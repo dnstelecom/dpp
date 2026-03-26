@@ -163,9 +163,10 @@ repeating it for full DNS question decoding.
   the top-level process outcome.
 
 - `docs/rfc/`
-  Canonical architecture decision records. `README.md` is the directory index and
-  `0001-architecture-boundaries.md`, `0002-cli-and-runtime-boundaries.md`, and
-  `0003-allocator-selection.md` record the current accepted ownership boundaries.
+  Canonical architecture decision records. `README.md` is the directory index. Current RFCs
+  cover ownership boundaries (0001), CLI/runtime split (0002), allocator selection (0003),
+  forward-only matcher determinism (0004), dual-path PCAP parsing (0005), and adaptive
+  pipeline execution (0006).
 
 - `docs/encapsulation-playbook.md`
   Operational and engineering guidance for captures that contain VLAN, QinQ, MPLS, or other outer
