@@ -8,8 +8,8 @@
 
 <p align="left">
   <img alt="License: GPLv3" src="https://img.shields.io/badge/License-GPLv3-blue.svg">
-  <a href="https://github.com/Nameto-Oy/dpp/releases/latest">
-    <img alt="Latest release" src="https://img.shields.io/github/v/release/Nameto-Oy/dpp?display_name=tag">
+  <a href="https://github.com/dnstelecom/dpp/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/dnstelecom/dpp?display_name=tag">
   </a>
 </p>
 
