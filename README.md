@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="https://github.com/Nameto-Oy/dpp">
+  <a href="https://github.com/dnstelecom/dpp">
     <img src="assets/dpp_mascote.svg" alt="DNS Packet Processor mascot" width="180">
   </a>
 </p>
