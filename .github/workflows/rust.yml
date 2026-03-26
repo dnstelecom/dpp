@@ -1,0 +1,55 @@
+name: Rust Release Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-ubuntu:
+    name: Build on ${{ matrix.os_label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-20.04
+            os_label: Ubuntu 20.04
+            artifact_suffix: ubuntu_20.04_x86_64
+          - runner: ubuntu-22.04
+            os_label: Ubuntu 22.04
+            artifact_suffix: ubuntu_22.04_x86_64
+          - runner: ubuntu-24.04
+            os_label: Ubuntu 24.04
+            artifact_suffix: ubuntu_24.04_x86_64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install PCAP lib (only on Linux)
+        run: sudo apt-get install -y libpcap-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get package version
+        id: cargo-version
+        run: |
+          echo "PACKAGE_VERSION=$(cargo pkgid | cut -d# -f2 | cut -d: -f2 | sed 's/\./_/g')" >> $GITHUB_ENV
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Create tar.bz2 archive
+        run: |
+          tar -cjf dpp_${PACKAGE_VERSION}_${{ matrix.artifact_suffix }}.tar.bz2 -C target/release dpp
+
+      - name: Upload Linux binary to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "dpp_${{ env.PACKAGE_VERSION }}_${{ matrix.artifact_suffix }}.tar.bz2"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

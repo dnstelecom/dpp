@@ -1,0 +1,90 @@
+# Cargo.toml for the DNS Packet Processor (DPP)
+
+[package]
+name = "dpp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+build = "build.rs"  # Custom build script to include version information from git
+
+# Optimized profile settings for maximum performance in release builds
+[profile.release]
+opt-level = 3            # Maximum optimization for speed (also increases binary size)
+lto = true               # Enable Link Time Optimization for better performance
+codegen-units = 1        # Reduce codegen units for inter-procedural optimizations
+panic = 'abort'          # Use abort instead of unwind to reduce binary size and overhead
+debug = false            # Disable debug information in the release build
+overflow-checks = true   # Keep overflow checks enabled in release for safer arithmetic behavior
+incremental = false      # Disable incremental builds in release to ensure full optimization
+strip = "debuginfo"      # Remove debug info from the final binary for smaller size
+
+[profile.perf]
+inherits = "release"
+overflow-checks = false  # Benchmark-focused profile for trusted perf runs on representative input
+
+# Build dependencies used during the compilation process
+[build-dependencies]
+vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
+vergen = "9.1.0"  # Generates build-time constants for the application
+anyhow = "1.0.102"  # Error handling used in the build script
+
+# Development profile settings for faster iteration
+[profile.dev]
+opt-level = 1          # Apply minimal optimizations
+debug = true           # Enable debug information for development
+incremental = true     # Enable incremental compilation for faster rebuilds
+
+# Enforce maximum optimization for all dependencies in release mode
+[profile.release.package."*"]
+opt-level = 3  # Use maximum optimization even for dependencies
+
+[profile.perf.package."*"]
+opt-level = 3
+
+# Core dependencies for the project
+[dependencies]
+pcap = "2.4"                      # Library for reading pcap files
+pcap-file = "3.0.0-rc1"           # Pure-Rust parser for classic pcap and pcapng files
+pnet_packet = "0.35"             # Packet parsing library for network packets
+rayon = "1.11"                    # Parallelism library for multithreaded processing
+hickory-proto = "0.25"            # DNS protocol parsing library
+csv = "1.4"                       # CSV serialization and deserialization
+crossbeam = "0.8"                 # Concurrency support with channels and data structures
+anyhow = "1.0"                    # Error handling library
+chrono = "0.4"                    # Date and time handling
+crossbeam-skiplist = "0.1"        # Efficient skiplist data structure for DNS query-response matching
+num-format = "0.4"                # Number formatting for logging and output
+itertools = "0.14"                # Additional utilities for iterator handling
+sysinfo = "0.38"                  # System information retrieval (for memory monitoring)
+arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
+parquet = "58.1.0"                # Apache Parquet format support for exporting results
+serde = { version = "1.0", features = ["derive"] }  # Serialization and deserialization support
+clap = { version = "4.6", features = ["derive"] }   # Command-line argument parsing
+tikv-jemallocator = { version = "0.6.1", optional = true } # Jemalloc successor for Rust global allocation
+mimalloc = { version = "0.1.48", optional = true }         # Microsoft mimalloc global allocator
+seahash = "4.1.0"                 # Fast Hash
+core_affinity = "0.8.3"           # To assign threads to specific CPU cores
+smallvec = "1.15.1"               # Optimizes vectors by storing them on the stack.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "local-time", "chrono"] }
+tracing-log = "0.2.0"             # Bridges log-based dependencies into tracing
+crossbeam-channel = "0.5.15"# Channel communication between threads
+aes = "0.8.4"
+pbkdf2 = "0.12.2"
+sha2 = "0.10.9"
+itoa = "1.0"
+memchr = "2.8"
+serde_json = "1.0"
+ctrlc = "3.5"
+thiserror = "2.0"
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tcmalloc-better = { version = "0.1.19", optional = true }  # Google TCMalloc wrapper for supported Linux targets
+
+# Optional features for controlling build behavior
+[features]
+default = ["allocator-jemalloc"]
+allocator-jemalloc = ["dep:tikv-jemallocator"]
+allocator-mimalloc = ["dep:mimalloc"]
+allocator-tcmalloc = ["dep:tcmalloc-better"]
+allocator-system = []

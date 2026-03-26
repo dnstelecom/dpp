@@ -1,0 +1,97 @@
+/*
+ * Nameto Oy © 2026. All rights reserved.
+ *
+ * This software is licensed under the GNU General Public License (GPL) version 3.
+ * Commercial licensing options: <carrier-support@dnstele.com>.
+ */
+
+use crate::config::{AppConfig, OUTPUT_FLUSH_THRESHOLD, OutputFormat};
+use crate::error::OutputError;
+use crate::{csv_writer, parquet_writer};
+use crossbeam::channel::Receiver;
+use std::error::Error;
+use std::fs::File;
+use std::thread::{self, JoinHandle};
+
+pub(crate) use crate::record::DnsRecord;
+
+/// Control messages accepted by output writers.
+#[derive(Debug)]
+pub(crate) enum OutputMessage {
+    Record(DnsRecord),
+    Shutdown,
+}
+
+impl From<DnsRecord> for OutputMessage {
+    fn from(record: DnsRecord) -> Self {
+        OutputMessage::Record(record)
+    }
+}
+
+pub(crate) fn drain_output_messages<FlushFn>(
+    rx: Receiver<OutputMessage>,
+    buffer: &mut Vec<DnsRecord>,
+    mut flush_buffer: FlushFn,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    FlushFn: FnMut(&mut Vec<DnsRecord>) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
+    while let Ok(message) = rx.recv() {
+        match message {
+            OutputMessage::Record(record) => {
+                buffer.push(record);
+                if buffer.len() >= OUTPUT_FLUSH_THRESHOLD {
+                    flush_buffer(buffer)?;
+                }
+            }
+            OutputMessage::Shutdown => break,
+        }
+    }
+
+    if !buffer.is_empty() {
+        flush_buffer(buffer)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn create_writer_thread(
+    config: &AppConfig,
+    rx: crossbeam::channel::Receiver<OutputMessage>,
+) -> Result<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>, OutputError> {
+    match config.format {
+        OutputFormat::Csv => {
+            let file = File::create(&config.output_filename).map_err(|source| {
+                OutputError::CreateCsvFile {
+                    path: config.output_filename.clone(),
+                    source,
+                }
+            })?;
+
+            Ok(thread::Builder::new()
+                .name("DPP_CSV_Writer".to_string())
+                .spawn(move || csv_writer::csv_writer(file, rx))
+                .map_err(|source| OutputError::SpawnWriterThread {
+                    format: OutputFormat::Csv,
+                    source,
+                })?)
+        }
+        OutputFormat::Parquet => {
+            let parquet_writer =
+                parquet_writer::create_parquet_writer(config).map_err(|source| {
+                    OutputError::CreateParquetWriter {
+                        path: config.output_filename.clone(),
+                        source,
+                    }
+                })?;
+
+            Ok(thread::Builder::new()
+                .name("DPP_PQ_Writer".to_string())
+                .spawn(move || parquet_writer::parquet_writer(parquet_writer, rx))
+                .map_err(|source| OutputError::SpawnWriterThread {
+                    format: OutputFormat::Parquet,
+                    source,
+                })?)
+        }
+    }
+}
