@@ -7,11 +7,9 @@
 
 use crate::catalog::SERVER1_JUL_2024_POSITIVE_DOMAINS;
 use crate::cli::ProfileKind;
-use crate::model::{
-    DnsQuestionType, ResponseCodeKind, ResponseCodeWeight, TrafficProfile, TypeWeight,
-    WeightedDomain,
-};
-use anyhow::{Result, bail};
+use crate::model::{DnsQuestionType, TrafficProfile, TypeWeight, WeightedDomain};
+use crate::tuning::RESPONSE_CODES;
+use crate::{Error, Result};
 
 const WEB_RICH_TYPES: &[TypeWeight] = &[
     TypeWeight {
@@ -159,33 +157,16 @@ const NEGATIVE_DOMAINS: &[WeightedDomain] = &[
     },
 ];
 
-const RESPONSE_CODES: &[ResponseCodeWeight] = &[
-    ResponseCodeWeight {
-        code: ResponseCodeKind::NoError,
-        weight: 964,
-    },
-    ResponseCodeWeight {
-        code: ResponseCodeKind::NxDomain,
-        weight: 24,
-    },
-    ResponseCodeWeight {
-        code: ResponseCodeKind::ServFail,
-        weight: 12,
-    },
-];
-
 const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "abanca.com",
     "abcchina.com",
     "abnamro.com",
     "acb.com.vn",
-    "advk",
     "afirme.com",
     "aib.ie",
     "akbank.com",
     "aktia.fi",
     "aliorbank.pl",
-    "alfabank.ru",
     "alliancebank.com.my",
     "ally.com",
     "alpha.gr",
@@ -441,8 +422,6 @@ const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "provincial.com",
     "psbc.com",
     "publicbankgroup.com",
-    "pvkt",
-    "qiwi",
     "qnb.com.tr",
     "rabobank.com",
     "raiffeisen.ch",
@@ -469,7 +448,6 @@ const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "santander.com.mx",
     "santander.pl",
     "sbanken.no",
-    "sber",
     "sbi.co.in",
     "scb.co.th",
     "schwab.com",
@@ -499,11 +477,9 @@ const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "swedbank.com",
     "sydbank.dk",
     "synchrony.com",
-    "tbank",
     "td.com",
     "tdbank.com",
     "techcombank.com.vn",
-    "tinkoff",
     "tpb.vn",
     "triodos.com",
     "truist.com",
@@ -528,7 +504,6 @@ const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "vietinbank.vn",
     "virginmoney.com",
     "virginmoneyukplc.com",
-    "vk.com",
     "volkswagenbank.de",
     "vpbank.com.vn",
     "websterbank.com",
@@ -542,8 +517,6 @@ const DISALLOWED_DOMAIN_SUBSTRINGS: &[&str] = &[
     "ziraatbank.com.tr",
     "zuercherkantonalbank.ch",
 ];
-
-const DISALLOWED_TLDS: &[&str] = &[".ru", ".su", ".xn--p1ai"];
 
 const CLIENT_SPECIFIC_SUBSTRINGS: &[&str] = &[
     "android.clients.",
@@ -570,11 +543,11 @@ pub(crate) fn profile_for(kind: ProfileKind) -> TrafficProfile {
 
 pub(crate) fn validate_profile(profile: &TrafficProfile) -> Result<()> {
     if profile.positive_domains.len() < 10_000 {
-        bail!(
-            "profile '{}' must expose at least 10,000 positive domains, found {}",
-            profile.name,
-            profile.positive_domains.len()
-        );
+        return Err(Error::ProfileTooFewPositiveDomains {
+            profile: profile.name,
+            minimum: 10_000,
+            found: profile.positive_domains.len(),
+        });
     }
 
     for domain in profile
@@ -583,16 +556,17 @@ pub(crate) fn validate_profile(profile: &TrafficProfile) -> Result<()> {
         .chain(profile.negative_domains.iter())
     {
         if is_disallowed_domain(domain.name) {
-            bail!(
-                "profile '{}' contains a disallowed domain '{}'",
-                profile.name,
-                domain.name
-            );
+            return Err(Error::ProfileDisallowedDomain {
+                profile: profile.name,
+                domain: domain.name.to_string(),
+            });
         }
     }
 
     if profile.response_codes.is_empty() {
-        bail!("profile '{}' has no response code weights", profile.name);
+        return Err(Error::ProfileMissingResponseCodes {
+            profile: profile.name,
+        });
     }
 
     Ok(())
@@ -673,7 +647,6 @@ pub(crate) fn is_disallowed_domain(name: &str) -> bool {
     DISALLOWED_DOMAIN_SUBSTRINGS
         .iter()
         .any(|token| domain_contains(token, &lower))
-        || DISALLOWED_TLDS.iter().any(|tld| lower.ends_with(tld))
         || CLIENT_SPECIFIC_SUBSTRINGS
             .iter()
             .any(|token| lower.contains(token))

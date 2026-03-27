@@ -9,7 +9,9 @@ use crate::catalog::SERVER1_JUL_2024_POSITIVE_DOMAINS;
 use crate::cli::{GeneratorConfig, ProfileKind};
 use crate::generator::write_capture;
 use crate::model::{DEFAULT_START_EPOCH_SECS, DnsQuestionType, ResponseCodeKind};
-use crate::packet::{build_dns_query_payload, build_dns_response_payload};
+use crate::packet::{
+    ROOT_NAME_SERVER_TARGETS, build_dns_query_payload, build_dns_response_payload,
+};
 use crate::profile::{
     is_disallowed_domain, profile_for, qtype_weights_for_positive_domain, validate_profile,
 };
@@ -51,10 +53,8 @@ fn sanitized_profile_contains_no_disallowed_domains() {
 }
 
 #[test]
-fn disallowed_domain_detector_catches_russian_and_client_specific_patterns() {
-    assert!(is_disallowed_domain("api.vk.com"));
+fn disallowed_domain_detector_catches_only_current_sanitization_targets() {
     assert!(is_disallowed_domain("android.clients.google.com"));
-    assert!(is_disallowed_domain("example.ru"));
     assert!(!is_disallowed_domain("www.google.com"));
 }
 
@@ -84,6 +84,28 @@ fn root_domain_serializes_as_valid_ns_query_and_response() {
     .expect("response encodes");
     assert_eq!(&response[6..8], &1_u16.to_be_bytes());
     assert_eq!(response[12], 0);
+}
+
+#[test]
+fn root_name_server_targets_match_the_current_a_to_m_root_set() {
+    assert_eq!(
+        ROOT_NAME_SERVER_TARGETS,
+        &[
+            "a.root-servers.net",
+            "b.root-servers.net",
+            "c.root-servers.net",
+            "d.root-servers.net",
+            "e.root-servers.net",
+            "f.root-servers.net",
+            "g.root-servers.net",
+            "h.root-servers.net",
+            "i.root-servers.net",
+            "j.root-servers.net",
+            "k.root-servers.net",
+            "l.root-servers.net",
+            "m.root-servers.net",
+        ]
+    );
 }
 
 #[test]

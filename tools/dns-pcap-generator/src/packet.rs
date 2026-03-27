@@ -6,18 +6,27 @@
  */
 
 use crate::model::{DnsQuestionType, ResponseCodeKind};
-use anyhow::{Result, bail};
+use crate::{Error, Result};
 use seahash::hash;
 use std::net::Ipv4Addr;
 
 pub(crate) const DNS_PORT: u16 = 53;
 const IPV4_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
-const ROOT_NAME_SERVER_TARGETS: &[&str] = &[
+pub(crate) const ROOT_NAME_SERVER_TARGETS: &[&str] = &[
     "a.root-servers.net",
     "b.root-servers.net",
     "c.root-servers.net",
     "d.root-servers.net",
+    "e.root-servers.net",
+    "f.root-servers.net",
+    "g.root-servers.net",
+    "h.root-servers.net",
+    "i.root-servers.net",
+    "j.root-servers.net",
+    "k.root-servers.net",
+    "l.root-servers.net",
+    "m.root-servers.net",
 ];
 
 #[derive(Clone, Copy)]
@@ -231,7 +240,7 @@ fn synthetic_ipv6_for_name(name: &str) -> [u8; 16] {
 
 fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
     if qname.is_empty() {
-        bail!("DNS name cannot be empty");
+        return Err(Error::EmptyDnsName);
     }
 
     let canonical = if qname == "." {
@@ -247,10 +256,14 @@ fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
 
     for label in canonical.split('.') {
         if label.is_empty() {
-            bail!("DNS name '{qname}' contains an empty label");
+            return Err(Error::EmptyDnsLabel {
+                qname: qname.to_string(),
+            });
         }
         if label.len() > 63 {
-            bail!("DNS label '{label}' exceeds 63 bytes");
+            return Err(Error::DnsLabelTooLong {
+                label: label.to_string(),
+            });
         }
         buffer.push(label.len() as u8);
         buffer.extend_from_slice(label.as_bytes());
