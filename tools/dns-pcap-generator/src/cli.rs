@@ -56,6 +56,7 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum ProfileKind {
+    #[value(name = "server1-jul-2024-sanitized")]
     Server1Jul2024Sanitized,
 }
 
