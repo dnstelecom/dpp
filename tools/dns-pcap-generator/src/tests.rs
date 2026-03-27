@@ -10,13 +10,13 @@ use crate::catalog::load_catalog;
 use crate::cli::{Cli, GeneratorConfig};
 use crate::error::Error;
 use crate::generator::write_capture;
+use crate::load_profile_dir as load_runtime_profile_dir;
 use crate::model::{DEFAULT_START_EPOCH_SECS, DnsQuestionType, ResponseCodeKind};
 use crate::packet::{
     MAX_SYNTHETIC_CLIENTS, ROOT_NAME_SERVER_TARGETS, build_dns_query_payload,
     build_dns_response_payload,
 };
 use crate::profile::{is_disallowed_domain, validate_profile};
-use crate::load_profile_dir as load_runtime_profile_dir;
 use pcap_file::pcap::PcapReader;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -301,7 +301,10 @@ fn profile_dir_loader_applies_fitted_defaults() {
 fn profile_dir_loader_rejects_catalog_hash_mismatch() {
     let dir = temp_profile_dir("catalog-hash-mismatch");
     write_profile_fixture(&dir);
-    let catalog_sha256 = format!("{:x}", Sha256::digest(b"10\texample.com\n8\twww.example.org\n"));
+    let catalog_sha256 = format!(
+        "{:x}",
+        Sha256::digest(b"10\texample.com\n8\twww.example.org\n")
+    );
 
     let fitted_path = dir.join("fitted-generator.toml");
     let fitted = fs::read_to_string(&fitted_path).expect("fitted profile read");
@@ -338,8 +341,8 @@ fn runtime_profile_dir_loader_accepts_small_extracted_catalogs() {
 
 #[test]
 fn checked_in_server1_profile_dir_loads_against_workspace_catalog() {
-    let profile = load_runtime_profile_dir(&checked_in_profile_dir())
-        .expect("checked-in profile dir loads");
+    let profile =
+        load_runtime_profile_dir(&checked_in_profile_dir()).expect("checked-in profile dir loads");
 
     assert_eq!(crate::profile_name(&profile), "server1-jul-2024");
     assert_eq!(

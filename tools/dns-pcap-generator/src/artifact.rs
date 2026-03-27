@@ -335,7 +335,10 @@ fn validate_fitted_profile(profile: &RawFittedGeneratorProfile, path: &Path) -> 
         "must not be empty",
     )?;
     if profile.catalog_sha256.len() != 64
-        || !profile.catalog_sha256.chars().all(|ch| ch.is_ascii_hexdigit())
+        || !profile
+            .catalog_sha256
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit())
     {
         return Err(invalid_fitted_profile(
             path,
@@ -394,7 +397,11 @@ fn validate_fitted_profile(profile: &RawFittedGeneratorProfile, path: &Path) -> 
     )?;
     validate_response_codes(path, &profile.response_codes)?;
     validate_response_delay(path, &profile.response_delay)?;
-    validate_retry_steps(path, "retry_delay.answered_steps", &profile.retry_delay.answered_steps)?;
+    validate_retry_steps(
+        path,
+        "retry_delay.answered_steps",
+        &profile.retry_delay.answered_steps,
+    )?;
     validate_retry_steps(
         path,
         "retry_delay.unanswered_steps",
@@ -551,9 +558,11 @@ fn validate_delay_distribution(
             bucket.range_us[0],
             bucket.range_us[1],
         )?;
-        total_share = total_share.checked_add(bucket.share_per_mille).ok_or_else(|| {
-            invalid_fitted_profile(path, format!("{field}.buckets share_per_mille overflowed"))
-        })?;
+        total_share = total_share
+            .checked_add(bucket.share_per_mille)
+            .ok_or_else(|| {
+                invalid_fitted_profile(path, format!("{field}.buckets share_per_mille overflowed"))
+            })?;
     }
 
     if total_share != SHARE_PER_MILLE_TOTAL {
@@ -579,7 +588,10 @@ fn validate_retry_steps(path: &Path, field: &str, steps: &[RawRetryStep]) -> Res
         if step.step != expected {
             return Err(invalid_fitted_profile(
                 path,
-                format!("{field}[{index}].step must be {expected}, got {}", step.step),
+                format!(
+                    "{field}[{index}].step must be {expected}, got {}",
+                    step.step
+                ),
             ));
         }
         validate_delay_range(

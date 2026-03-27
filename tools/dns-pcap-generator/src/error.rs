@@ -98,10 +98,7 @@ pub enum Error {
     },
 
     #[error("invalid fitted profile '{path}': {message}")]
-    FittedProfileInvalid {
-        path: PathBuf,
-        message: String,
-    },
+    FittedProfileInvalid { path: PathBuf, message: String },
 
     #[error("failed to compute SHA-256 for '{path}'")]
     InputHashOpen {
