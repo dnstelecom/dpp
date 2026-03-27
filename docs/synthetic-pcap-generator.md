@@ -66,6 +66,8 @@ Runtime failures are reported through typed CLI errors, so invalid arguments and
 - The output is classic little-endian PCAP with Ethernet + IPv4 + UDP + DNS packets.
 - Queries go from a synthetic client pool in `100.64.0.0/10` to a synthetic resolver pool in
   `172.20.0.0/16`.
+- `--clients` is validated against the distinct address capacity of that client pool, which is
+  4,161,536 synthetic client IPs.
 - Inter-arrival times are sampled from an exponential distribution around the configured `--qps`.
 - Duplicate retries use increasing retry delays so slow or unanswered lookups produce realistic
   retry spacing; unanswered transactions keep long retransmit backoff, while answered retries stay

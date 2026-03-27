@@ -19,6 +19,9 @@ pub enum Error {
     #[error("--clients must be greater than 0")]
     InvalidClients,
 
+    #[error("invalid value for --clients: expected at most {max}, got {value}")]
+    TooManyClients { value: usize, max: usize },
+
     #[error("--resolvers must be greater than 0")]
     InvalidResolvers,
 

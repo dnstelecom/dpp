@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{DEFAULT_SEED, DEFAULT_START_EPOCH_SECS};
+use crate::packet::{MAX_SYNTHETIC_CLIENTS, MAX_SYNTHETIC_RESOLVERS};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
@@ -81,13 +82,19 @@ impl TryFrom<&Cli> for GeneratorConfig {
         if cli.clients == 0 {
             return Err(Error::InvalidClients);
         }
+        if cli.clients > MAX_SYNTHETIC_CLIENTS {
+            return Err(Error::TooManyClients {
+                value: cli.clients,
+                max: MAX_SYNTHETIC_CLIENTS,
+            });
+        }
         if cli.resolvers == 0 {
             return Err(Error::InvalidResolvers);
         }
-        if cli.resolvers > 203 * 256 {
+        if cli.resolvers > MAX_SYNTHETIC_RESOLVERS {
             return Err(Error::TooManyResolvers {
                 value: cli.resolvers,
-                max: 203 * 256,
+                max: MAX_SYNTHETIC_RESOLVERS,
             });
         }
         if cli.duplicate_max == 0 {

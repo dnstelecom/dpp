@@ -11,6 +11,8 @@ use seahash::hash;
 use std::net::Ipv4Addr;
 
 pub(crate) const DNS_PORT: u16 = 53;
+pub(crate) const MAX_SYNTHETIC_CLIENTS: usize = 64 * 256 * 254;
+pub(crate) const MAX_SYNTHETIC_RESOLVERS: usize = 203 * 256;
 const IPV4_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
 pub(crate) const ROOT_NAME_SERVER_TARGETS: &[&str] = &[

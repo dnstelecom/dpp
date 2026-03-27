@@ -6,17 +6,20 @@
  */
 
 use crate::catalog::SERVER1_JUL_2024_POSITIVE_DOMAINS;
-use crate::cli::{GeneratorConfig, ProfileKind};
+use crate::cli::{Cli, GeneratorConfig, ProfileKind};
+use crate::error::Error;
 use crate::generator::write_capture;
 use crate::model::{DEFAULT_START_EPOCH_SECS, DnsQuestionType, ResponseCodeKind};
 use crate::packet::{
-    ROOT_NAME_SERVER_TARGETS, build_dns_query_payload, build_dns_response_payload,
+    MAX_SYNTHETIC_CLIENTS, ROOT_NAME_SERVER_TARGETS, build_dns_query_payload,
+    build_dns_response_payload,
 };
 use crate::profile::{
     is_disallowed_domain, profile_for, qtype_weights_for_positive_domain, validate_profile,
 };
 use pcap_file::pcap::PcapReader;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::time::Duration;
 
 fn test_config() -> GeneratorConfig {
@@ -106,6 +109,30 @@ fn root_name_server_targets_match_the_current_a_to_m_root_set() {
             "m.root-servers.net",
         ]
     );
+}
+
+#[test]
+fn cli_rejects_client_count_above_address_pool_capacity() {
+    let cli = Cli {
+        output: PathBuf::from("ignored.pcap"),
+        profile: ProfileKind::Server1Jul2024Sanitized,
+        transactions: Some(1),
+        duration_seconds: 300,
+        qps: 1200.0,
+        clients: MAX_SYNTHETIC_CLIENTS + 1,
+        resolvers: 3,
+        duplicate_rate: 0.08,
+        timeout_rate: 0.03,
+        duplicate_max: 3,
+        seed: 7,
+        start_epoch_seconds: DEFAULT_START_EPOCH_SECS,
+    };
+
+    assert!(matches!(
+        GeneratorConfig::try_from(&cli),
+        Err(Error::TooManyClients { value, max })
+            if value == MAX_SYNTHETIC_CLIENTS + 1 && max == MAX_SYNTHETIC_CLIENTS
+    ));
 }
 
 #[test]
