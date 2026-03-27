@@ -136,6 +136,24 @@ fn cli_rejects_client_count_above_address_pool_capacity() {
 }
 
 #[test]
+fn disallowed_domain_detector_preserves_case_insensitive_behavior() {
+    assert!(is_disallowed_domain("Android.Clients.Google.com"));
+    assert!(!is_disallowed_domain("WWW.Google.com"));
+}
+
+#[test]
+fn qtype_classifier_preserves_case_insensitive_behavior() {
+    assert!(std::ptr::eq(
+        qtype_weights_for_positive_domain("WWW.Example.com"),
+        qtype_weights_for_positive_domain("www.example.com")
+    ));
+    assert!(std::ptr::eq(
+        qtype_weights_for_positive_domain("Api.Googleapis.com"),
+        qtype_weights_for_positive_domain("api.googleapis.com")
+    ));
+}
+
+#[test]
 fn generator_produces_reproducible_output_for_same_seed() {
     let config = test_config();
     let profile = profile_for(ProfileKind::Server1Jul2024Sanitized);

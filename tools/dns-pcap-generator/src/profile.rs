@@ -577,59 +577,66 @@ pub(crate) fn qtype_weights_for_positive_domain(name: &str) -> &'static [TypeWei
         return ROOT_TYPES;
     }
 
-    let lower = name.to_ascii_lowercase();
+    if domain_is_ascii_lowercase(name) {
+        return qtype_weights_for_normalized_positive_domain(name);
+    }
 
-    if lower.contains("connectivitycheck")
-        || lower.starts_with("dns.")
-        || lower.contains("time.")
-        || lower.ends_with("root-servers.net")
-        || lower.ends_with("pool.ntp.org")
-        || lower.ends_with("whoami.akamai.net")
+    let lower = name.to_ascii_lowercase();
+    qtype_weights_for_normalized_positive_domain(&lower)
+}
+
+fn qtype_weights_for_normalized_positive_domain(name: &str) -> &'static [TypeWeight] {
+    if name.contains("connectivitycheck")
+        || name.starts_with("dns.")
+        || name.contains("time.")
+        || name.ends_with("root-servers.net")
+        || name.ends_with("pool.ntp.org")
+        || name.ends_with("whoami.akamai.net")
     {
         return A_HEAVY_TYPES;
     }
 
-    if lower.contains("analytics")
-        || lower.contains("measurement")
-        || lower.contains("logging")
-        || lower.contains("remoteconfig")
-        || lower.contains("crashlytics")
-        || lower.contains("app-measurement")
-        || lower.contains("pubsub")
-        || lower.contains("notifications")
-        || lower.contains("collector.")
-        || lower.contains("metrics")
+    if name.contains("analytics")
+        || name.contains("measurement")
+        || name.contains("logging")
+        || name.contains("remoteconfig")
+        || name.contains("crashlytics")
+        || name.contains("app-measurement")
+        || name.contains("pubsub")
+        || name.contains("notifications")
+        || name.contains("collector.")
+        || name.contains("metrics")
     {
         return SERVICE_MISC_TYPES;
     }
 
-    if lower.starts_with("api.")
-        || lower.contains("googleapis.com")
-        || lower.contains("facebook.com")
-        || lower.contains("instagram.com")
-        || lower.contains("mixpanel.com")
-        || lower.contains("appcenter.ms")
-        || lower.contains("xiaomi.com")
-        || lower.contains("apple-dns.net")
-        || lower.contains("icloud.com")
-        || lower.contains("aaplimg.com")
-        || lower.contains("whatsapp.net")
-        || lower.contains("viber.com")
+    if name.starts_with("api.")
+        || name.contains("googleapis.com")
+        || name.contains("facebook.com")
+        || name.contains("instagram.com")
+        || name.contains("mixpanel.com")
+        || name.contains("appcenter.ms")
+        || name.contains("xiaomi.com")
+        || name.contains("apple-dns.net")
+        || name.contains("icloud.com")
+        || name.contains("aaplimg.com")
+        || name.contains("whatsapp.net")
+        || name.contains("viber.com")
     {
         return API_TYPES;
     }
 
-    if lower.starts_with("www.")
-        || lower.contains("googleusercontent.com")
-        || lower.contains("ytimg.com")
-        || lower.contains("gstatic.com")
-        || lower.contains("tiktokcdn.com")
-        || lower.contains("tiktokv.com")
-        || lower.contains("ttlivecdn.com")
-        || lower.contains("akamaiedge.net")
-        || lower.contains("doubleclick.net")
-        || lower.contains("cdn.")
-        || lower.contains("edge")
+    if name.starts_with("www.")
+        || name.contains("googleusercontent.com")
+        || name.contains("ytimg.com")
+        || name.contains("gstatic.com")
+        || name.contains("tiktokcdn.com")
+        || name.contains("tiktokv.com")
+        || name.contains("ttlivecdn.com")
+        || name.contains("akamaiedge.net")
+        || name.contains("doubleclick.net")
+        || name.contains("cdn.")
+        || name.contains("edge")
     {
         return EDGE_TYPES;
     }
@@ -642,15 +649,22 @@ pub(crate) fn qtype_weights_for_negative_domain() -> &'static [TypeWeight] {
 }
 
 pub fn is_disallowed_domain(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    if domain_is_ascii_lowercase(name) {
+        return is_disallowed_domain_normalized(name);
+    }
 
+    let lower = name.to_ascii_lowercase();
+    is_disallowed_domain_normalized(&lower)
+}
+
+fn is_disallowed_domain_normalized(name: &str) -> bool {
     DISALLOWED_DOMAIN_SUBSTRINGS
         .iter()
-        .any(|token| domain_contains(token, &lower))
+        .any(|token| domain_contains(token, name))
         || CLIENT_SPECIFIC_SUBSTRINGS
             .iter()
-            .any(|token| lower.contains(token))
-        || lower.split('.').any(label_looks_unique)
+            .any(|token| name.contains(token))
+        || name.split('.').any(label_looks_unique)
 }
 
 /// Matches `token` against `domain`. Tokens that look like domains (contain `.`)
@@ -674,4 +688,8 @@ fn label_looks_unique(label: &str) -> bool {
     let digits = label.bytes().filter(u8::is_ascii_digit).count();
     let hex_chars = label.bytes().filter(u8::is_ascii_hexdigit).count();
     digits >= 6 || hex_chars >= 10
+}
+
+fn domain_is_ascii_lowercase(name: &str) -> bool {
+    !name.bytes().any(|byte| byte.is_ascii_uppercase())
 }
