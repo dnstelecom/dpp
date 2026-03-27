@@ -84,6 +84,12 @@ struct GeneratorState<'a> {
     config: &'a GeneratorConfig,
     profile: &'a TrafficProfile,
     rng: SplitMix64,
+    // Only packets scheduled strictly in the future live in this heap.
+    // `run()` flushes everything due at the current transaction timestamp
+    // before scheduling new retries / responses, so heap growth is bounded by
+    // the future-event window (retry delays, response delays, and QPS), not by
+    // the total `transactions` count. Each transaction contributes at most
+    // `duplicate_max` retry queries plus one response while it is still in flight.
     pending_packets: BinaryHeap<ScheduledPacket>,
     clients: Vec<Ipv4Addr>,
     resolvers: Vec<Ipv4Addr>,
