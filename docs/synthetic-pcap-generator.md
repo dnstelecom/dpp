@@ -62,7 +62,7 @@ Generate from the checked-in fitted profile defaults without overriding `qps`, `
   --transactions 500000
 ```
 
-Regenerate the embedded catalog TSV from a local CSV:
+Regenerate the checked-in workspace catalog TSV from a local CSV:
 
 ```bash
 cargo run -p dns-catalog-builder --release -- \
