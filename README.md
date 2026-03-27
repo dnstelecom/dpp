@@ -249,7 +249,6 @@ Example:
 
 ```bash
 cargo run --release --bin dns-pcap-generator -- synthetic/server1-like.pcap \
-  --profile server1-jul-2024-sanitized \
   --duration-seconds 300 \
   --qps 30000 \
   --duplicate-rate 0.08 \

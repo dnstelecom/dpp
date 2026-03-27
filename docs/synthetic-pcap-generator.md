@@ -30,7 +30,6 @@ Generate a five-minute synthetic capture:
 
 ```bash
 ./target/release/dns-pcap-generator synthetic/server1-like.pcap \
-  --profile server1-jul-2024-sanitized \
   --duration-seconds 300 \
   --qps 1200 \
   --clients 2048 \
