@@ -133,6 +133,9 @@ dpp --anonymize /tmp/anon.key input.pcap output.csv
 # Quiet mode
 dpp -s -f parquet input.pcap dns_output.pq
 
+# Stream CSV records to stdout
+dpp input.pcap - > output.csv
+
 # Emit a machine-readable JSON summary object at the end of the run
 dpp --report-format json input.pcap output.csv > dpp-summary.json
 ```
@@ -170,15 +173,15 @@ Notes:
 | Argument          | Description                                                            |
 |-------------------|------------------------------------------------------------------------|
 | `filename`        | Path to the input PCAP file                                            |
-| `output_filename` | Output file name; defaults to `dns_output.csv` or `dns_output.parquet` |
+| `output_filename` | Output file name; use `-` for CSV stdout output; defaults to `dns_output.csv` or `dns_output.parquet` |
 
 ### Options
 
 | Option                            | Description                                                                                                         |
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------|
 | `-s, --silent`                    | Suppress info-level log output                                                                                      |
-| `-f, --format <csv\|parquet\|pq>` | Select output format                                                                                                |
-| `--report-format <text\|json>`    | Select the final process report format; defaults to `text`                                                          |
+| `-f, --format <csv\|parquet\|pq>` | Select output format; stdout output is supported only for `csv`                                                     |
+| `--report-format <text\|json>`    | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -`   |
 | `--match-timeout-ms <MS>`         | Set the DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`            |
 | `--monotonic-capture`             | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
 | `-b, --bonded <N>`                | Set I/O channel capacity; `0` uses the safe default bounded capacity                                                |
@@ -195,9 +198,9 @@ Notes:
 | Variable                 | Description                                                                                                         |
 |--------------------------|---------------------------------------------------------------------------------------------------------------------|
 | `DPP_FILENAME`           | Input PCAP path                                                                                                     |
-| `DPP_OUTPUT_FILENAME`    | Output file name                                                                                                    |
+| `DPP_OUTPUT_FILENAME`    | Output file name; use `-` for CSV stdout output                                                                     |
 | `DPP_FORMAT`             | Output format: `csv`, `parquet`, or `pq`                                                                            |
-| `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`                                                   |
+| `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
 | `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                    |
 | `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
 | `DPP_BONDED`             | I/O channel capacity; `0` uses the default bounded capacity                                                         |
@@ -207,6 +210,10 @@ Notes:
 | `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                              |
 | `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                      |
 | `DPP_SILENT`             | Suppress info-level log output                                                                                      |
+
+When `output_filename` is `-`, DPP writes CSV records to stdout, suppresses non-error log output, and does not emit
+the final text report. `--format parquet`, `--report-format json`, and `DPP_REPORT_FORMAT=json` are rejected in this
+mode.
 
 Repeated pending queries that share the same match identity (`id`, `name`, client IP, client port,
 and `query_type`) inside the configured match window (`1200ms` by default) are deduplicated to the earliest canonical

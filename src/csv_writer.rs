@@ -12,7 +12,6 @@ use crossbeam::channel::Receiver;
 use memchr::{memchr, memchr3_iter};
 use std::error::Error;
 use std::fmt::Write as FmtWrite;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 
 const CSV_HEADER: &[u8] =
@@ -88,7 +87,7 @@ fn encode_csv_record(row_buffer: &mut Vec<u8>, record: &DnsRecord) {
 }
 
 fn flush_buffer_async_csv(
-    writer: &mut BufWriter<File>,
+    writer: &mut BufWriter<impl Write>,
     buffer: &mut Vec<DnsRecord>,
     row_buffer: &mut Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -114,11 +113,14 @@ fn flush_buffer_async_csv(
 /// let file = std::fs::File::create("output.csv").unwrap();
 /// csv_writer(file, rx).expect("csv writer completes successfully");
 /// ```
-pub(crate) fn csv_writer(
-    file: File,
+pub(crate) fn csv_writer<W>(
+    sink: W,
     rx: Receiver<OutputMessage>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut csv_writer = BufWriter::with_capacity(CSV_WRITER_BUFFER_CAPACITY, file);
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    W: Write,
+{
+    let mut csv_writer = BufWriter::with_capacity(CSV_WRITER_BUFFER_CAPACITY, sink);
     let mut buffer = Vec::with_capacity(OUTPUT_FLUSH_THRESHOLD);
     let mut row_buffer = Vec::with_capacity(CSV_ROW_BUFFER_CAPACITY);
 
@@ -139,6 +141,7 @@ mod tests {
     use crate::test_support::{temp_test_path, test_dns_record};
     use crossbeam::channel;
     use std::fs;
+    use std::fs::File;
 
     #[test]
     fn flushes_buffer_on_shutdown() {
@@ -222,5 +225,23 @@ mod tests {
         assert!(output.contains("example.com"));
 
         fs::remove_file(filename).expect("removes temp csv file");
+    }
+
+    #[test]
+    fn writes_csv_to_an_in_memory_sink() {
+        let (tx, rx) = channel::unbounded();
+
+        tx.send(OutputMessage::Record(test_dns_record()))
+            .expect("record is sent");
+        tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
+
+        let mut output = Vec::new();
+        csv_writer(&mut output, rx).expect("csv writer completes successfully");
+
+        let output = String::from_utf8(output).expect("csv output is utf-8");
+        assert!(output.starts_with(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n"
+        ));
+        assert!(output.contains("example.com"));
     }
 }

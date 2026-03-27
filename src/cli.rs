@@ -7,6 +7,7 @@
 
 use crate::config::{
     AppConfig, DEFAULT_MATCH_TIMEOUT_MS, MAX_MATCH_TIMEOUT_MS, OutputFormat, ReportFormat,
+    output_path_targets_stdout,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -82,9 +83,19 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .or(env_bonded)
         .unwrap_or(0);
 
+    let output_filename = matches
+        .get_one::<String>("output_filename")
+        .map(PathBuf::from)
+        .or(env_output_filename)
+        .unwrap_or_else(|| PathBuf::from(format.default_output_filename()));
+
+    validate_output_path(&output_filename)?;
+    validate_output_mode(&output_filename, format, report_format)?;
+
     let zstd = matches.get_flag("zstd") || env_zstd;
     let v2 = matches.get_flag("v2") || env_v2;
-    let silent = matches.get_flag("silent") || env_silent;
+    let silent =
+        matches.get_flag("silent") || env_silent || output_path_targets_stdout(&output_filename);
     let affinity = matches.get_flag("affinity") || env_affinity;
     let dns_wire_fast_path = matches.get_flag("dns_wire_fast_path") || env_dns_wire_fast_path;
     let monotonic_capture = matches.get_flag("monotonic_capture") || env_monotonic_capture;
@@ -94,14 +105,6 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
             "The '--zstd' and '--v2' flags|env_vars can only be used with the '--format parquet' option|env_var."
         );
     }
-
-    let output_filename = matches
-        .get_one::<String>("output_filename")
-        .map(PathBuf::from)
-        .or(env_output_filename)
-        .unwrap_or_else(|| PathBuf::from(format.default_output_filename()));
-
-    validate_output_path(&output_filename)?;
 
     Ok(AppConfig {
         filename,
@@ -129,7 +132,7 @@ fn build_cli(version: &'static str) -> Command {
         .about("Parses DNS traffic from a PCAP file and exports the results to CSV or Parquet format")
         .after_help(
             "ENVIRONMENT VARIABLES:
-  DPP_OUTPUT_FILENAME   Name of the output file (used if [output_filename] argument is not provided)
+  DPP_OUTPUT_FILENAME   Name of the output file (use '-' to write CSV records to stdout; used if [output_filename] argument is not provided)
   DPP_ANONYMIZE         Path to the key file
   DPP_FILENAME          Path to the input PCAP file (used if [filename] argument is not provided)
   DPP_AFFINITY          Set to 'true' to use cpu affinity
@@ -137,7 +140,7 @@ fn build_cli(version: &'static str) -> Command {
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
-  DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified)
+  DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
   DPP_MATCH_TIMEOUT_MS  DNS match timeout in milliseconds; allowed range is 1..=5000, default is 1200
   DPP_BONDED=N          Set IO channel capacity to 'N'; 0 uses the safe default bounded capacity
   DPP_FORMAT            Output format: csv, parquet, or pq (used if --format option is not specified)
@@ -147,6 +150,7 @@ fn build_cli(version: &'static str) -> Command {
 
 EXAMPLES:
   dpp -s -f parquet input.pcap dns_output.pq
+  dpp input.pcap - > output.csv
   DPP_FILENAME=input.pcap DPP_FORMAT=parquet dpp
 
 LICENSE INFORMATION:
@@ -172,14 +176,14 @@ LICENSE INFORMATION:
             Arg::new("format")
                 .long("format")
                 .short('f')
-                .help("Output format: csv or parquet|pq")
+                .help("Output format: csv or parquet|pq; stdout output is supported only for csv")
                 .num_args(1)
                 .value_parser(["csv", "parquet", "pq"]),
         )
         .arg(
             Arg::new("report_format")
                 .long("report-format")
-                .help("Final process report format: text or json")
+                .help("Final process report format: text or json; json cannot be combined with stdout output")
                 .value_name("text|json")
                 .num_args(1)
                 .value_parser(["text", "json"]),
@@ -249,7 +253,7 @@ LICENSE INFORMATION:
         .arg(
             Arg::new("output_filename")
                 .help(
-                    "Name of the output file (if not specified, defaults to 'dns_output.csv' or 'dns_output.parquet')",
+                    "Name of the output file; use '-' to write CSV records to stdout (if not specified, defaults to 'dns_output.csv' or 'dns_output.parquet')",
                 )
                 .required(false)
                 .index(2),
@@ -311,6 +315,10 @@ fn parse_match_timeout_ms(value: &str) -> Result<u64> {
 }
 
 fn validate_output_path(output_path: &Path) -> Result<()> {
+    if output_path_targets_stdout(output_path) {
+        return Ok(());
+    }
+
     if output_path.exists() {
         let metadata = fs::symlink_metadata(output_path)
             .context("Failed to retrieve file metadata for the output file")?;
@@ -323,6 +331,22 @@ fn validate_output_path(output_path: &Path) -> Result<()> {
 
     if output_path.is_dir() {
         bail!("Error: The output file path is a directory, not a file.");
+    }
+
+    Ok(())
+}
+
+fn validate_output_mode(
+    output_path: &Path,
+    format: OutputFormat,
+    report_format: ReportFormat,
+) -> Result<()> {
+    if output_path_targets_stdout(output_path) && !matches!(format, OutputFormat::Csv) {
+        bail!("Error: stdout output is supported only for '--format csv'.");
+    }
+
+    if output_path_targets_stdout(output_path) && matches!(report_format, ReportFormat::Json) {
+        bail!("Error: '--report-format json' cannot be used when output_filename is '-'.");
     }
 
     Ok(())
@@ -514,5 +538,40 @@ mod tests {
             .expect("readable anonymization key is accepted");
 
         fs::remove_file(path).expect("removes temp anonymization key");
+    }
+
+    #[test]
+    fn stdout_output_sentinel_is_accepted() {
+        validate_output_path(Path::new("-")).expect("stdout sentinel is accepted");
+    }
+
+    #[test]
+    fn json_report_format_is_rejected_for_stdout_output() {
+        let error = validate_output_mode(Path::new("-"), OutputFormat::Csv, ReportFormat::Json)
+            .expect_err("json report format must be rejected for stdout output");
+
+        assert!(
+            error
+                .to_string()
+                .contains("'--report-format json' cannot be used when output_filename is '-'")
+        );
+    }
+
+    #[test]
+    fn parquet_format_is_rejected_for_stdout_output() {
+        let error = validate_output_mode(Path::new("-"), OutputFormat::Parquet, ReportFormat::Text)
+            .expect_err("parquet format must be rejected for stdout output");
+
+        assert!(
+            error
+                .to_string()
+                .contains("stdout output is supported only for '--format csv'")
+        );
+    }
+
+    #[test]
+    fn text_report_format_is_allowed_for_stdout_output() {
+        validate_output_mode(Path::new("-"), OutputFormat::Csv, ReportFormat::Text)
+            .expect("text report format remains valid for stdout output");
     }
 }

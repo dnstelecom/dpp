@@ -511,28 +511,30 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         writer_result.map_err(|source| OutputError::WriterThreadFailure { source }),
     )?;
 
-    let final_write_post_processing_seconds = io_flush_start.elapsed().as_secs_f64();
-    let total_runtime_seconds = start_time.elapsed().as_secs_f64();
-    let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
-    let warnings = RunWarningsSummary {
-        non_monotonic_capture_timestamps: non_monotonic_timestamp_warning(&packet_parser),
-        graceful_signal_shutdown: shutdown_requested.load(AtomicOrdering::SeqCst),
-    };
-    let summary = build_run_summary(
-        &args,
-        execution_budget,
-        counters,
-        warnings,
-        max_memory_kib,
-        processing_seconds,
-        final_write_post_processing_seconds,
-        total_runtime_seconds,
-    );
+    if !args.writes_output_to_stdout() {
+        let final_write_post_processing_seconds = io_flush_start.elapsed().as_secs_f64();
+        let total_runtime_seconds = start_time.elapsed().as_secs_f64();
+        let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
+        let warnings = RunWarningsSummary {
+            non_monotonic_capture_timestamps: non_monotonic_timestamp_warning(&packet_parser),
+            graceful_signal_shutdown: shutdown_requested.load(AtomicOrdering::SeqCst),
+        };
+        let summary = build_run_summary(
+            &args,
+            execution_budget,
+            counters,
+            warnings,
+            max_memory_kib,
+            processing_seconds,
+            final_write_post_processing_seconds,
+            total_runtime_seconds,
+        );
 
-    match args.report_format {
-        ReportFormat::Text => display_text_summary(&summary),
-        ReportFormat::Json => {
-            emit_json_summary(&summary).map_err(|source| AppRunError::JsonSummary { source })?
+        match args.report_format {
+            ReportFormat::Text => display_text_summary(&summary),
+            ReportFormat::Json => {
+                emit_json_summary(&summary).map_err(|source| AppRunError::JsonSummary { source })?
+            }
         }
     }
 

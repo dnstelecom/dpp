@@ -41,6 +41,9 @@ pub(crate) const WORKER_STACK_SIZE_MB: usize = 16;
 /// Parquet row-group batch size.
 pub(crate) const PARQUET_WRITE_BATCH_SIZE: usize = 65_536;
 
+/// POSIX-style output path sentinel that directs exported records to standard output.
+pub(crate) const STDOUT_OUTPUT_SENTINEL: &str = "-";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OutputFormat {
@@ -55,6 +58,10 @@ impl OutputFormat {
             OutputFormat::Parquet => "dns_output.parquet",
         }
     }
+}
+
+pub(crate) fn output_path_targets_stdout(path: &Path) -> bool {
+    path == Path::new(STDOUT_OUTPUT_SENTINEL)
 }
 
 impl fmt::Display for OutputFormat {
@@ -172,6 +179,10 @@ impl ExecutionBudget {
 }
 
 impl AppConfig {
+    pub(crate) fn writes_output_to_stdout(&self) -> bool {
+        output_path_targets_stdout(&self.output_filename)
+    }
+
     pub(crate) fn match_timeout_micros(&self) -> i64 {
         i64::try_from(self.match_timeout_ms)
             .expect("validated timeout milliseconds fit into i64")
@@ -260,6 +271,16 @@ mod tests {
         let config = test_config();
 
         assert_eq!(config.match_timeout_micros(), 1_200_000);
+    }
+
+    #[test]
+    fn stdout_output_sentinel_is_detected() {
+        assert!(output_path_targets_stdout(Path::new("-")));
+        assert!(!output_path_targets_stdout(Path::new("dns_output.csv")));
+
+        let mut config = test_config();
+        config.output_filename = PathBuf::from("-");
+        assert!(config.writes_output_to_stdout());
     }
 
     #[test]

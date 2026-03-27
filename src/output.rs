@@ -11,6 +11,7 @@ use crate::{csv_writer, parquet_writer};
 use crossbeam::channel::Receiver;
 use std::error::Error;
 use std::fs::File;
+use std::io::{self, Write};
 use std::thread::{self, JoinHandle};
 
 pub(crate) use crate::record::DnsRecord;
@@ -61,24 +62,38 @@ pub(crate) fn create_writer_thread(
 ) -> Result<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>, OutputError> {
     match config.format {
         OutputFormat::Csv => {
-            let file = File::create(&config.output_filename).map_err(|source| {
-                OutputError::CreateCsvFile {
-                    path: config.output_filename.clone(),
-                    source,
-                }
-            })?;
+            let sink: Box<dyn Write + Send> = if config.writes_output_to_stdout() {
+                Box::new(io::stdout())
+            } else {
+                Box::new(File::create(&config.output_filename).map_err(|source| {
+                    OutputError::CreateCsvFile {
+                        path: config.output_filename.clone(),
+                        source,
+                    }
+                })?)
+            };
 
             Ok(thread::Builder::new()
                 .name("DPP_CSV_Writer".to_string())
-                .spawn(move || csv_writer::csv_writer(file, rx))
+                .spawn(move || csv_writer::csv_writer(sink, rx))
                 .map_err(|source| OutputError::SpawnWriterThread {
                     format: OutputFormat::Csv,
                     source,
                 })?)
         }
         OutputFormat::Parquet => {
+            let sink: Box<dyn Write + Send> = if config.writes_output_to_stdout() {
+                Box::new(io::stdout())
+            } else {
+                Box::new(File::create(&config.output_filename).map_err(|source| {
+                    OutputError::CreateParquetWriter {
+                        path: config.output_filename.clone(),
+                        source: Box::new(source),
+                    }
+                })?)
+            };
             let parquet_writer =
-                parquet_writer::create_parquet_writer(config).map_err(|source| {
+                parquet_writer::create_parquet_writer(sink, config).map_err(|source| {
                     OutputError::CreateParquetWriter {
                         path: config.output_filename.clone(),
                         source,
