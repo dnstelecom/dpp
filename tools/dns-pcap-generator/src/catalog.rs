@@ -29,6 +29,7 @@ fn load_catalog(tsv: &str) -> Result<Vec<WeightedDomain>> {
                 line: line_number + 1,
                 source,
             })?;
+        // SAFETY: intentional leak — catalog is loaded once for the process lifetime
         let name = Box::leak(name.to_string().into_boxed_str());
         domains.push(WeightedDomain { name, weight });
     }
