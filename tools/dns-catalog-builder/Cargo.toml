@@ -1,0 +1,11 @@
+[package]
+name = "dns-catalog-builder"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.94.1"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+csv = "1.4"
+dns-pcap-generator = { path = "../dns-pcap-generator" }
+thiserror = "2.0"

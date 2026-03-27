@@ -641,7 +641,7 @@ pub(crate) fn qtype_weights_for_negative_domain() -> &'static [TypeWeight] {
     NEGATIVE_TYPES
 }
 
-pub(crate) fn is_disallowed_domain(name: &str) -> bool {
+pub fn is_disallowed_domain(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
 
     DISALLOWED_DOMAIN_SUBSTRINGS

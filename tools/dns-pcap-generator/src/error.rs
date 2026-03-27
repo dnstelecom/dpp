@@ -6,7 +6,6 @@
  */
 
 use std::io;
-use std::num::ParseIntError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -37,16 +36,6 @@ pub enum Error {
 
     #[error("--duration-seconds must be greater than 0 when --transactions is omitted")]
     InvalidDurationWithoutTransactions,
-
-    #[error("--top must be greater than 0")]
-    InvalidCatalogTop,
-
-    #[error("failed to open '{path}'")]
-    InputOpen {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 
     #[error("failed to create output directory '{path}'")]
     OutputDirectoryCreate {
@@ -87,55 +76,7 @@ pub enum Error {
     InvalidCatalogWeight {
         line: usize,
         #[source]
-        source: ParseIntError,
-    },
-
-    #[error("failed to read CSV header")]
-    CsvHeader {
-        #[source]
-        source: csv::Error,
-    },
-
-    #[error("CSV must contain a 'name' column")]
-    MissingCsvNameColumn,
-
-    #[error("failed to decode CSV row {row}")]
-    CsvRow {
-        row: u64,
-        #[source]
-        source: csv::Error,
-    },
-
-    #[error("output path must include a file name: '{path}'")]
-    OutputPathMissingFileName { path: PathBuf },
-
-    #[error("failed to create temporary catalog '{path}'")]
-    TemporaryCatalogCreate {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to write catalog row for '{name}'")]
-    CatalogRowWrite {
-        name: String,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to flush '{path}'")]
-    OutputFlush {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to move temporary catalog '{temp_path}' into '{output_path}'")]
-    CatalogRename {
-        temp_path: PathBuf,
-        output_path: PathBuf,
-        #[source]
-        source: io::Error,
+        source: std::num::ParseIntError,
     },
 
     #[error("DNS name cannot be empty")]

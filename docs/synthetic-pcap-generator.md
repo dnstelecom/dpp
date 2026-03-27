@@ -52,8 +52,8 @@ Generate an exact number of logical transactions instead of duration-based traff
 Regenerate the embedded catalog TSV from a local CSV:
 
 ```bash
-cargo run -p dns-pcap-generator --release --bin dns-catalog-builder -- \
- from_real_traffic.csv \
+cargo run -p dns-catalog-builder --release -- \
+  from_real_traffic.csv \
   tools/dns-pcap-generator/catalog_data.tsv \
   --top 10000
 ```

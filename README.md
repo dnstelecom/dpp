@@ -260,7 +260,7 @@ cargo run -p dns-pcap-generator --release --bin dns-pcap-generator -- synthetic/
 To regenerate the embedded positive-domain catalog from a local CSV:
 
 ```bash
-cargo run -p dns-pcap-generator --release --bin dns-catalog-builder -- \
+cargo run -p dns-catalog-builder --release -- \
   real_dns_traffic.csv \
   tools/dns-pcap-generator/catalog_data.tsv \
   --top 10000

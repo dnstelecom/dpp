@@ -6,7 +6,6 @@
  */
 
 mod catalog;
-mod catalog_builder;
 mod cli;
 mod error;
 mod generator;
@@ -19,7 +18,6 @@ mod tuning;
 #[cfg(test)]
 mod tests;
 
-use catalog_builder::{BuilderCli, build_catalog_file};
 use clap::Parser;
 use cli::{Cli, GeneratorConfig};
 use generator::write_capture;
@@ -29,6 +27,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 pub use error::{Error, Result};
+pub use profile::is_disallowed_domain;
 
 pub fn report_error(error: &Error) {
     eprintln!("Error: {error}");
@@ -74,22 +73,6 @@ pub fn run_generator() -> Result<()> {
         summary.timed_out_transactions,
         summary.capture_span_seconds(),
         config.seed
-    );
-
-    Ok(())
-}
-
-pub fn run_catalog_builder() -> Result<()> {
-    let cli = BuilderCli::parse();
-    let summary = build_catalog_file(&cli)?;
-
-    println!(
-        "Wrote {} domains to {} from {} CSV rows ({} unique names, {} filtered).",
-        summary.emitted_domains,
-        cli.output.display(),
-        summary.rows_read,
-        summary.unique_domains,
-        summary.filtered_domains
     );
 
     Ok(())

@@ -5,37 +5,109 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::profile::is_disallowed_domain;
-use crate::{Error, Result};
 use clap::Parser;
 use csv::StringRecord;
+use dns_pcap_generator::is_disallowed_domain;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use thiserror::Error;
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "dns-catalog-builder",
     about = "Build a sanitized DNS catalog TSV from a CSV file"
 )]
-pub(crate) struct BuilderCli {
+struct Cli {
     #[arg(value_name = "INPUT_CSV")]
-    pub(crate) input: PathBuf,
+    input: PathBuf,
 
     #[arg(value_name = "OUTPUT_TSV")]
-    pub(crate) output: PathBuf,
+    output: PathBuf,
 
     #[arg(long, default_value_t = 10_000)]
-    pub(crate) top: usize,
+    top: usize,
+}
+
+#[derive(Debug, Error)]
+enum Error {
+    #[error("--top must be greater than 0")]
+    InvalidTop,
+
+    #[error("failed to open '{path}'")]
+    InputOpen {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create output directory '{path}'")]
+    OutputDirectoryCreate {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to read CSV header")]
+    CsvHeader {
+        #[source]
+        source: csv::Error,
+    },
+
+    #[error("CSV must contain a 'name' column")]
+    MissingCsvNameColumn,
+
+    #[error("failed to decode CSV row {row}")]
+    CsvRow {
+        row: u64,
+        #[source]
+        source: csv::Error,
+    },
+
+    #[error("output path must include a file name: '{path}'")]
+    OutputPathMissingFileName { path: PathBuf },
+
+    #[error("failed to create temporary catalog '{path}'")]
+    TemporaryCatalogCreate {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write catalog row for '{name}'")]
+    CatalogRowWrite {
+        name: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to flush '{path}'")]
+    OutputFlush {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to move temporary catalog '{temp_path}' into '{output_path}'")]
+    CatalogRename {
+        temp_path: PathBuf,
+        output_path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct CatalogBuildSummary {
-    pub(crate) rows_read: u64,
-    pub(crate) unique_domains: usize,
-    pub(crate) filtered_domains: usize,
-    pub(crate) emitted_domains: usize,
+struct CatalogBuildSummary {
+    rows_read: u64,
+    unique_domains: usize,
+    filtered_domains: usize,
+    emitted_domains: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -44,9 +116,44 @@ struct CatalogEntry {
     name: String,
 }
 
-pub(crate) fn build_catalog_file(cli: &BuilderCli) -> Result<CatalogBuildSummary> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_error(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let summary = build_catalog_file(&cli)?;
+
+    println!(
+        "Wrote {} domains to {} from {} CSV rows ({} unique names, {} filtered).",
+        summary.emitted_domains,
+        cli.output.display(),
+        summary.rows_read,
+        summary.unique_domains,
+        summary.filtered_domains
+    );
+
+    Ok(())
+}
+
+fn report_error(error: &Error) {
+    eprintln!("Error: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        eprintln!("Caused by: {cause}");
+        source = cause.source();
+    }
+}
+
+fn build_catalog_file(cli: &Cli) -> Result<CatalogBuildSummary> {
     if cli.top == 0 {
-        return Err(Error::InvalidCatalogTop);
+        return Err(Error::InvalidTop);
     }
 
     let input = File::open(&cli.input).map_err(|source| Error::InputOpen {
@@ -185,7 +292,7 @@ mod tests {
 
     #[test]
     fn build_catalog_aggregates_filters_and_sorts_rows() {
-        assert!(!crate::profile::is_disallowed_domain("api.vk.com"));
+        assert!(!dns_pcap_generator::is_disallowed_domain("api.vk.com"));
 
         let csv = "\
 request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code

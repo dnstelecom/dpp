@@ -721,12 +721,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-catalog-builder"
+version = "0.21.0"
+dependencies = [
+ "clap",
+ "csv",
+ "dns-pcap-generator",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "dns-pcap-generator"
 version = "0.21.0"
 dependencies = [
  "anyhow",
  "clap",
- "csv",
  "pcap-file",
  "seahash",
  "serde",
