@@ -18,8 +18,7 @@ use parquet::schema::types::ColumnPath;
 use parquet::schema::types::TypePtr;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -40,10 +39,13 @@ pub fn build_dns_schema() -> Result<TypePtr, Box<dyn Error + Send + Sync>> {
     Ok(Arc::new(parse_message_type(message_type)?))
 }
 
-pub(crate) fn create_parquet_writer(
+pub(crate) fn create_parquet_writer<W>(
+    sink: W,
     config: &AppConfig,
-) -> Result<SerializedFileWriter<File>, Box<dyn Error + Send + Sync>> {
-    let file = File::create(&config.output_filename)?;
+) -> Result<SerializedFileWriter<W>, Box<dyn Error + Send + Sync>>
+where
+    W: Write + Send,
+{
     let schema = build_dns_schema()?;
 
     let compression = if config.zstd {
@@ -72,7 +74,7 @@ pub(crate) fn create_parquet_writer(
             .build(),
     );
 
-    Ok(SerializedFileWriter::new(file, schema, props)?)
+    Ok(SerializedFileWriter::new(sink, schema, props)?)
 }
 
 fn format_ip_address(ip: &IpAddr) -> ArrayString<45> {
@@ -82,7 +84,7 @@ fn format_ip_address(ip: &IpAddr) -> ArrayString<45> {
 }
 
 fn write_column<Type>(
-    row_group_writer: &mut parquet::file::writer::SerializedRowGroupWriter<'_, File>,
+    row_group_writer: &mut parquet::file::writer::SerializedRowGroupWriter<'_, impl Write + Send>,
     values: &[Type::T],
     missing_column_error: &'static str,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -99,10 +101,13 @@ where
     Ok(())
 }
 
-fn flush_buffer_async_parquet(
-    parquet_writer: &mut SerializedFileWriter<File>,
+fn flush_buffer_async_parquet<W>(
+    parquet_writer: &mut SerializedFileWriter<W>,
     buffer: &mut Vec<DnsRecord>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    W: Write + Send,
+{
     let len = buffer.len();
     let mut request_timestamps = Vec::with_capacity(len);
     let mut response_timestamps = Vec::with_capacity(len);
@@ -171,7 +176,7 @@ fn flush_buffer_async_parquet(
 
 /// Parquet writer loop that owns its buffer and flushes on threshold or shutdown.
 pub(crate) fn parquet_writer(
-    mut parquet_writer: SerializedFileWriter<File>,
+    mut parquet_writer: SerializedFileWriter<impl Write + Send>,
     rx: Receiver<OutputMessage>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buffer = Vec::with_capacity(OUTPUT_FLUSH_THRESHOLD);
@@ -192,7 +197,29 @@ mod tests {
     use crossbeam::channel;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::fs;
+    use std::fs::File;
+    use std::io;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedSink {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("shared sink lock is healthy")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn parquet_writer_flushes_buffer_on_shutdown() {
@@ -214,7 +241,8 @@ mod tests {
             anonymize: None,
             dns_wire_fast_path: false,
         };
-        let writer = create_parquet_writer(&config).expect("creates parquet writer");
+        let file = File::create(&filename).expect("creates parquet file");
+        let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
         tx.send(OutputMessage::Record(test_dns_record()))
@@ -251,7 +279,8 @@ mod tests {
             anonymize: None,
             dns_wire_fast_path: false,
         };
-        let writer = create_parquet_writer(&config).expect("creates parquet writer");
+        let file = File::create(&filename).expect("creates parquet file");
+        let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
         tx.send(OutputMessage::Record(test_dns_record()))
@@ -266,5 +295,45 @@ mod tests {
         assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
 
         fs::remove_file(filename).expect("removes temp parquet file");
+    }
+
+    #[test]
+    fn parquet_writer_supports_non_file_sinks() {
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let config = AppConfig {
+            filename: PathBuf::from("input.pcap"),
+            output_filename: PathBuf::from("-"),
+            format: OutputFormat::Parquet,
+            report_format: crate::config::ReportFormat::Text,
+            match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            monotonic_capture: false,
+            zstd: false,
+            v2: false,
+            silent: true,
+            num_cpus: 1,
+            requested_threads: None,
+            affinity: false,
+            bonded: 0,
+            anonymize: None,
+            dns_wire_fast_path: false,
+        };
+        let writer = create_parquet_writer(
+            SharedSink {
+                buffer: Arc::clone(&shared),
+            },
+            &config,
+        )
+        .expect("creates parquet writer");
+        let (tx, rx) = channel::unbounded();
+
+        tx.send(OutputMessage::Record(test_dns_record()))
+            .expect("record is sent");
+        tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
+
+        parquet_writer(writer, rx).expect("parquet writer completes successfully");
+
+        let bytes = shared.lock().expect("shared sink lock is healthy");
+        assert!(!bytes.is_empty());
+        assert_eq!(&bytes[..4], b"PAR1");
     }
 }
