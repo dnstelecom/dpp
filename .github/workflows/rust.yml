@@ -19,9 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-20.04
-            os_label: Ubuntu 20.04
-            artifact_suffix: ubuntu_20.04_x86_64
           - runner: ubuntu-22.04
             os_label: Ubuntu 22.04
             artifact_suffix: ubuntu_22.04_x86_64
