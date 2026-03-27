@@ -74,6 +74,7 @@ DPP reads offline PCAP files, extracts DNS traffic, matches queries with respons
 - Allocator guide: [docs/allocator-guide.md](docs/allocator-guide.md)
 - Allocator benchmarking protocol: [benches/allocator-benchmarking.md](benches/allocator-benchmarking.md)
 - Encapsulation handling playbook: [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md)
+- Synthetic DNS PCAP generator: [docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md)
 
 ## Prerequisites
 
@@ -238,6 +239,27 @@ If packet timestamps move backwards in capture order, DPP emits a red warning af
 Matching remains deterministic, but timestamp-based pairing quality may degrade on such input.
 When that warning appears, normalize the capture first with Wireshark's `reordercap`, for example:
 `reordercap input.pcap normalized.pcap`
+
+## Synthetic Capture Generation
+
+This repository also ships a standalone utility, `dns-pcap-generator`, for producing synthetic DNS
+classic-PCAP files without needing a source capture at runtime.
+
+Example:
+
+```bash
+cargo run --release --bin dns-pcap-generator -- synthetic/server1-like.pcap \
+  --profile server1-jul-2024-sanitized \
+  --duration-seconds 300 \
+  --qps 30000 \
+  --duplicate-rate 0.08 \
+  --timeout-rate 0.03
+```
+
+The default profile is shaped after a representative July 2024 resolver workload but keeps only
+sanitized, non-client-specific, non-Russian query names. See
+[docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md) for the full contract and
+current modeling assumptions.
 
 For captures that are already globally monotonic by timestamp, `--monotonic-capture` or
 `DPP_MONOTONIC_CAPTURE=1` enables batched timeout eviction inside the matcher. This can reduce
