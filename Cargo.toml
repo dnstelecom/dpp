@@ -49,14 +49,14 @@ pcap = "2.4"                      # Library for reading pcap files
 pcap-file = "3.0.0-rc1"           # Pure-Rust parser for classic pcap and pcapng files
 pnet_packet = "0.35"             # Packet parsing library for network packets
 rayon = "1.11"                    # Parallelism library for multithreaded processing
-hickory-proto = "0.25"            # DNS protocol parsing library
+hickory-proto = { version = "0.25", default-features = false, features = ["std"] } # DNS protocol parsing library
 csv = "1.4"                       # CSV serialization and deserialization
 crossbeam = "0.8"                 # Concurrency support with channels and data structures
 anyhow = "1.0"                    # Error handling library
 num-format = "0.4"                # Number formatting for logging and output
 sysinfo = "0.38"                  # System information retrieval (for memory monitoring)
 arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
-parquet = "58.1.0"                # Apache Parquet format support for exporting results
+parquet = { version = "58.1.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
 serde = { version = "1.0", features = ["derive"] }  # Serialization and deserialization support
 clap = { version = "4.6", features = ["derive"] }   # Command-line argument parsing
 tikv-jemallocator = { version = "0.6.1", optional = true } # Jemalloc successor for Rust global allocation
@@ -64,7 +64,7 @@ mimalloc = { version = "0.1.48", optional = true }         # Microsoft mimalloc 
 seahash = "4.1.0"                 # Fast Hash
 core_affinity = "0.8.3"           # To assign threads to specific CPU cores
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "local-time", "chrono"] }
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "ansi", "chrono"] }
 tracing-log = "0.2.0"             # Bridges log-based dependencies into tracing
 aes = "0.8.4"
 pbkdf2 = "0.12.2"
