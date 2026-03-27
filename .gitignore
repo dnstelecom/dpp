@@ -1,0 +1,9 @@
+/target
+
+# Local capture artifacts belong in dedicated fixture/testdata directories, not in the repository
+# root. Keep root-level PCAP/CSV/Parquet files untracked by default.
+/*.pcap
+/*.pcapng
+/*.csv
+/*.pq
+/*.parquet
