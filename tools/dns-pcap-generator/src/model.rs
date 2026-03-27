@@ -5,6 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 pub(crate) const DEFAULT_SNAPLEN: u32 = 262_144;
@@ -14,45 +15,70 @@ pub(crate) const DEFAULT_SEED: u64 = 0x5eed_f00d_cafe_beef;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DnsQuestionType {
     A,
+    Any,
     Ns,
+    Ptr,
     Aaaa,
+    Soa,
+    Hinfo,
+    Naptr,
+    Ds,
     Https,
     Svcb,
     Txt,
     Srv,
     Cname,
     Mx,
+    Zero,
+    Unknown,
 }
 
 impl DnsQuestionType {
     pub(crate) const fn code(self) -> u16 {
         match self {
             Self::A => 1,
+            Self::Zero => 0,
             Self::Ns => 2,
-            Self::Aaaa => 28,
             Self::Cname => 5,
+            Self::Soa => 6,
+            Self::Ptr => 12,
+            Self::Hinfo => 13,
             Self::Mx => 15,
             Self::Txt => 16,
+            Self::Aaaa => 28,
             Self::Srv => 33,
+            Self::Naptr => 35,
+            Self::Ds => 43,
             Self::Svcb => 64,
             Self::Https => 65,
+            Self::Any => 255,
+            // Hypothesis: DPP renders this synthetic private-use code as "Unknown",
+            // which keeps the fitted qtype tail representable without binding runtime
+            // behavior to a specific opaque code from the reference capture.
+            Self::Unknown => 65_280,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResponseCodeKind {
+    FormErr,
     NoError,
     ServFail,
     NxDomain,
+    NotImp,
+    Refused,
 }
 
 impl ResponseCodeKind {
     pub(crate) const fn code(self) -> u16 {
         match self {
+            Self::FormErr => 1,
             Self::NoError => 0,
             Self::ServFail => 2,
             Self::NxDomain => 3,
+            Self::NotImp => 4,
+            Self::Refused => 5,
         }
     }
 }
@@ -63,9 +89,22 @@ pub(crate) struct TypeWeight {
     pub(crate) weight: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+pub(crate) enum QueryTypeModel {
+    Explicit(ExplicitQueryTypeProfile),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExplicitQueryTypeProfile {
+    pub(crate) positive: Vec<TypeWeight>,
+    pub(crate) negative: Vec<TypeWeight>,
+    pub(crate) reverse: Vec<TypeWeight>,
+    pub(crate) root: Vec<TypeWeight>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct WeightedDomain {
-    pub(crate) name: &'static str,
+    pub(crate) name: Cow<'static, str>,
     pub(crate) weight: u32,
 }
 
@@ -76,11 +115,47 @@ pub(crate) struct ResponseCodeWeight {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryCountWeight {
+    pub(crate) retry_count: u8,
+    pub(crate) weight: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DelayBucket {
+    pub(crate) weight: u32,
+    pub(crate) min_us: u64,
+    pub(crate) max_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DelayRange {
+    pub(crate) min_us: u64,
+    pub(crate) max_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProfileGenerationDefaults {
+    pub(crate) qps: f64,
+    pub(crate) clients: usize,
+    pub(crate) resolvers: usize,
+    pub(crate) duplicate_rate: f64,
+    pub(crate) timeout_rate: f64,
+    pub(crate) duplicate_max: u8,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct TrafficProfile {
-    pub(crate) name: &'static str,
-    pub(crate) positive_domains: &'static [WeightedDomain],
-    pub(crate) negative_domains: &'static [WeightedDomain],
-    pub(crate) response_codes: &'static [ResponseCodeWeight],
+    pub(crate) name: String,
+    pub(crate) positive_domains: Vec<WeightedDomain>,
+    pub(crate) negative_domains: Vec<WeightedDomain>,
+    pub(crate) query_types: QueryTypeModel,
+    pub(crate) response_codes: Vec<ResponseCodeWeight>,
+    pub(crate) duplicate_retry_counts: Vec<RetryCountWeight>,
+    pub(crate) normal_response_delay_buckets: Vec<DelayBucket>,
+    pub(crate) servfail_response_delay_buckets: Vec<DelayBucket>,
+    pub(crate) answered_retry_delay_ranges: Vec<DelayRange>,
+    pub(crate) unanswered_retry_delay_ranges: Vec<DelayRange>,
+    pub(crate) generation_defaults: ProfileGenerationDefaults,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

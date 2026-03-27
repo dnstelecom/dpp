@@ -5,154 +5,31 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::catalog::SERVER1_JUL_2024_POSITIVE_DOMAINS;
-use crate::cli::ProfileKind;
-use crate::model::{DnsQuestionType, TrafficProfile, TypeWeight, WeightedDomain};
-use crate::tuning::RESPONSE_CODES;
+use crate::model::{
+    DelayBucket, DelayRange, QueryTypeModel, TrafficProfile, TypeWeight, WeightedDomain,
+};
 use crate::{Error, Result};
-
-const WEB_RICH_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 67,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Https,
-        weight: 20,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 12,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Svcb,
-        weight: 1,
-    },
-];
-
-const API_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 77,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 12,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Https,
-        weight: 10,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Svcb,
-        weight: 1,
-    },
-];
-
-const A_HEAVY_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 88,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 10,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Https,
-        weight: 2,
-    },
-];
-
-const EDGE_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 82,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Https,
-        weight: 12,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 5,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Svcb,
-        weight: 1,
-    },
-];
-
-const SERVICE_MISC_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 87,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 8,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Txt,
-        weight: 2,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Srv,
-        weight: 1,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Cname,
-        weight: 1,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Mx,
-        weight: 1,
-    },
-];
-
-const NEGATIVE_TYPES: &[TypeWeight] = &[
-    TypeWeight {
-        qtype: DnsQuestionType::A,
-        weight: 74,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Https,
-        weight: 14,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Aaaa,
-        weight: 10,
-    },
-    TypeWeight {
-        qtype: DnsQuestionType::Svcb,
-        weight: 2,
-    },
-];
-
-const ROOT_TYPES: &[TypeWeight] = &[TypeWeight {
-    qtype: DnsQuestionType::Ns,
-    weight: 100,
-}];
+use std::borrow::Cow;
 
 const NEGATIVE_DOMAINS: &[WeightedDomain] = &[
     WeightedDomain {
-        name: "bootstrap-check.synthetic.invalid",
+        name: Cow::Borrowed("bootstrap-check.synthetic.invalid"),
         weight: 26,
     },
     WeightedDomain {
-        name: "public-api-probe.synthetic.invalid",
+        name: Cow::Borrowed("public-api-probe.synthetic.invalid"),
         weight: 24,
     },
     WeightedDomain {
-        name: "edge-config-miss.synthetic.invalid",
+        name: Cow::Borrowed("edge-config-miss.synthetic.invalid"),
         weight: 22,
     },
     WeightedDomain {
-        name: "media-bootstrap.synthetic.invalid",
+        name: Cow::Borrowed("media-bootstrap.synthetic.invalid"),
         weight: 18,
     },
     WeightedDomain {
-        name: "fallback-control.synthetic.invalid",
+        name: Cow::Borrowed("fallback-control.synthetic.invalid"),
         weight: 18,
     },
 ];
@@ -530,34 +407,35 @@ const CLIENT_SPECIFIC_SUBSTRINGS: &[&str] = &[
     "alarmserverlist.",
 ];
 
-pub(crate) fn profile_for(kind: ProfileKind) -> TrafficProfile {
-    match kind {
-        ProfileKind::Server1Jul2024Sanitized => TrafficProfile {
-            name: "server1-jul-2024-sanitized",
-            positive_domains: SERVER1_JUL_2024_POSITIVE_DOMAINS.as_slice(),
-            negative_domains: NEGATIVE_DOMAINS,
-            response_codes: RESPONSE_CODES,
-        },
-    }
+pub(crate) fn builtin_negative_domains() -> Vec<WeightedDomain> {
+    NEGATIVE_DOMAINS.to_vec()
 }
 
 pub(crate) fn validate_profile(profile: &TrafficProfile) -> Result<()> {
-    if profile.positive_domains.len() < 10_000 {
+    validate_minimum_positive_domains(profile, 1)?;
+    validate_profile_common(profile)
+}
+
+fn validate_minimum_positive_domains(profile: &TrafficProfile, minimum: usize) -> Result<()> {
+    if profile.positive_domains.len() < minimum {
         return Err(Error::ProfileTooFewPositiveDomains {
-            profile: profile.name,
-            minimum: 10_000,
+            profile: profile.name.clone(),
+            minimum,
             found: profile.positive_domains.len(),
         });
     }
+    Ok(())
+}
 
+fn validate_profile_common(profile: &TrafficProfile) -> Result<()> {
     for domain in profile
         .positive_domains
         .iter()
         .chain(profile.negative_domains.iter())
     {
-        if is_disallowed_domain(domain.name) {
+        if is_disallowed_domain(domain.name.as_ref()) {
             return Err(Error::ProfileDisallowedDomain {
-                profile: profile.name,
+                profile: profile.name.clone(),
                 domain: domain.name.to_string(),
             });
         }
@@ -565,87 +443,108 @@ pub(crate) fn validate_profile(profile: &TrafficProfile) -> Result<()> {
 
     if profile.response_codes.is_empty() {
         return Err(Error::ProfileMissingResponseCodes {
-            profile: profile.name,
+            profile: profile.name.clone(),
+        });
+    }
+
+    if profile.duplicate_retry_counts.is_empty() {
+        return Err(Error::ProfileMissingDuplicateRetryCounts {
+            profile: profile.name.clone(),
+        });
+    }
+
+    match &profile.query_types {
+        QueryTypeModel::Explicit(query_types) => {
+            validate_query_type_weights(profile, "positive", &query_types.positive)?;
+            validate_query_type_weights(profile, "negative", &query_types.negative)?;
+            validate_query_type_weights(profile, "reverse", &query_types.reverse)?;
+            validate_query_type_weights(profile, "root", &query_types.root)?;
+        }
+    }
+
+    validate_delay_buckets(
+        profile,
+        "normal response",
+        &profile.normal_response_delay_buckets,
+    )?;
+    validate_delay_buckets(
+        profile,
+        "servfail response",
+        &profile.servfail_response_delay_buckets,
+    )?;
+    validate_retry_ranges(
+        profile,
+        "answered retry",
+        &profile.answered_retry_delay_ranges,
+    )?;
+    validate_retry_ranges(
+        profile,
+        "unanswered retry",
+        &profile.unanswered_retry_delay_ranges,
+    )?;
+
+    Ok(())
+}
+
+fn validate_query_type_weights(
+    profile: &TrafficProfile,
+    category: &'static str,
+    weights: &[TypeWeight],
+) -> Result<()> {
+    if weights.is_empty() {
+        return Err(Error::ProfileMissingQueryTypeWeights {
+            profile: profile.name.clone(),
+            category,
+        });
+    }
+    Ok(())
+}
+
+fn validate_delay_buckets(
+    profile: &TrafficProfile,
+    bucket_family: &'static str,
+    buckets: &[DelayBucket],
+) -> Result<()> {
+    if buckets.is_empty() {
+        return Err(Error::ProfileMissingResponseDelayBuckets {
+            profile: profile.name.clone(),
+            bucket_family,
         });
     }
 
     Ok(())
 }
 
-pub(crate) fn qtype_weights_for_positive_domain(name: &str) -> &'static [TypeWeight] {
-    if name == "." {
-        return ROOT_TYPES;
+fn validate_retry_ranges(
+    profile: &TrafficProfile,
+    range_family: &'static str,
+    ranges: &[DelayRange],
+) -> Result<()> {
+    if ranges.is_empty() {
+        return Err(Error::ProfileMissingRetryDelayRanges {
+            profile: profile.name.clone(),
+            range_family,
+        });
     }
 
+    Ok(())
+}
+
+pub(crate) fn is_root_dns_name(name: &str) -> bool {
+    name == "."
+}
+
+pub(crate) fn is_reverse_dns_name(name: &str) -> bool {
     if domain_is_ascii_lowercase(name) {
-        return qtype_weights_for_normalized_positive_domain(name);
+        return is_reverse_dns_name_normalized(name);
     }
 
     let lower = name.to_ascii_lowercase();
-    qtype_weights_for_normalized_positive_domain(&lower)
+    is_reverse_dns_name_normalized(&lower)
 }
 
-fn qtype_weights_for_normalized_positive_domain(name: &str) -> &'static [TypeWeight] {
-    if name.contains("connectivitycheck")
-        || name.starts_with("dns.")
-        || name.contains("time.")
-        || name.ends_with("root-servers.net")
-        || name.ends_with("pool.ntp.org")
-        || name.ends_with("whoami.akamai.net")
-    {
-        return A_HEAVY_TYPES;
-    }
-
-    if name.contains("analytics")
-        || name.contains("measurement")
-        || name.contains("logging")
-        || name.contains("remoteconfig")
-        || name.contains("crashlytics")
-        || name.contains("app-measurement")
-        || name.contains("pubsub")
-        || name.contains("notifications")
-        || name.contains("collector.")
-        || name.contains("metrics")
-    {
-        return SERVICE_MISC_TYPES;
-    }
-
-    if name.starts_with("api.")
-        || name.contains("googleapis.com")
-        || name.contains("facebook.com")
-        || name.contains("instagram.com")
-        || name.contains("mixpanel.com")
-        || name.contains("appcenter.ms")
-        || name.contains("xiaomi.com")
-        || name.contains("apple-dns.net")
-        || name.contains("icloud.com")
-        || name.contains("aaplimg.com")
-        || name.contains("whatsapp.net")
-        || name.contains("viber.com")
-    {
-        return API_TYPES;
-    }
-
-    if name.starts_with("www.")
-        || name.contains("googleusercontent.com")
-        || name.contains("ytimg.com")
-        || name.contains("gstatic.com")
-        || name.contains("tiktokcdn.com")
-        || name.contains("tiktokv.com")
-        || name.contains("ttlivecdn.com")
-        || name.contains("akamaiedge.net")
-        || name.contains("doubleclick.net")
-        || name.contains("cdn.")
-        || name.contains("edge")
-    {
-        return EDGE_TYPES;
-    }
-
-    WEB_RICH_TYPES
-}
-
-pub(crate) fn qtype_weights_for_negative_domain() -> &'static [TypeWeight] {
-    NEGATIVE_TYPES
+fn is_reverse_dns_name_normalized(name: &str) -> bool {
+    name.ends_with(".in-addr.arpa") || name.ends_with(".ip6.arpa")
 }
 
 pub fn is_disallowed_domain(name: &str) -> bool {

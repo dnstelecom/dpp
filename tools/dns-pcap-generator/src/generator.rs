@@ -7,18 +7,15 @@
 
 use crate::cli::GeneratorConfig;
 use crate::model::{
-    DEFAULT_SNAPLEN, GenerationSummary, ResponseCodeKind, TrafficProfile, WeightedDomain,
+    DEFAULT_SNAPLEN, DnsQuestionType, GenerationSummary, QueryTypeModel, ResponseCodeKind,
+    TrafficProfile, TypeWeight, WeightedDomain,
 };
 use crate::packet::{
     DNS_PORT, MacPair, build_client_pool, build_dns_query_payload, build_dns_response_payload,
     build_resolver_pool, build_udp_dns_ipv4_packet,
 };
-use crate::profile::{qtype_weights_for_negative_domain, qtype_weights_for_positive_domain};
+use crate::profile::{is_reverse_dns_name, is_root_dns_name};
 use crate::rng::{SplitMix64, pick_weighted};
-use crate::tuning::{
-    ANSWERED_RETRY_DELAY_RANGES, NORMAL_RESPONSE_DELAY_BUCKETS, SERVFAIL_RESPONSE_DELAY_BUCKETS,
-    UNANSWERED_RETRY_DELAY_RANGES,
-};
 use crate::{Error, Result};
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
 use pcap_file::{DataLink, Endianness};
@@ -128,14 +125,15 @@ impl<'a> GeneratorState<'a> {
             let timed_out = self.rng.chance(self.config.timeout_rate);
             let response_code = (!timed_out).then(|| self.sample_response_code());
             let duplicate_count = self.sample_duplicate_count();
-            let (qname, qtype) = self.sample_query_identity(response_code);
+            let (qname, qtype) =
+                Self::sample_query_identity(&mut self.rng, self.profile, response_code);
 
             let base_query = self.build_query_packet(
                 client,
                 resolver,
                 source_port,
                 transaction_id,
-                qname.name,
+                qname.name.as_ref(),
                 qtype,
             )?;
             self.write_packet(writer, self.current_timestamp, base_query)?;
@@ -149,7 +147,7 @@ impl<'a> GeneratorState<'a> {
                     resolver,
                     source_port,
                     transaction_id,
-                    qname.name,
+                    qname.name.as_ref(),
                     qtype,
                 )?;
                 self.schedule_packet(last_query_timestamp, retry_packet);
@@ -165,16 +163,19 @@ impl<'a> GeneratorState<'a> {
                         client,
                         source_port,
                         transaction_id,
-                        qname.name,
+                        qname.name.as_ref(),
                         qtype,
                         code,
                     )?;
                     self.schedule_packet(response_timestamp, response_packet);
                     self.summary.response_packets += 1;
                     match code {
+                        ResponseCodeKind::FormErr => {}
                         ResponseCodeKind::NoError => self.summary.noerror_responses += 1,
                         ResponseCodeKind::ServFail => self.summary.servfail_responses += 1,
                         ResponseCodeKind::NxDomain => self.summary.nxdomain_responses += 1,
+                        ResponseCodeKind::NotImp => {}
+                        ResponseCodeKind::Refused => {}
                     }
                 }
                 None => {
@@ -198,63 +199,58 @@ impl<'a> GeneratorState<'a> {
             return 0;
         }
 
-        let capped = self.config.duplicate_max.min(3);
-        let roll = self.rng.below(100);
-        match capped {
-            1 => 1,
-            2 => {
-                if roll < 80 {
-                    1
-                } else {
-                    2
-                }
-            }
-            _ => {
-                if roll < 72 {
-                    1
-                } else if roll < 94 {
-                    2
-                } else {
-                    3
-                }
-            }
-        }
+        let supported_max = self
+            .profile
+            .duplicate_retry_counts
+            .last()
+            .map(|entry| entry.retry_count)
+            .unwrap_or_default();
+        let capped_max = self.config.duplicate_max.min(supported_max);
+        let candidate_count = self
+            .profile
+            .duplicate_retry_counts
+            .iter()
+            .take_while(|entry| entry.retry_count <= capped_max)
+            .count();
+        let retry_count = pick_weighted(
+            &self.profile.duplicate_retry_counts[..candidate_count],
+            &mut self.rng,
+            |entry| u64::from(entry.weight),
+        );
+        retry_count.retry_count
     }
 
     fn sample_response_code(&mut self) -> ResponseCodeKind {
-        pick_weighted(self.profile.response_codes, &mut self.rng, |entry| {
-            u64::from(entry.weight)
-        })
+        pick_weighted(
+            self.profile.response_codes.as_slice(),
+            &mut self.rng,
+            |entry| u64::from(entry.weight),
+        )
         .code
     }
 
-    fn sample_query_identity(
-        &mut self,
+    fn sample_query_identity<'b>(
+        rng: &mut SplitMix64,
+        profile: &'b TrafficProfile,
         response_code: Option<ResponseCodeKind>,
-    ) -> (&'static WeightedDomain, crate::model::DnsQuestionType) {
+    ) -> (&'b WeightedDomain, DnsQuestionType) {
         match response_code {
             Some(ResponseCodeKind::NxDomain) => {
-                let domain = pick_weighted(self.profile.negative_domains, &mut self.rng, |entry| {
+                let domain = pick_weighted(profile.negative_domains.as_slice(), rng, |entry| {
                     u64::from(entry.weight)
                 });
-                let qtype = pick_weighted(
-                    qtype_weights_for_negative_domain(),
-                    &mut self.rng,
-                    |entry| u64::from(entry.weight),
-                )
-                .qtype;
+                let qtype = match &profile.query_types {
+                    QueryTypeModel::Explicit(query_types) => {
+                        sample_qtype(rng, query_types.negative.as_slice())
+                    }
+                };
                 (domain, qtype)
             }
             _ => {
-                let domain = pick_weighted(self.profile.positive_domains, &mut self.rng, |entry| {
+                let domain = pick_weighted(profile.positive_domains.as_slice(), rng, |entry| {
                     u64::from(entry.weight)
                 });
-                let qtype = pick_weighted(
-                    qtype_weights_for_positive_domain(domain.name),
-                    &mut self.rng,
-                    |entry| u64::from(entry.weight),
-                )
-                .qtype;
+                let qtype = sample_positive_domain_qtype(rng, profile, domain.name.as_ref());
                 (domain, qtype)
             }
         }
@@ -262,9 +258,9 @@ impl<'a> GeneratorState<'a> {
 
     fn retry_delay(&mut self, retry_index: u8, unanswered: bool) -> Duration {
         let ranges = if unanswered {
-            UNANSWERED_RETRY_DELAY_RANGES
+            &self.profile.unanswered_retry_delay_ranges
         } else {
-            ANSWERED_RETRY_DELAY_RANGES
+            &self.profile.answered_retry_delay_ranges
         };
         let range = ranges[usize::from(retry_index).min(ranges.len() - 1)];
         Duration::from_micros(self.rng.range_inclusive_u64(range.min_us, range.max_us))
@@ -272,8 +268,13 @@ impl<'a> GeneratorState<'a> {
 
     fn response_delay(&mut self, response_code: ResponseCodeKind) -> Duration {
         let buckets = match response_code {
-            ResponseCodeKind::ServFail => SERVFAIL_RESPONSE_DELAY_BUCKETS,
-            ResponseCodeKind::NoError | ResponseCodeKind::NxDomain => NORMAL_RESPONSE_DELAY_BUCKETS,
+            ResponseCodeKind::FormErr
+            | ResponseCodeKind::ServFail
+            | ResponseCodeKind::NotImp
+            | ResponseCodeKind::Refused => &self.profile.servfail_response_delay_buckets,
+            ResponseCodeKind::NoError | ResponseCodeKind::NxDomain => {
+                &self.profile.normal_response_delay_buckets
+            }
         };
         let bucket = pick_weighted(buckets, &mut self.rng, |entry| u64::from(entry.weight));
         Duration::from_micros(self.rng.range_inclusive_u64(bucket.min_us, bucket.max_us))
@@ -371,4 +372,27 @@ impl<'a> GeneratorState<'a> {
             &payload,
         ))
     }
+}
+
+fn sample_positive_domain_qtype(
+    rng: &mut SplitMix64,
+    profile: &TrafficProfile,
+    name: &str,
+) -> DnsQuestionType {
+    let weights = match &profile.query_types {
+        QueryTypeModel::Explicit(query_types) => {
+            if is_root_dns_name(name) {
+                query_types.root.as_slice()
+            } else if is_reverse_dns_name(name) {
+                query_types.reverse.as_slice()
+            } else {
+                query_types.positive.as_slice()
+            }
+        }
+    };
+    sample_qtype(rng, weights)
+}
+
+fn sample_qtype(rng: &mut SplitMix64, weights: &[TypeWeight]) -> DnsQuestionType {
+    pick_weighted(weights, rng, |entry| u64::from(entry.weight)).qtype
 }

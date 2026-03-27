@@ -201,15 +201,26 @@ fn build_dns_answer(
             rdata.extend_from_slice(&synthetic_ipv6_for_name(qname));
             Ok(Some((ttl, rdata)))
         }
+        DnsQuestionType::Ptr => {
+            append_dns_name(&mut rdata, &synthetic_ptr_target_for_name(qname))?;
+            Ok(Some((ttl, rdata)))
+        }
         DnsQuestionType::Https | DnsQuestionType::Svcb => {
             rdata.extend_from_slice(&1_u16.to_be_bytes());
             rdata.push(0);
             Ok(Some((ttl, rdata)))
         }
-        DnsQuestionType::Txt
+        DnsQuestionType::Any
+        | DnsQuestionType::Soa
+        | DnsQuestionType::Hinfo
+        | DnsQuestionType::Naptr
+        | DnsQuestionType::Ds
+        | DnsQuestionType::Txt
         | DnsQuestionType::Srv
         | DnsQuestionType::Cname
-        | DnsQuestionType::Mx => Ok(None),
+        | DnsQuestionType::Mx
+        | DnsQuestionType::Zero
+        | DnsQuestionType::Unknown => Ok(None),
     }
 }
 
@@ -238,6 +249,11 @@ fn synthetic_ipv6_for_name(name: &str) -> [u8; 16] {
         value[2] ^ value[6],
         value[3] ^ value[7],
     ]
+}
+
+fn synthetic_ptr_target_for_name(name: &str) -> String {
+    let value = hash(name.as_bytes());
+    format!("ptr-{:016x}.synthetic.example", value)
 }
 
 fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
