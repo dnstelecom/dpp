@@ -7,10 +7,6 @@ edition = "2024"
 rust-version = "1.94.1"
 build = "build.rs"  # Custom build script to include version information from git
 
-[[bin]]
-name = "dns-pcap-generator"
-path = "src/bin/dns_pcap_generator.rs"
-
 # Optimized profile settings for maximum performance in release builds
 [profile.release]
 opt-level = 3            # Maximum optimization for speed (also increases binary size)
@@ -29,7 +25,6 @@ overflow-checks = false  # Benchmark-focused profile for trusted perf runs on re
 # Build dependencies used during the compilation process
 [build-dependencies]
 vergen-gitcl = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
-vergen = "9.1.0"  # Generates build-time constants for the application
 anyhow = "1.0.102"  # Error handling used in the build script
 
 # Development profile settings for faster iteration
@@ -55,10 +50,7 @@ hickory-proto = "0.25"            # DNS protocol parsing library
 csv = "1.4"                       # CSV serialization and deserialization
 crossbeam = "0.8"                 # Concurrency support with channels and data structures
 anyhow = "1.0"                    # Error handling library
-chrono = "0.4"                    # Date and time handling
-crossbeam-skiplist = "0.1"        # Efficient skiplist data structure for DNS query-response matching
 num-format = "0.4"                # Number formatting for logging and output
-itertools = "0.14"                # Additional utilities for iterator handling
 sysinfo = "0.38"                  # System information retrieval (for memory monitoring)
 arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
 parquet = "58.1.0"                # Apache Parquet format support for exporting results
@@ -68,11 +60,9 @@ tikv-jemallocator = { version = "0.6.1", optional = true } # Jemalloc successor 
 mimalloc = { version = "0.1.48", optional = true }         # Microsoft mimalloc global allocator
 seahash = "4.1.0"                 # Fast Hash
 core_affinity = "0.8.3"           # To assign threads to specific CPU cores
-smallvec = "1.15.1"               # Optimizes vectors by storing them on the stack.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "local-time", "chrono"] }
 tracing-log = "0.2.0"             # Bridges log-based dependencies into tracing
-crossbeam-channel = "0.5.15"# Channel communication between threads
 aes = "0.8.4"
 pbkdf2 = "0.12.2"
 sha2 = "0.10.9"
