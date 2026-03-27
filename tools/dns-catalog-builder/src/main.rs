@@ -93,6 +93,13 @@ enum Error {
         source: io::Error,
     },
 
+    #[error("failed to sync '{path}'")]
+    OutputSync {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("failed to move temporary catalog '{temp_path}' into '{output_path}'")]
     CatalogRename {
         temp_path: PathBuf,
@@ -266,6 +273,13 @@ fn write_catalog_atomic(output: &Path, entries: &[CatalogEntry]) -> Result<()> {
             path: temp_path.clone(),
             source,
         })?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|source| Error::OutputSync {
+                path: temp_path.clone(),
+                source,
+            })?;
     }
 
     fs::rename(&temp_path, output).map_err(|source| Error::CatalogRename {
