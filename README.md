@@ -244,21 +244,33 @@ When that warning appears, normalize the capture first with Wireshark's `reorder
 
 This repository also ships a standalone utility, `dns-pcap-generator`, for producing synthetic DNS
 classic-PCAP files without needing a source capture at runtime.
+The tool lives in the separate workspace crate `tools/dns-pcap-generator`; from the repository root,
+use `-p dns-pcap-generator`, or run the same commands directly inside that directory without `-p`.
 
 Example:
 
 ```bash
-cargo run --release --bin dns-pcap-generator -- synthetic/server1-like.pcap \
+cargo run -p dns-pcap-generator --release --bin dns-pcap-generator -- synthetic/server1-like.pcap \
   --duration-seconds 300 \
   --qps 30000 \
   --duplicate-rate 0.08 \
   --timeout-rate 0.03
 ```
 
+To regenerate the embedded positive-domain catalog from a local CSV:
+
+```bash
+cargo run -p dns-catalog-builder --release -- \
+  real_dns_traffic.csv \
+  tools/dns-pcap-generator/catalog_data.tsv \
+  --top 10000
+```
+
 The default profile is shaped after a representative July 2024 resolver workload but keeps only
-sanitized, non-client-specific, non-Russian query names. See
-[docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md) for the full contract and
-current modeling assumptions.
+sanitized, non-client-specific. See [docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md) for the full contract and
+current modeling assumptions. Response latency is also calibrated from the local July 2024 CSV so
+matched RTT stays in the same microsecond-heavy regime instead of an arbitrary millisecond range,
+with the exact timing profile sourced from `tools/dns-pcap-generator/config/dns-pcap-generator.toml` at build time.
 
 For captures that are already globally monotonic by timestamp, `--monotonic-capture` or
 `DPP_MONOTONIC_CAPTURE=1` enables batched timeout eviction inside the matcher. This can reduce

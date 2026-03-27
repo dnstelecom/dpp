@@ -15,7 +15,11 @@ use crate::packet::{
 };
 use crate::profile::{qtype_weights_for_negative_domain, qtype_weights_for_positive_domain};
 use crate::rng::{SplitMix64, pick_weighted};
-use anyhow::{Context, Result};
+use crate::tuning::{
+    ANSWERED_RETRY_DELAY_RANGES, NORMAL_RESPONSE_DELAY_BUCKETS, SERVFAIL_RESPONSE_DELAY_BUCKETS,
+    UNANSWERED_RETRY_DELAY_RANGES,
+};
+use crate::{Error, Result};
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter};
 use pcap_file::{DataLink, Endianness};
 use std::cmp::Ordering;
@@ -65,11 +69,13 @@ pub(crate) fn write_capture<W: Write>(
         endianness: Endianness::Little,
         ..Default::default()
     };
-    let mut pcap_writer =
-        PcapWriter::with_header(writer, header).context("failed to initialize PCAP writer")?;
+    let mut pcap_writer = PcapWriter::with_header(writer, header)
+        .map_err(|source| Error::PcapWriterInit { source })?;
     let mut state = GeneratorState::new(config, profile);
     state.run(&mut pcap_writer)?;
-    pcap_writer.flush().context("failed to flush PCAP writer")?;
+    pcap_writer
+        .flush()
+        .map_err(|source| Error::PcapWriterFlush { source })?;
     let writer = pcap_writer.into_writer();
     Ok((writer, state.summary))
 }
@@ -78,6 +84,12 @@ struct GeneratorState<'a> {
     config: &'a GeneratorConfig,
     profile: &'a TrafficProfile,
     rng: SplitMix64,
+    // Only packets scheduled strictly in the future live in this heap.
+    // `run()` flushes everything due at the current transaction timestamp
+    // before scheduling new retries / responses, so heap growth is bounded by
+    // the future-event window (retry delays, response delays, and QPS), not by
+    // the total `transactions` count. Each transaction contributes at most
+    // `duplicate_max` retry queries plus one response while it is still in flight.
     pending_packets: BinaryHeap<ScheduledPacket>,
     clients: Vec<Ipv4Addr>,
     resolvers: Vec<Ipv4Addr>,
@@ -113,9 +125,9 @@ impl<'a> GeneratorState<'a> {
             let resolver = self.resolvers[self.rng.below(self.resolvers.len() as u64) as usize];
             let source_port = self.rng.range_u16(49_152, 65_000);
             let transaction_id = self.rng.next_u64() as u16;
-            let duplicate_count = self.sample_duplicate_count();
             let timed_out = self.rng.chance(self.config.timeout_rate);
             let response_code = (!timed_out).then(|| self.sample_response_code());
+            let duplicate_count = self.sample_duplicate_count();
             let (qname, qtype) = self.sample_query_identity(response_code);
 
             let base_query = self.build_query_packet(
@@ -131,7 +143,7 @@ impl<'a> GeneratorState<'a> {
 
             let mut last_query_timestamp = self.current_timestamp;
             for retry_index in 0..duplicate_count {
-                last_query_timestamp += self.retry_delay(retry_index);
+                last_query_timestamp += self.retry_delay(retry_index, response_code.is_none());
                 let retry_packet = self.build_query_packet(
                     client,
                     resolver,
@@ -147,11 +159,7 @@ impl<'a> GeneratorState<'a> {
 
             match response_code {
                 Some(code) => {
-                    let response_timestamp = if duplicate_count == 0 {
-                        self.current_timestamp + self.fast_response_delay()
-                    } else {
-                        last_query_timestamp + self.post_retry_response_delay()
-                    };
+                    let response_timestamp = last_query_timestamp + self.response_delay(code);
                     let response_packet = self.build_response_packet(
                         resolver,
                         client,
@@ -252,21 +260,23 @@ impl<'a> GeneratorState<'a> {
         }
     }
 
-    fn retry_delay(&mut self, retry_index: u8) -> Duration {
-        let millis = match retry_index {
-            0 => self.rng.range_inclusive_u64(70, 140),
-            1 => self.rng.range_inclusive_u64(180, 320),
-            _ => self.rng.range_inclusive_u64(450, 900),
+    fn retry_delay(&mut self, retry_index: u8, unanswered: bool) -> Duration {
+        let ranges = if unanswered {
+            UNANSWERED_RETRY_DELAY_RANGES
+        } else {
+            ANSWERED_RETRY_DELAY_RANGES
         };
-        Duration::from_millis(millis)
+        let range = ranges[usize::from(retry_index).min(ranges.len() - 1)];
+        Duration::from_micros(self.rng.range_inclusive_u64(range.min_us, range.max_us))
     }
 
-    fn fast_response_delay(&mut self) -> Duration {
-        Duration::from_millis(self.rng.range_inclusive_u64(6, 120))
-    }
-
-    fn post_retry_response_delay(&mut self) -> Duration {
-        Duration::from_millis(self.rng.range_inclusive_u64(25, 90))
+    fn response_delay(&mut self, response_code: ResponseCodeKind) -> Duration {
+        let buckets = match response_code {
+            ResponseCodeKind::ServFail => SERVFAIL_RESPONSE_DELAY_BUCKETS,
+            ResponseCodeKind::NoError | ResponseCodeKind::NxDomain => NORMAL_RESPONSE_DELAY_BUCKETS,
+        };
+        let bucket = pick_weighted(buckets, &mut self.rng, |entry| u64::from(entry.weight));
+        Duration::from_micros(self.rng.range_inclusive_u64(bucket.min_us, bucket.max_us))
     }
 
     fn schedule_packet(&mut self, timestamp: Duration, bytes: Vec<u8>) {
@@ -307,7 +317,7 @@ impl<'a> GeneratorState<'a> {
 
         writer
             .write_packet(&PcapPacket::new_owned(timestamp, bytes.len() as u32, bytes))
-            .context("failed to write generated packet")?;
+            .map_err(|source| Error::PcapPacketWrite { source })?;
         Ok(())
     }
 

@@ -5,34 +5,40 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-#[path = "dns_pcap_generator/catalog.rs"]
 mod catalog;
-#[path = "dns_pcap_generator/cli.rs"]
 mod cli;
-#[path = "dns_pcap_generator/generator.rs"]
+mod error;
 mod generator;
-#[path = "dns_pcap_generator/model.rs"]
 mod model;
-#[path = "dns_pcap_generator/packet.rs"]
 mod packet;
-#[path = "dns_pcap_generator/profile.rs"]
 mod profile;
-#[path = "dns_pcap_generator/rng.rs"]
 mod rng;
+mod tuning;
 
 #[cfg(test)]
-#[path = "dns_pcap_generator/tests.rs"]
 mod tests;
 
-use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, GeneratorConfig};
 use generator::write_capture;
 use profile::{profile_for, validate_profile};
+use std::error::Error as StdError;
 use std::fs::{self, File};
 use std::io::BufWriter;
 
-fn main() -> Result<()> {
+pub use error::{Error, Result};
+pub use profile::is_disallowed_domain;
+
+pub fn report_error(error: &Error) {
+    eprintln!("Error: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        eprintln!("Caused by: {cause}");
+        source = cause.source();
+    }
+}
+
+pub fn run_generator() -> Result<()> {
     let cli = Cli::parse();
     let config = GeneratorConfig::try_from(&cli)?;
     let profile = profile_for(cli.profile);
@@ -43,12 +49,16 @@ fn main() -> Result<()> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create output directory '{}'", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|source| Error::OutputDirectoryCreate {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
 
-    let file = File::create(&cli.output)
-        .with_context(|| format!("failed to create '{}'", cli.output.display()))?;
+    let file = File::create(&cli.output).map_err(|source| Error::OutputCreate {
+        path: cli.output.clone(),
+        source,
+    })?;
     let writer = BufWriter::new(file);
     let (_, summary) = write_capture(writer, &config, &profile)?;
 

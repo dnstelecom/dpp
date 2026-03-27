@@ -6,15 +6,20 @@
  */
 
 use crate::catalog::SERVER1_JUL_2024_POSITIVE_DOMAINS;
-use crate::cli::{GeneratorConfig, ProfileKind};
+use crate::cli::{Cli, GeneratorConfig, ProfileKind};
+use crate::error::Error;
 use crate::generator::write_capture;
 use crate::model::{DEFAULT_START_EPOCH_SECS, DnsQuestionType, ResponseCodeKind};
-use crate::packet::{build_dns_query_payload, build_dns_response_payload};
+use crate::packet::{
+    MAX_SYNTHETIC_CLIENTS, ROOT_NAME_SERVER_TARGETS, build_dns_query_payload,
+    build_dns_response_payload,
+};
 use crate::profile::{
     is_disallowed_domain, profile_for, qtype_weights_for_positive_domain, validate_profile,
 };
 use pcap_file::pcap::PcapReader;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::time::Duration;
 
 fn test_config() -> GeneratorConfig {
@@ -51,10 +56,8 @@ fn sanitized_profile_contains_no_disallowed_domains() {
 }
 
 #[test]
-fn disallowed_domain_detector_catches_russian_and_client_specific_patterns() {
-    assert!(is_disallowed_domain("api.vk.com"));
+fn disallowed_domain_detector_catches_only_current_sanitization_targets() {
     assert!(is_disallowed_domain("android.clients.google.com"));
-    assert!(is_disallowed_domain("example.ru"));
     assert!(!is_disallowed_domain("www.google.com"));
 }
 
@@ -84,6 +87,70 @@ fn root_domain_serializes_as_valid_ns_query_and_response() {
     .expect("response encodes");
     assert_eq!(&response[6..8], &1_u16.to_be_bytes());
     assert_eq!(response[12], 0);
+}
+
+#[test]
+fn root_name_server_targets_match_the_current_a_to_m_root_set() {
+    assert_eq!(
+        ROOT_NAME_SERVER_TARGETS,
+        &[
+            "a.root-servers.net",
+            "b.root-servers.net",
+            "c.root-servers.net",
+            "d.root-servers.net",
+            "e.root-servers.net",
+            "f.root-servers.net",
+            "g.root-servers.net",
+            "h.root-servers.net",
+            "i.root-servers.net",
+            "j.root-servers.net",
+            "k.root-servers.net",
+            "l.root-servers.net",
+            "m.root-servers.net",
+        ]
+    );
+}
+
+#[test]
+fn cli_rejects_client_count_above_address_pool_capacity() {
+    let cli = Cli {
+        output: PathBuf::from("ignored.pcap"),
+        profile: ProfileKind::Server1Jul2024Sanitized,
+        transactions: Some(1),
+        duration_seconds: 300,
+        qps: 1200.0,
+        clients: MAX_SYNTHETIC_CLIENTS + 1,
+        resolvers: 3,
+        duplicate_rate: 0.08,
+        timeout_rate: 0.03,
+        duplicate_max: 3,
+        seed: 7,
+        start_epoch_seconds: DEFAULT_START_EPOCH_SECS,
+    };
+
+    assert!(matches!(
+        GeneratorConfig::try_from(&cli),
+        Err(Error::TooManyClients { value, max })
+            if value == MAX_SYNTHETIC_CLIENTS + 1 && max == MAX_SYNTHETIC_CLIENTS
+    ));
+}
+
+#[test]
+fn disallowed_domain_detector_preserves_case_insensitive_behavior() {
+    assert!(is_disallowed_domain("Android.Clients.Google.com"));
+    assert!(!is_disallowed_domain("WWW.Google.com"));
+}
+
+#[test]
+fn qtype_classifier_preserves_case_insensitive_behavior() {
+    assert!(std::ptr::eq(
+        qtype_weights_for_positive_domain("WWW.Example.com"),
+        qtype_weights_for_positive_domain("www.example.com")
+    ));
+    assert!(std::ptr::eq(
+        qtype_weights_for_positive_domain("Api.Googleapis.com"),
+        qtype_weights_for_positive_domain("api.googleapis.com")
+    ));
 }
 
 #[test]

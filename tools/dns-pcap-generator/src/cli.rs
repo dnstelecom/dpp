@@ -5,15 +5,16 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use crate::error::{Error, Result};
 use crate::model::{DEFAULT_SEED, DEFAULT_START_EPOCH_SECS};
-use anyhow::{Result, bail};
+use crate::packet::{MAX_SYNTHETIC_CLIENTS, MAX_SYNTHETIC_RESOLVERS};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "dns-pcap-generator",
-    about = "Generate standalone synthetic DNS classic-PCAP traffic without client-specific or Russian domains"
+    about = "Generate standalone synthetic DNS classic-PCAP traffic with a sanitized domain catalog"
 )]
 pub(crate) struct Cli {
     #[arg(value_name = "OUTPUT_PCAP")]
@@ -55,6 +56,7 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum ProfileKind {
+    #[value(name = "server1-jul-2024-sanitized")]
     Server1Jul2024Sanitized,
 }
 
@@ -72,44 +74,48 @@ pub(crate) struct GeneratorConfig {
 }
 
 impl TryFrom<&Cli> for GeneratorConfig {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(cli: &Cli) -> Result<Self> {
         if !(cli.qps.is_finite() && cli.qps > 0.0) {
-            bail!("--qps must be a finite value greater than 0");
+            return Err(Error::InvalidQps { value: cli.qps });
         }
         if cli.clients == 0 {
-            bail!("--clients must be greater than 0");
+            return Err(Error::InvalidClients);
+        }
+        if cli.clients > MAX_SYNTHETIC_CLIENTS {
+            return Err(Error::TooManyClients {
+                value: cli.clients,
+                max: MAX_SYNTHETIC_CLIENTS,
+            });
         }
         if cli.resolvers == 0 {
-            bail!("--resolvers must be greater than 0");
+            return Err(Error::InvalidResolvers);
         }
-        if cli.resolvers > 203 * 256 {
-            bail!(
-                "--resolvers must be at most {} (203 addresses × 256 subnets)",
-                203 * 256
-            );
+        if cli.resolvers > MAX_SYNTHETIC_RESOLVERS {
+            return Err(Error::TooManyResolvers {
+                value: cli.resolvers,
+                max: MAX_SYNTHETIC_RESOLVERS,
+            });
         }
         if cli.duplicate_max == 0 {
-            bail!("--duplicate-max must be greater than 0");
+            return Err(Error::InvalidDuplicateMax);
         }
         for (flag, value) in [
             ("--duplicate-rate", cli.duplicate_rate),
             ("--timeout-rate", cli.timeout_rate),
         ] {
             if !(0.0..=1.0).contains(&value) {
-                bail!("{flag} must be between 0.0 and 1.0");
+                return Err(Error::RateOutOfRange { flag, value });
             }
         }
 
         let transactions = match cli.transactions {
             Some(value) if value > 0 => value,
-            Some(_) => bail!("--transactions must be greater than 0"),
+            Some(_) => return Err(Error::InvalidTransactions),
             None => {
                 if cli.duration_seconds == 0 {
-                    bail!(
-                        "--duration-seconds must be greater than 0 when --transactions is omitted"
-                    );
+                    return Err(Error::InvalidDurationWithoutTransactions);
                 }
                 ((cli.duration_seconds as f64 * cli.qps).round() as u64).max(1)
             }

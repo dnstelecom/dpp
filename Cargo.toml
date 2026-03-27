@@ -7,9 +7,8 @@ edition = "2024"
 rust-version = "1.94.1"
 build = "build.rs"  # Custom build script to include version information from git
 
-[[bin]]
-name = "dns-pcap-generator"
-path = "src/bin/dns_pcap_generator.rs"
+[workspace]
+members = ["tools/dns-catalog-builder", "tools/dns-pcap-generator"]
 
 # Optimized profile settings for maximum performance in release builds
 [profile.release]
