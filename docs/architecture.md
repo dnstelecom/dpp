@@ -12,7 +12,8 @@ DPP Community Edition has a single supported matching model:
 
 - forward-only matching with deterministic ordering by `(timestamp_micros, packet_ordinal)`
 - offline processing from PCAP input into CSV or Parquet output
-- optional final JSON run summary through the canonical report-format contract
+- optional final JSON run summary through the canonical report-format contract; stdout export mode
+  is CSV-only, rejects JSON reports, and suppresses text reports
 - optional `--monotonic-capture` mode for globally ordered captures
 
 The matcher is the authoritative owner of in-flight query/response state. Parsing may run in
