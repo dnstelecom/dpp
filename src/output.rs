@@ -21,6 +21,7 @@ pub(crate) use crate::record::DnsRecord;
 pub(crate) enum OutputMessage {
     Record(DnsRecord),
     Shutdown,
+    Abort,
 }
 
 impl From<DnsRecord> for OutputMessage {
@@ -46,6 +47,10 @@ where
                 }
             }
             OutputMessage::Shutdown => break,
+            OutputMessage::Abort => {
+                buffer.clear();
+                return Ok(());
+            }
         }
     }
 

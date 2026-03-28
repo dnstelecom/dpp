@@ -244,4 +244,22 @@ mod tests {
         ));
         assert!(output.contains("example.com"));
     }
+
+    #[test]
+    fn drops_buffered_rows_on_abort() {
+        let (tx, rx) = channel::unbounded();
+
+        tx.send(OutputMessage::Record(test_dns_record()))
+            .expect("record is sent");
+        tx.send(OutputMessage::Abort).expect("abort is sent");
+
+        let mut output = Vec::new();
+        csv_writer(&mut output, rx).expect("csv writer completes successfully");
+
+        let output = String::from_utf8(output).expect("csv output is utf-8");
+        assert_eq!(
+            output,
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n"
+        );
+    }
 }

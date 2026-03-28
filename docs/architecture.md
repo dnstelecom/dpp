@@ -13,7 +13,8 @@ DPP Community Edition has a single supported matching model:
 - forward-only matching with deterministic ordering by `(timestamp_micros, packet_ordinal)`
 - offline processing from PCAP input into CSV or Parquet output
 - optional final JSON run summary through the canonical report-format contract; stdout export mode
-  is CSV-only, rejects JSON reports, and suppresses text reports
+  is CSV-only, rejects JSON reports, suppresses text reports, and signal-driven shutdown drops any
+  still-buffered output tail before final writer teardown
 - optional `--monotonic-capture` mode for globally ordered captures
 
 The matcher is the authoritative owner of in-flight query/response state. Parsing may run in
@@ -126,7 +127,9 @@ repeating it for full DNS question decoding.
   submodules: `anonymizer.rs` for key loading and deterministic pseudonymization, `parser.rs` for
   packet-to-DNS extraction and canonical flow routing metadata, `matcher.rs` for in-flight state
   and pairing, `pipeline.rs` for shard-parallel orchestration, and `types.rs` for internal matcher
-  types. The staged pipeline may reuse parser-produced UDP/DNS metadata between routing and
+  types. Signal-driven shutdown semantics for pending unmatched queries are also owned here:
+  interrupted runs must not synthesize timeout tail records from incomplete matcher state. The
+  staged pipeline may reuse parser-produced UDP/DNS metadata between routing and
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
   parsing does not gain a second source of truth for IP/port extraction. The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains

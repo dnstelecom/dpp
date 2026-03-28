@@ -50,7 +50,7 @@ DPP reads offline PCAP files, extracts DNS traffic, matches queries with respons
 - Asynchronous output pipeline to reduce write-side overhead.
 - Optional deterministic IP pseudonymization.
 - Peak RSS memory tracking for performance analysis.
-- Graceful `SIGINT`/`SIGTERM` handling that stops intake, drains in-flight work, and flushes output.
+- Graceful `SIGINT`/`SIGTERM` handling that stops intake and drains in-flight work; any still-buffered output tail is discarded before final writer teardown to avoid a skewed partial ending.
 - Graceful handling of malformed packets and I/O errors.
 
 ## Architecture
@@ -233,8 +233,9 @@ reporting and emits one final JSON summary object to `stdout`. This keeps CSV or
 its own file while making the end-of-run report easy to capture and parse.
 
 If DPP receives `SIGINT` or `SIGTERM`, it stops accepting new packet batches, drains already
-accepted work, flushes writers, and then exits. The final JSON summary reports this through the
-`warnings.graceful_signal_shutdown` field.
+accepted work, skips synthetic timeout finalization for pending unmatched queries, discards any
+still-buffered output tail, and then exits. This applies to CSV and Parquet outputs alike. The
+final JSON summary reports this through the `warnings.graceful_signal_shutdown` field.
 
 The final report now also includes basic matching-quality metrics:
 

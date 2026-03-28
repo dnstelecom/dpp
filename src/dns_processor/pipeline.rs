@@ -380,6 +380,7 @@ fn run_phase_processing_worker(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     per_thread: bool,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let (mut query_maps, mut response_maps): (Vec<QueryMap>, Vec<ResponseMap>) = if per_thread {
         (
@@ -425,22 +426,24 @@ fn run_phase_processing_worker(
         }
     }
 
-    let mut finalization_results: Vec<(usize, ShardProcessingResult)> = query_maps
-        .par_iter_mut()
-        .zip(response_maps.par_iter_mut())
-        .enumerate()
-        .map(|(map_idx, (query_map, response_map))| {
-            (
-                map_idx,
-                dns_processor.finalize_shard(query_map, response_map),
-            )
-        })
-        .collect();
+    if !shutdown_requested.load(AtomicOrdering::SeqCst) {
+        let mut finalization_results: Vec<(usize, ShardProcessingResult)> = query_maps
+            .par_iter_mut()
+            .zip(response_maps.par_iter_mut())
+            .enumerate()
+            .map(|(map_idx, (query_map, response_map))| {
+                (
+                    map_idx,
+                    dns_processor.finalize_shard(query_map, response_map),
+                )
+            })
+            .collect();
 
-    finalization_results.sort_by_key(|(map_idx, _)| *map_idx);
+        finalization_results.sort_by_key(|(map_idx, _)| *map_idx);
 
-    for (_, shard_result) in finalization_results {
-        counters.absorb(&tx, shard_result);
+        for (_, shard_result) in finalization_results {
+            counters.absorb(&tx, shard_result);
+        }
     }
 
     Ok(counters)
@@ -488,6 +491,7 @@ fn run_matcher_worker(
     shard_range: Range<usize>,
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
     let mut query_maps: Vec<QueryMap> = (0..logical_shard_count).map(|_| QueryMap::new()).collect();
@@ -531,11 +535,13 @@ fn run_matcher_worker(
     }
 
     let mut finalization = ShardProcessingResult::default();
-    for (query_map, response_map) in query_maps.iter_mut().zip(response_maps.iter_mut()) {
-        merge_shard_results(
-            &mut finalization,
-            dns_processor.finalize_shard(query_map, response_map),
-        );
+    if !shutdown_requested.load(AtomicOrdering::SeqCst) {
+        for (query_map, response_map) in query_maps.iter_mut().zip(response_maps.iter_mut()) {
+            merge_shard_results(
+                &mut finalization,
+                dns_processor.finalize_shard(query_map, response_map),
+            );
+        }
     }
 
     result_tx
@@ -611,6 +617,7 @@ fn run_staged_processing_pipeline(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     worker_count: usize,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let worker_ranges = worker_shard_ranges(shard_count, worker_count);
     let (result_tx, result_rx) =
@@ -629,6 +636,7 @@ fn run_staged_processing_pipeline(
                 .spawn({
                     let dns_processor = Arc::clone(&dns_processor);
                     let result_tx = result_tx.clone();
+                    let shutdown_requested = Arc::clone(&shutdown_requested);
                     move || {
                         run_matcher_worker(
                             dns_processor,
@@ -636,6 +644,7 @@ fn run_staged_processing_pipeline(
                             shard_range,
                             worker_rx,
                             result_tx,
+                            shutdown_requested,
                         )
                     }
                 })?,
@@ -671,7 +680,7 @@ impl DnsProcessor {
         tx: &Sender<OutputMessage>,
         execution_budget: ExecutionBudget,
         per_thread: bool,
-        shutdown_requested: &AtomicBool,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> anyhow::Result<ProcessingCounters> {
         let shard_count = logical_shard_count(execution_budget.available_cpus, per_thread);
         let worker_count = matcher_worker_count(execution_budget, per_thread, shard_count);
@@ -700,6 +709,7 @@ impl DnsProcessor {
                 .spawn({
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
+                    let shutdown_requested = Arc::clone(&shutdown_requested);
                     move || {
                         run_staged_processing_pipeline(
                             dns_processor,
@@ -707,6 +717,7 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             worker_count,
+                            shutdown_requested,
                         )
                     }
                 })?
@@ -716,6 +727,7 @@ impl DnsProcessor {
                 .spawn({
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
+                    let shutdown_requested = Arc::clone(&shutdown_requested);
                     move || {
                         run_phase_processing_worker(
                             dns_processor,
@@ -723,6 +735,7 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             per_thread,
+                            shutdown_requested,
                         )
                     }
                 })?
@@ -749,7 +762,7 @@ impl DnsProcessor {
 
         if shutdown_requested.load(AtomicOrdering::SeqCst) {
             tracing::warn!(
-                "Termination signal received. DPP will stop accepting new batches, drain in-flight work, and flush output before exit."
+                "Termination signal received. DPP will stop accepting new batches, drain already accepted work, skip synthetic timeout finalization for pending unmatched queries, and discard any still-buffered output tail before exit."
             );
         }
 
@@ -766,14 +779,40 @@ impl DnsProcessor {
 mod tests {
     use super::*;
     use crate::packet_parser::PacketParser;
-    use crate::test_support::{classic_pcap_bytes, make_udp_dns_packet, temp_test_path};
+    use crate::test_support::{
+        classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
+        make_udp_dns_packet_with_payload, temp_test_path,
+    };
     use std::fs;
+    use std::sync::atomic::AtomicBool;
 
     fn shard_result(token: usize) -> ShardProcessingResult {
         ShardProcessingResult {
             dns_query_count: token,
             ..Default::default()
         }
+    }
+
+    fn unresolved_query_batch(test_name: &str) -> PacketBatch {
+        let path = temp_test_path(test_name, "pcap");
+        let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+        dns_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let packet =
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+        fs::write(&path, classic_pcap_bytes(&[(1, 0, &packet)])).expect("test pcap written");
+
+        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let batch = parser
+            .next_batch(1)
+            .expect("batch read succeeds")
+            .expect("query packet is present");
+        fs::remove_file(&path).expect("test pcap removed");
+
+        batch
     }
 
     #[test]
@@ -932,5 +971,120 @@ mod tests {
             ordered_packets,
             vec![(1_000_000, 1, false), (2_000_000, 0, false)]
         );
+    }
+
+    #[test]
+    fn phase_worker_finalizes_pending_queries_without_signal_shutdown() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(unresolved_query_batch(
+                "phase-worker-finalization-without-signal",
+            ))
+            .expect("batch is sent");
+        drop(batch_tx);
+
+        let counters = run_phase_processing_worker(
+            dns_processor,
+            batch_rx,
+            output_tx,
+            1,
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("phase worker completes");
+
+        assert_eq!(counters.dns_query_count, 1);
+        assert_eq!(counters.timeout_query_count, 1);
+
+        let output_records = output_rx
+            .try_iter()
+            .filter_map(|message| match message {
+                OutputMessage::Record(record) => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_records.len(), 1);
+        assert_eq!(output_records[0].response_timestamp, 0);
+    }
+
+    #[test]
+    fn phase_worker_skips_pending_query_finalization_on_signal_shutdown() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(unresolved_query_batch("phase-worker-signal-shutdown"))
+            .expect("batch is sent");
+        drop(batch_tx);
+
+        let counters = run_phase_processing_worker(
+            dns_processor,
+            batch_rx,
+            output_tx,
+            1,
+            false,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("phase worker completes");
+
+        assert_eq!(counters.dns_query_count, 1);
+        assert_eq!(counters.timeout_query_count, 0);
+        assert!(output_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn matcher_worker_skips_pending_query_finalization_on_signal_shutdown() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let worker_range = 0..1;
+        let RoutedWorkerBatches {
+            batch_max_timestamp_micros,
+            mut worker_batches,
+        } = route_batch_to_worker_batches(
+            unresolved_query_batch("matcher-worker-signal-shutdown"),
+            1,
+            std::slice::from_ref(&worker_range),
+        );
+        let shard_packets = worker_batches.pop().expect("worker batch exists");
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(MatcherBatchWork {
+                batch_seq: 0,
+                batch_max_timestamp_micros,
+                shard_packets,
+            })
+            .expect("worker batch is sent");
+        drop(batch_tx);
+
+        run_matcher_worker(
+            dns_processor,
+            0,
+            worker_range,
+            batch_rx,
+            result_tx,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("matcher worker completes");
+
+        let events = result_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+
+        let batch_result = match &events[0] {
+            MatcherWorkerEvent::BatchResult { result, .. } => result,
+            _ => panic!("expected batch result before finalization"),
+        };
+        assert_eq!(batch_result.dns_query_count, 1);
+
+        let finalization = match &events[1] {
+            MatcherWorkerEvent::Finalization { result, .. } => result,
+            _ => panic!("expected finalization result"),
+        };
+        assert_eq!(finalization.timeout_query_count, 0);
+        assert!(finalization.output_records.is_empty());
     }
 }
