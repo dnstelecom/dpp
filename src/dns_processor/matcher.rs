@@ -87,7 +87,7 @@ impl DnsProcessor {
         identity: &QueryIdentityKey,
         timestamp_micros: i64,
     ) -> bool {
-        let Some(timeline) = state.query_map.get(&identity) else {
+        let Some(timeline) = state.query_map.get(identity) else {
             return false;
         };
 
