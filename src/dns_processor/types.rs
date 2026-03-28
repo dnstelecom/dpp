@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::mem::{self, MaybeUninit};
 use std::net::IpAddr;
 
-use crate::custom_types::DnsName255;
+use crate::custom_types::DnsNameBuf;
 use crate::record::DnsRecord;
 
 const INLINE_TIMELINE_CAPACITY: usize = 4;
@@ -21,8 +21,8 @@ const INLINE_TIMELINE_CAPACITY: usize = 4;
 // them before building in-flight keys. This is an accepted operational hypothesis for the current
 // offline capture path: responses are expected to preserve the query's 0x20 casing. If a capture
 // violates that assumption, query/response pairs that differ only by case may not match.
-pub(super) type QueryIdentityKey = (u16, DnsName255, IpAddr, u16, HickoryRecordType);
-pub(super) type ResponseIdentityKey = (u16, DnsName255, IpAddr, u16, HickoryRecordType);
+pub(super) type QueryIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
+pub(super) type ResponseIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TimelineKey {
@@ -345,7 +345,7 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
     pub(super) is_query: bool,
-    pub(super) name: DnsName255,
+    pub(super) name: DnsNameBuf,
     pub(super) query_type: HickoryRecordType,
     pub(super) response_code: HickoryResponseCode,
 }
@@ -353,7 +353,7 @@ pub(super) struct ProcessedDnsRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsQuery {
     pub(super) id: u16,
-    pub(super) name: DnsName255,
+    pub(super) name: DnsNameBuf,
     pub(super) src_ip: IpAddr,
     pub(super) src_port: u16,
     pub(super) timestamp_micros: i64,
@@ -365,7 +365,7 @@ pub(super) struct DnsQuery {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsResponse {
     pub(super) id: u16,
-    pub(super) name: DnsName255,
+    pub(super) name: DnsNameBuf,
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
     pub(super) timestamp_micros: i64,

@@ -257,7 +257,7 @@ fn parse_response_code_text(value: &str) -> Option<HickoryResponseCode> {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct DnsName255 {
+pub struct DnsNameBuf {
     bytes: [MaybeUninit<u8>; 255],
     len: u8,
 }
@@ -273,7 +273,7 @@ impl fmt::Display for DnsNameTooLong {
 
 impl std::error::Error for DnsNameTooLong {}
 
-impl DnsName255 {
+impl DnsNameBuf {
     pub fn new(value: &str) -> Result<Self, DnsNameTooLong> {
         let mut name = Self::default();
         name.try_push_str(value)?;
@@ -318,7 +318,7 @@ impl DnsName255 {
     }
 }
 
-impl Default for DnsName255 {
+impl Default for DnsNameBuf {
     fn default() -> Self {
         Self {
             bytes: [MaybeUninit::uninit(); 255],
@@ -327,45 +327,45 @@ impl Default for DnsName255 {
     }
 }
 
-impl PartialEq for DnsName255 {
+impl PartialEq for DnsNameBuf {
     fn eq(&self, other: &Self) -> bool {
         self.as_bytes() == other.as_bytes()
     }
 }
 
-impl Eq for DnsName255 {}
+impl Eq for DnsNameBuf {}
 
-impl PartialOrd for DnsName255 {
+impl PartialOrd for DnsNameBuf {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for DnsName255 {
+impl Ord for DnsNameBuf {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_bytes().cmp(other.as_bytes())
     }
 }
 
-impl Hash for DnsName255 {
+impl Hash for DnsNameBuf {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_bytes().hash(state);
     }
 }
 
-impl fmt::Debug for DnsName255 {
+impl fmt::Debug for DnsNameBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("DnsName255").field(&self.as_str()).finish()
+        f.debug_tuple("DnsNameBuf").field(&self.as_str()).finish()
     }
 }
 
-impl fmt::Display for DnsName255 {
+impl fmt::Display for DnsNameBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
 
-impl Serialize for DnsName255 {
+impl Serialize for DnsNameBuf {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -374,13 +374,13 @@ impl Serialize for DnsName255 {
     }
 }
 
-impl<'de> Deserialize<'de> for DnsName255 {
+impl<'de> Deserialize<'de> for DnsNameBuf {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        DnsName255::new(&value).map_err(serde::de::Error::custom)
+        DnsNameBuf::new(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -469,10 +469,10 @@ impl<const N: usize> From<ArrayString<N>> for FixedSizeString<N> {
     }
 }
 
-impl From<DnsName255> for FixedSizeString<255> {
-    fn from(name: DnsName255) -> Self {
+impl From<DnsNameBuf> for FixedSizeString<255> {
+    fn from(name: DnsNameBuf) -> Self {
         FixedSizeString::new(name.as_str())
-            .expect("DnsName255 always fits into FixedSizeString<255>")
+            .expect("DnsNameBuf always fits into FixedSizeString<255>")
     }
 }
 
@@ -490,7 +490,7 @@ impl<'de, const N: usize> Deserialize<'de> for FixedSizeString<N> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsName255, FixedSizeString, HickoryResponseCode, ProtoResponseCode};
+    use super::{DnsNameBuf, FixedSizeString, HickoryResponseCode, ProtoResponseCode};
     use std::mem::size_of;
 
     #[test]
@@ -522,32 +522,32 @@ mod tests {
     }
 
     #[test]
-    fn dns_name_255_rejects_values_longer_than_capacity() {
+    fn dns_name_buf_rejects_values_longer_than_capacity() {
         let oversized = "a".repeat(256);
 
-        let error = DnsName255::new(&oversized).expect_err("overflow must fail");
+        let error = DnsNameBuf::new(&oversized).expect_err("overflow must fail");
 
         assert_eq!(error, super::DnsNameTooLong);
     }
 
     #[test]
-    fn dns_name_255_uses_string_order_and_not_padding_order() {
-        let short = DnsName255::new("a").expect("name fits");
-        let long = DnsName255::new("aa").expect("name fits");
+    fn dns_name_buf_uses_string_order_and_not_padding_order() {
+        let short = DnsNameBuf::new("a").expect("name fits");
+        let long = DnsNameBuf::new("aa").expect("name fits");
 
         assert!(short < long);
     }
 
     #[test]
-    fn dns_name_255_stays_within_256_byte_layout_budget() {
-        assert_eq!(size_of::<DnsName255>(), 256);
+    fn dns_name_buf_stays_within_256_byte_layout_budget() {
+        assert_eq!(size_of::<DnsNameBuf>(), 256);
     }
 
     #[test]
-    fn dns_name_255_round_trips_through_serde_as_a_string() {
-        let serialized = serde_json::to_string(&DnsName255::new("example.com").expect("name fits"))
+    fn dns_name_buf_round_trips_through_serde_as_a_string() {
+        let serialized = serde_json::to_string(&DnsNameBuf::new("example.com").expect("name fits"))
             .expect("dns name serializes");
-        let parsed: DnsName255 = serde_json::from_str(&serialized).expect("dns name parses");
+        let parsed: DnsNameBuf = serde_json::from_str(&serialized).expect("dns name parses");
 
         assert_eq!(serialized, "\"example.com\"");
         assert_eq!(parsed.as_str(), "example.com");
