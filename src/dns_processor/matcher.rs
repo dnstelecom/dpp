@@ -10,29 +10,19 @@ use std::collections::BTreeMap;
 
 use super::DnsProcessor;
 use super::types::{
-    DnsQuery, DnsResponse, EntryHandle, MatcherShardState, ProcessedDnsRecord, QueryIdentityKey,
-    ResponseIdentityKey, ShardProcessingResult, Timeline, TimelineKey,
+    MatcherShardState, ProcessedDnsRecord, QueryEventPayload, QueryIdentityKey,
+    ResponseEventPayload, ResponseIdentityKey, ShardProcessingResult, Timeline, TimelineKey,
 };
 use crate::custom_types::{ProtoRecordType, ProtoResponseCode};
 use crate::record::DnsRecord;
 
-impl DnsProcessor {
-    fn collect_timeline_records<Identity, Record>(
-        map: &BTreeMap<Identity, Timeline<Record>>,
-    ) -> Vec<Record>
-    where
-        Record: Clone,
-    {
-        let mut records = Vec::new();
-        for timeline in map.values() {
-            timeline.extend_cloned_into(&mut records);
-        }
-        records
-    }
+#[cfg(test)]
+use super::types::DnsQuery;
 
+impl DnsProcessor {
     fn remove_timeline_entry<Identity, Record>(
         map: &mut BTreeMap<Identity, Timeline<Record>>,
-        identity: Identity,
+        identity: &Identity,
         key: TimelineKey,
     ) -> Option<Record>
     where
@@ -40,7 +30,7 @@ impl DnsProcessor {
     {
         let mut remove_identity = false;
 
-        let removed = if let Some(timeline) = map.get_mut(&identity) {
+        let removed = if let Some(timeline) = map.get_mut(identity) {
             let removed = timeline.remove(key);
             remove_identity = timeline.is_empty();
             removed
@@ -49,49 +39,61 @@ impl DnsProcessor {
         };
 
         if remove_identity {
-            map.remove(&identity);
+            map.remove(identity);
         }
 
         removed
     }
 
-    fn create_matched_record(query: &DnsQuery, response: &DnsResponse) -> DnsRecord {
+    fn create_matched_record_from_query_parts(
+        query_identity: &QueryIdentityKey,
+        query_key: TimelineKey,
+        response_timestamp_micros: i64,
+        response_code: HickoryResponseCode,
+    ) -> DnsRecord {
+        let &(id, name, src_ip, src_port, query_type) = query_identity;
         DnsRecord {
-            request_timestamp: query.timestamp_micros,
-            response_timestamp: response.timestamp_micros,
-            source_ip: query.src_ip,
-            source_port: query.src_port,
-            id: query.id,
-            name: query.name,
-            query_type: ProtoRecordType::from(query.query_type),
-            response_code: ProtoResponseCode::from(response.response_code),
+            request_timestamp: query_key.timestamp_micros,
+            response_timestamp: response_timestamp_micros,
+            source_ip: src_ip,
+            source_port: src_port,
+            id,
+            name,
+            query_type: ProtoRecordType::from(query_type),
+            response_code: ProtoResponseCode::from(response_code),
         }
     }
 
-    fn create_timeout_record(query: &DnsQuery) -> DnsRecord {
+    fn create_timeout_record_from_query_parts(
+        query_identity: &QueryIdentityKey,
+        query_key: TimelineKey,
+    ) -> DnsRecord {
+        let &(id, name, src_ip, src_port, query_type) = query_identity;
         DnsRecord {
-            request_timestamp: query.timestamp_micros,
+            request_timestamp: query_key.timestamp_micros,
             response_timestamp: 0,
-            source_ip: query.src_ip,
-            source_port: query.src_port,
-            id: query.id,
-            name: query.name,
-            query_type: ProtoRecordType::from(query.query_type),
+            source_ip: src_ip,
+            source_port: src_port,
+            id,
+            name,
+            query_type: ProtoRecordType::from(query_type),
             response_code: ProtoResponseCode::from(HickoryResponseCode::ServFail),
         }
     }
 
-    fn has_pending_query_before(&self, state: &MatcherShardState, query: &DnsQuery) -> bool {
-        let identity = self.query_identity_key(query);
+    fn has_pending_query_before(
+        &self,
+        state: &MatcherShardState,
+        identity: &QueryIdentityKey,
+        timestamp_micros: i64,
+    ) -> bool {
         let Some(timeline) = state.query_map.get(&identity) else {
             return false;
         };
 
         timeline.contains_timestamp_range(
-            query
-                .timestamp_micros
-                .saturating_sub(self.match_timeout_micros),
-            query.timestamp_micros,
+            timestamp_micros.saturating_sub(self.match_timeout_micros),
+            timestamp_micros,
         )
     }
 
@@ -105,36 +107,40 @@ impl DnsProcessor {
         matched_query_response_count: &mut usize,
         matched_rtt_sum_micros: &mut u64,
     ) {
-        let query = self.create_dns_query(record);
+        let query_identity = self.query_identity_from_record(record);
+        let query_key = self.timeline_key_from_record(record);
         *dns_query_count += 1;
 
-        if self.has_pending_query_before(state, &query) {
+        if self.has_pending_query_before(state, &query_identity, query_key.timestamp_micros) {
             *duplicated_query_count += 1;
             return;
         }
 
-        let response_identity = self.response_identity_from_query(&query);
-
         if let Some((_, response_handle)) = self.find_closest_response(
             state,
-            &response_identity,
-            query.timestamp_micros,
-            query
+            &query_identity,
+            query_key.timestamp_micros,
+            query_key
                 .timestamp_micros
                 .saturating_add(self.match_timeout_micros),
-            query.timestamp_micros,
+            query_key.timestamp_micros,
         ) {
-            let response = self
-                .remove_response_entry(state, response_handle)
+            let response_payload = self
+                .remove_response_entry(state, &query_identity, response_handle)
                 .expect("matched response handle must remain valid until removal");
-            output_records.push(DnsProcessor::create_matched_record(&query, &response));
+            output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+                &query_identity,
+                query_key,
+                response_handle.timestamp_micros,
+                response_payload.response_code,
+            ));
             *matched_query_response_count += 1;
-            *matched_rtt_sum_micros += response
+            *matched_rtt_sum_micros += response_handle
                 .timestamp_micros
-                .saturating_sub(query.timestamp_micros)
+                .saturating_sub(query_key.timestamp_micros)
                 .max(0) as u64;
         } else {
-            self.insert_query_entry(state, query);
+            self.insert_query_entry(state, query_identity, query_key);
         }
     }
 
@@ -147,31 +153,39 @@ impl DnsProcessor {
         matched_query_response_count: &mut usize,
         matched_rtt_sum_micros: &mut u64,
     ) {
-        let response = self.create_dns_response(record);
+        let response_identity = self.response_identity_from_record(record);
+        let response_key = self.timeline_key_from_record(record);
         *dns_response_count += 1;
-
-        let query_identity = self.query_identity_from_response(&response);
 
         if let Some((_, query_handle)) = self.find_closest_query(
             state,
-            &query_identity,
-            response
+            &response_identity,
+            response_key
                 .timestamp_micros
                 .saturating_sub(self.match_timeout_micros),
-            response.timestamp_micros,
-            response.timestamp_micros,
+            response_key.timestamp_micros,
+            response_key.timestamp_micros,
         ) {
-            let query = self
-                .remove_query_entry(state, query_handle)
+            self.remove_query_entry(state, &response_identity, query_handle)
                 .expect("matched query handle must remain valid until removal");
-            output_records.push(DnsProcessor::create_matched_record(&query, &response));
+            output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+                &response_identity,
+                query_handle,
+                response_key.timestamp_micros,
+                record.response_code,
+            ));
             *matched_query_response_count += 1;
-            *matched_rtt_sum_micros += response
+            *matched_rtt_sum_micros += response_key
                 .timestamp_micros
-                .saturating_sub(query.timestamp_micros)
+                .saturating_sub(query_handle.timestamp_micros)
                 .max(0) as u64;
         } else {
-            self.insert_response_entry(state, response);
+            self.insert_response_entry(
+                state,
+                response_identity,
+                response_key,
+                record.response_code,
+            );
         }
     }
 
@@ -184,43 +198,40 @@ impl DnsProcessor {
         matched_rtt_sum_micros: &mut u64,
         out_of_order_combined_count: &mut usize,
     ) {
-        let remaining_queries = self.collect_queries(state);
+        while let Some((query_identity, timeline)) = state.query_map.pop_first() {
+            timeline.into_entries(|query_handle, _| {
+                let query_timestamp = query_handle.timestamp_micros;
 
-        for query_handle in remaining_queries {
-            let query = state
-                .query_arena
-                .get(query_handle)
-                .expect("query handle collected from timeline must remain valid");
-            let query_timestamp = query.timestamp_micros;
-            let response_identity = self.response_identity_from_query(query);
-
-            if let Some((_, response_handle)) = self.find_closest_response(
-                state,
-                &response_identity,
-                query_timestamp,
-                query_timestamp.saturating_add(self.match_timeout_micros),
-                query_timestamp,
-            ) {
-                let response = self
-                    .remove_response_entry(state, response_handle)
-                    .expect("matched response handle must remain valid until removal");
-                let query = self
-                    .remove_query_entry(state, query_handle)
-                    .expect("pending query handle must remain valid until removal");
-                output_records.push(DnsProcessor::create_matched_record(&query, &response));
-                *matched_query_response_count += 1;
-                *matched_rtt_sum_micros += response
-                    .timestamp_micros
-                    .saturating_sub(query.timestamp_micros)
-                    .max(0) as u64;
-                *out_of_order_combined_count += 1;
-            } else {
-                let query = self
-                    .remove_query_entry(state, query_handle)
-                    .expect("pending query handle must remain valid until removal");
-                output_records.push(DnsProcessor::create_timeout_record(&query));
-                *timeout_query_count += 1;
-            }
+                if let Some((_, response_handle)) = self.find_closest_response(
+                    state,
+                    &query_identity,
+                    query_timestamp,
+                    query_timestamp.saturating_add(self.match_timeout_micros),
+                    query_timestamp,
+                ) {
+                    let response_payload = self
+                        .remove_response_entry(state, &query_identity, response_handle)
+                        .expect("matched response handle must remain valid until removal");
+                    output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+                        &query_identity,
+                        query_handle,
+                        response_handle.timestamp_micros,
+                        response_payload.response_code,
+                    ));
+                    *matched_query_response_count += 1;
+                    *matched_rtt_sum_micros += response_handle
+                        .timestamp_micros
+                        .saturating_sub(query_handle.timestamp_micros)
+                        .max(0) as u64;
+                    *out_of_order_combined_count += 1;
+                } else {
+                    output_records.push(DnsProcessor::create_timeout_record_from_query_parts(
+                        &query_identity,
+                        query_handle,
+                    ));
+                    *timeout_query_count += 1;
+                }
+            });
         }
     }
 
@@ -232,14 +243,12 @@ impl DnsProcessor {
         timeout_query_count: &mut usize,
     ) {
         let query_map = &mut state.query_map;
-        let query_arena = &mut state.query_arena;
 
-        query_map.retain(|_, timeline| {
-            timeline.drain_before(threshold_timestamp_micros, |handle| {
-                let query = query_arena
-                    .remove(handle)
-                    .expect("evicted query handle must resolve in arena");
-                output_records.push(DnsProcessor::create_timeout_record(&query));
+        query_map.retain(|identity, timeline| {
+            timeline.drain_before(threshold_timestamp_micros, |key, _| {
+                output_records.push(DnsProcessor::create_timeout_record_from_query_parts(
+                    identity, key,
+                ));
                 *timeout_query_count += 1;
             });
             !timeline.is_empty()
@@ -252,14 +261,9 @@ impl DnsProcessor {
         threshold_timestamp_micros: i64,
     ) {
         let response_map = &mut state.response_map;
-        let response_arena = &mut state.response_arena;
 
         response_map.retain(|_, timeline| {
-            timeline.drain_before(threshold_timestamp_micros, |handle| {
-                let _ = response_arena
-                    .remove(handle)
-                    .expect("evicted response handle must resolve in arena");
-            });
+            timeline.drain_before(threshold_timestamp_micros, |_, _| {});
             !timeline.is_empty()
         });
     }
@@ -283,25 +287,22 @@ impl DnsProcessor {
         self.evict_responses_before(state, threshold_timestamp_micros);
     }
 
-    pub(super) fn insert_query_entry(&self, state: &mut MatcherShardState, query: DnsQuery) {
-        let identity = self.query_identity_key(&query);
-        let timeline_key = self.timeline_key_for_query(&query);
-        let handle = state.query_arena.alloc(query);
-
+    pub(super) fn insert_query_entry(
+        &self,
+        state: &mut MatcherShardState,
+        identity: QueryIdentityKey,
+        timeline_key: TimelineKey,
+    ) {
         let replaced = state
             .query_map
             .entry(identity)
             .or_default()
-            .insert(timeline_key, handle);
+            .insert(timeline_key, QueryEventPayload);
 
-        if let Some(replaced_handle) = replaced {
-            let _ = state
-                .query_arena
-                .remove(replaced_handle)
-                .expect("replaced query handle must resolve in arena");
+        if replaced.is_some() {
             debug_assert!(
                 false,
-                "query timeline unexpectedly replaced an existing handle for identical identity/timeline key"
+                "query timeline unexpectedly replaced an existing payload for identical identity/timeline key"
             );
         }
     }
@@ -309,60 +310,44 @@ impl DnsProcessor {
     pub(super) fn insert_response_entry(
         &self,
         state: &mut MatcherShardState,
-        response: DnsResponse,
+        identity: ResponseIdentityKey,
+        timeline_key: TimelineKey,
+        response_code: HickoryResponseCode,
     ) {
-        let identity = self.response_identity_key(&response);
-        let timeline_key = self.timeline_key_for_response(&response);
-        let handle = state.response_arena.alloc(response);
+        let payload = ResponseEventPayload {
+            response_code,
+        };
 
         let replaced = state
             .response_map
             .entry(identity)
             .or_default()
-            .insert(timeline_key, handle);
+            .insert(timeline_key, payload);
 
-        if let Some(replaced_handle) = replaced {
-            let _ = state
-                .response_arena
-                .remove(replaced_handle)
-                .expect("replaced response handle must resolve in arena");
+        if replaced.is_some() {
             debug_assert!(
                 false,
-                "response timeline unexpectedly replaced an existing handle for identical identity/timeline key"
+                "response timeline unexpectedly replaced an existing payload for identical identity/timeline key"
             );
         }
-    }
-
-    fn collect_queries(&self, state: &MatcherShardState) -> Vec<EntryHandle> {
-        Self::collect_timeline_records(&state.query_map)
     }
 
     fn remove_query_entry(
         &self,
         state: &mut MatcherShardState,
-        handle: EntryHandle,
-    ) -> Option<DnsQuery> {
-        let query = state.query_arena.get(handle)?;
-        let identity = self.query_identity_key(query);
-        let timeline_key = self.timeline_key_for_query(query);
-        let removed_handle =
-            Self::remove_timeline_entry(&mut state.query_map, identity, timeline_key)?;
-        debug_assert_eq!(removed_handle, handle);
-        state.query_arena.remove(removed_handle)
+        identity: &QueryIdentityKey,
+        timeline_key: TimelineKey,
+    ) -> Option<QueryEventPayload> {
+        Self::remove_timeline_entry(&mut state.query_map, identity, timeline_key)
     }
 
     fn remove_response_entry(
         &self,
         state: &mut MatcherShardState,
-        handle: EntryHandle,
-    ) -> Option<DnsResponse> {
-        let response = state.response_arena.get(handle)?;
-        let identity = self.response_identity_key(response);
-        let timeline_key = self.timeline_key_for_response(response);
-        let removed_handle =
-            Self::remove_timeline_entry(&mut state.response_map, identity, timeline_key)?;
-        debug_assert_eq!(removed_handle, handle);
-        state.response_arena.remove(removed_handle)
+        identity: &ResponseIdentityKey,
+        timeline_key: TimelineKey,
+    ) -> Option<ResponseEventPayload> {
+        Self::remove_timeline_entry(&mut state.response_map, identity, timeline_key)
     }
 
     pub(super) fn find_closest_response(
@@ -372,19 +357,12 @@ impl DnsProcessor {
         lower_timestamp_micros: i64,
         upper_timestamp_micros: i64,
         query_timestamp_micros: i64,
-    ) -> Option<(i64, EntryHandle)> {
+    ) -> Option<(i64, TimelineKey)> {
         let timeline = state.response_map.get(response_identity)?;
-        let response_handle =
-            *timeline.first_in_range(lower_timestamp_micros, upper_timestamp_micros)?;
-        let response = state
-            .response_arena
-            .get(response_handle)
-            .expect("response handle stored in timeline must resolve in arena");
+        let (response_key, _) =
+            timeline.first_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)?;
 
-        Some((
-            response.timestamp_micros - query_timestamp_micros,
-            response_handle,
-        ))
+        Some((response_key.timestamp_micros - query_timestamp_micros, response_key))
     }
 
     pub(super) fn find_closest_query(
@@ -394,76 +372,36 @@ impl DnsProcessor {
         lower_timestamp_micros: i64,
         upper_timestamp_micros: i64,
         response_timestamp_micros: i64,
-    ) -> Option<(i64, EntryHandle)> {
+    ) -> Option<(i64, TimelineKey)> {
         let timeline = state.query_map.get(query_identity)?;
-        let query_handle =
-            *timeline.last_in_range(lower_timestamp_micros, upper_timestamp_micros)?;
-        let query = state
-            .query_arena
-            .get(query_handle)
-            .expect("query handle stored in timeline must resolve in arena");
-        let time_diff = response_timestamp_micros.checked_sub(query.timestamp_micros)?;
+        let (query_key, _) =
+            timeline.last_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)?;
+        let time_diff = response_timestamp_micros.checked_sub(query_key.timestamp_micros)?;
 
-        Some((time_diff, query_handle))
+        Some((time_diff, query_key))
     }
 
-    fn create_dns_query(&self, record: &ProcessedDnsRecord) -> DnsQuery {
-        DnsQuery {
-            id: record.id,
-            name: record.name,
-            src_ip: self.anonymize_ip(&record.src_ip),
-            src_port: record.src_port,
-            timestamp_micros: record.timestamp_micros,
-            packet_ordinal: record.packet_ordinal,
-            record_ordinal: record.record_ordinal,
-            query_type: record.query_type,
-        }
+    fn query_identity_from_record(&self, record: &ProcessedDnsRecord) -> QueryIdentityKey {
+        let (src_ip, src_port) = if record.is_query {
+            (self.anonymize_ip(&record.src_ip), record.src_port)
+        } else {
+            (self.anonymize_ip(&record.dst_ip), record.dst_port)
+        };
+
+        (record.id, record.name, src_ip, src_port, record.query_type)
     }
 
-    fn create_dns_response(&self, record: &ProcessedDnsRecord) -> DnsResponse {
-        DnsResponse {
-            id: record.id,
-            name: record.name,
-            dst_ip: self.anonymize_ip(&record.dst_ip),
-            dst_port: record.dst_port,
-            timestamp_micros: record.timestamp_micros,
-            packet_ordinal: record.packet_ordinal,
-            record_ordinal: record.record_ordinal,
-            response_code: record.response_code,
-            query_type: record.query_type,
-        }
+    fn response_identity_from_record(&self, record: &ProcessedDnsRecord) -> ResponseIdentityKey {
+        let (dst_ip, dst_port) = if record.is_query {
+            (self.anonymize_ip(&record.src_ip), record.src_port)
+        } else {
+            (self.anonymize_ip(&record.dst_ip), record.dst_port)
+        };
+
+        (record.id, record.name, dst_ip, dst_port, record.query_type)
     }
 
-    fn query_identity_key(&self, query: &DnsQuery) -> QueryIdentityKey {
-        (
-            query.id,
-            query.name,
-            query.src_ip,
-            query.src_port,
-            query.query_type,
-        )
-    }
-
-    fn response_identity_key(&self, response: &DnsResponse) -> ResponseIdentityKey {
-        (
-            response.id,
-            response.name,
-            response.dst_ip,
-            response.dst_port,
-            response.query_type,
-        )
-    }
-
-    pub(super) fn query_identity_from_response(&self, response: &DnsResponse) -> QueryIdentityKey {
-        (
-            response.id,
-            response.name,
-            response.dst_ip,
-            response.dst_port,
-            response.query_type,
-        )
-    }
-
+    #[cfg(test)]
     pub(super) fn response_identity_from_query(&self, query: &DnsQuery) -> ResponseIdentityKey {
         (
             query.id,
@@ -474,19 +412,11 @@ impl DnsProcessor {
         )
     }
 
-    fn timeline_key_for_query(&self, query: &DnsQuery) -> TimelineKey {
+    fn timeline_key_from_record(&self, record: &ProcessedDnsRecord) -> TimelineKey {
         TimelineKey::new(
-            query.timestamp_micros,
-            query.packet_ordinal,
-            query.record_ordinal,
-        )
-    }
-
-    fn timeline_key_for_response(&self, response: &DnsResponse) -> TimelineKey {
-        TimelineKey::new(
-            response.timestamp_micros,
-            response.packet_ordinal,
-            response.record_ordinal,
+            record.timestamp_micros,
+            record.packet_ordinal,
+            record.record_ordinal,
         )
     }
 

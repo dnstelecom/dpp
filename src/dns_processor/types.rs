@@ -9,13 +9,16 @@ use arrayvec::ArrayVec;
 use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
-use std::mem::{self, MaybeUninit};
+use std::mem;
 use std::net::IpAddr;
+
+#[cfg(test)]
+use std::mem::MaybeUninit;
 
 use crate::custom_types::DnsNameBuf;
 use crate::record::DnsRecord;
 
-const INLINE_TIMELINE_CAPACITY: usize = 4;
+const INLINE_TIMELINE_CAPACITY: usize = 1;
 
 // Matcher identity preserves the observed presentation-form QNAME bytes and does not lowercase
 // them before building in-flight keys. This is an accepted operational hypothesis for the current
@@ -47,6 +50,14 @@ impl TimelineKey {
     pub(super) fn upper_bound(timestamp_micros: i64) -> Self {
         Self::new(timestamp_micros, u64::MAX, u32::MAX)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct QueryEventPayload;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ResponseEventPayload {
+    pub(super) response_code: HickoryResponseCode,
 }
 
 pub(super) enum Timeline<Record> {
@@ -90,15 +101,15 @@ impl<Record> Timeline<Record> {
         lower_timestamp_micros: i64,
         upper_timestamp_micros: i64,
     ) -> bool {
-        self.first_in_range(lower_timestamp_micros, upper_timestamp_micros)
+        self.first_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)
             .is_some()
     }
 
-    pub(super) fn first_in_range(
+    pub(super) fn first_entry_in_range(
         &self,
         lower_timestamp_micros: i64,
         upper_timestamp_micros: i64,
-    ) -> Option<&Record> {
+    ) -> Option<(TimelineKey, &Record)> {
         match self {
             Self::Inline(entries) => {
                 let lower_bound = TimelineKey::lower_bound(lower_timestamp_micros);
@@ -107,7 +118,7 @@ impl<Record> Timeline<Record> {
                         Ok(index) | Err(index) => index,
                     };
                 let (key, record) = entries.get(index)?;
-                (key.timestamp_micros <= upper_timestamp_micros).then_some(record)
+                (key.timestamp_micros <= upper_timestamp_micros).then_some((*key, record))
             }
             Self::Tree(tree) => tree
                 .range(
@@ -115,15 +126,15 @@ impl<Record> Timeline<Record> {
                         ..=TimelineKey::upper_bound(upper_timestamp_micros),
                 )
                 .next()
-                .map(|(_, record)| record),
+                .map(|(key, record)| (*key, record)),
         }
     }
 
-    pub(super) fn last_in_range(
+    pub(super) fn last_entry_in_range(
         &self,
         lower_timestamp_micros: i64,
         upper_timestamp_micros: i64,
-    ) -> Option<&Record> {
+    ) -> Option<(TimelineKey, &Record)> {
         match self {
             Self::Inline(entries) => {
                 let upper_bound = TimelineKey::upper_bound(upper_timestamp_micros);
@@ -133,7 +144,7 @@ impl<Record> Timeline<Record> {
                         Err(index) => index.checked_sub(1)?,
                     };
                 let (key, record) = entries.get(index)?;
-                (key.timestamp_micros >= lower_timestamp_micros).then_some(record)
+                (key.timestamp_micros >= lower_timestamp_micros).then_some((*key, record))
             }
             Self::Tree(tree) => tree
                 .range(
@@ -141,7 +152,7 @@ impl<Record> Timeline<Record> {
                         ..=TimelineKey::upper_bound(upper_timestamp_micros),
                 )
                 .next_back()
-                .map(|(_, record)| record),
+                .map(|(key, record)| (*key, record)),
         }
     }
 
@@ -160,7 +171,7 @@ impl<Record> Timeline<Record> {
     pub(super) fn drain_before(
         &mut self,
         threshold_timestamp_micros: i64,
-        mut visit: impl FnMut(Record),
+        mut visit: impl FnMut(TimelineKey, Record),
     ) {
         match self {
             Self::Inline(entries) => {
@@ -168,8 +179,8 @@ impl<Record> Timeline<Record> {
                     .iter()
                     .position(|(key, _)| key.timestamp_micros >= threshold_timestamp_micros)
                     .unwrap_or(entries.len());
-                for (_, record) in entries.drain(..split_index) {
-                    visit(record);
+                for (key, record) in entries.drain(..split_index) {
+                    visit(key, record);
                 }
             }
             Self::Tree(tree) => {
@@ -177,25 +188,24 @@ impl<Record> Timeline<Record> {
                     .first_key_value()
                     .is_some_and(|(key, _)| key.timestamp_micros < threshold_timestamp_micros)
                 {
-                    let (_, record) = tree.pop_first().expect("timeline must have first entry");
-                    visit(record);
+                    let (key, record) = tree.pop_first().expect("timeline must have first entry");
+                    visit(key, record);
                 }
             }
         }
     }
 
-    pub(super) fn extend_cloned_into(&self, records: &mut Vec<Record>)
-    where
-        Record: Clone,
-    {
+    pub(super) fn into_entries(self, mut visit: impl FnMut(TimelineKey, Record)) {
         match self {
             Self::Inline(entries) => {
-                records.reserve(entries.len());
-                records.extend(entries.iter().map(|(_, record)| record.clone()));
+                for (key, record) in entries {
+                    visit(key, record);
+                }
             }
             Self::Tree(tree) => {
-                records.reserve(tree.len());
-                records.extend(tree.values().cloned());
+                for (key, record) in tree {
+                    visit(key, record);
+                }
             }
         }
     }
@@ -216,20 +226,23 @@ impl<Record> Timeline<Record> {
     }
 }
 
-pub(super) type QueryTimeline = Timeline<EntryHandle>;
-pub(super) type ResponseTimeline = Timeline<EntryHandle>;
+pub(super) type QueryTimeline = Timeline<QueryEventPayload>;
+pub(super) type ResponseTimeline = Timeline<ResponseEventPayload>;
 
 pub(super) type QueryMap = BTreeMap<QueryIdentityKey, QueryTimeline>;
 pub(super) type ResponseMap = BTreeMap<ResponseIdentityKey, ResponseTimeline>;
 
+#[cfg(test)]
 const FREE_LIST_EMPTY: u32 = u32::MAX;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EntryHandle {
     slot: u32,
     generation: u32,
 }
 
+#[cfg(test)]
 struct EntrySlot<T> {
     generation: u32,
     next_free: u32,
@@ -237,11 +250,13 @@ struct EntrySlot<T> {
     value: MaybeUninit<T>,
 }
 
+#[cfg(test)]
 pub(super) struct EntryArena<T> {
     slots: Vec<EntrySlot<T>>,
     free_head: u32,
 }
 
+#[cfg(test)]
 impl<T> Default for EntryArena<T> {
     fn default() -> Self {
         Self {
@@ -251,6 +266,7 @@ impl<T> Default for EntryArena<T> {
     }
 }
 
+#[cfg(test)]
 impl<T> EntryArena<T> {
     pub(super) fn alloc(&mut self, value: T) -> EntryHandle {
         if self.free_head != FREE_LIST_EMPTY {
@@ -310,6 +326,7 @@ impl<T> EntryArena<T> {
     }
 }
 
+#[cfg(test)]
 impl<T> Drop for EntryArena<T> {
     fn drop(&mut self) {
         for slot in &mut self.slots {
@@ -350,6 +367,7 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) response_code: HickoryResponseCode,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsQuery {
     pub(super) id: u16,
@@ -362,6 +380,7 @@ pub(super) struct DnsQuery {
     pub(super) query_type: HickoryRecordType,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsResponse {
     pub(super) id: u16,
@@ -379,6 +398,4 @@ pub(super) struct DnsResponse {
 pub(super) struct MatcherShardState {
     pub(super) query_map: QueryMap,
     pub(super) response_map: ResponseMap,
-    pub(super) query_arena: EntryArena<DnsQuery>,
-    pub(super) response_arena: EntryArena<DnsResponse>,
 }

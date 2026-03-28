@@ -116,6 +116,40 @@ fn make_response_with_timestamp(
     }
 }
 
+fn insert_query(
+    processor: &DnsProcessor,
+    state: &mut MatcherShardState,
+    query: super::types::DnsQuery,
+) {
+    let identity = (query.id, query.name, query.src_ip, query.src_port, query.query_type);
+    let key = super::types::TimelineKey::new(
+        query.timestamp_micros,
+        query.packet_ordinal,
+        query.record_ordinal,
+    );
+    processor.insert_query_entry(state, identity, key);
+}
+
+fn insert_response(
+    processor: &DnsProcessor,
+    state: &mut MatcherShardState,
+    response: super::types::DnsResponse,
+) {
+    let identity = (
+        response.id,
+        response.name,
+        response.dst_ip,
+        response.dst_port,
+        response.query_type,
+    );
+    let key = super::types::TimelineKey::new(
+        response.timestamp_micros,
+        response.packet_ordinal,
+        response.record_ordinal,
+    );
+    processor.insert_response_entry(state, identity, key, response.response_code);
+}
+
 fn make_query_record(packet_ordinal: u64, record_ordinal: u32) -> ProcessedDnsRecord {
     make_query_record_with_timestamp(1_000, packet_ordinal, record_ordinal)
 }
@@ -280,8 +314,8 @@ fn duplicate_responses_stay_distinct_and_tie_break_by_discriminator() {
     let first = make_response(11, 0);
     let second = make_response(11, 1);
 
-    processor.insert_response_entry(&mut state, first.clone());
-    processor.insert_response_entry(&mut state, second.clone());
+    insert_response(&processor, &mut state, first.clone());
+    insert_response(&processor, &mut state, second.clone());
 
     assert_eq!(pending_response_count(&state), 2);
 
@@ -299,11 +333,12 @@ fn duplicate_responses_stay_distinct_and_tie_break_by_discriminator() {
         .expect("a match is expected");
 
     assert_eq!(
-        state
-            .response_arena
-            .get(matched.1)
-            .expect("matched response handle resolves"),
-        &first
+        matched.1,
+        super::types::TimelineKey::new(
+            first.timestamp_micros,
+            first.packet_ordinal,
+            first.record_ordinal,
+        )
     );
 }
 
@@ -454,7 +489,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
     let processor = test_processor();
     let mut state = test_shard_state();
 
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -467,7 +503,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -480,7 +517,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -517,7 +555,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
     let processor = test_processor();
     let mut state = test_shard_state();
 
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -530,7 +569,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -543,7 +583,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -556,7 +597,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
@@ -569,7 +611,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             query_type: HickoryRecordType::A,
         },
     );
-    processor.insert_query_entry(
+    insert_query(
+        &processor,
         &mut state,
         super::types::DnsQuery {
             id: 42,
