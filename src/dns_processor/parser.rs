@@ -13,7 +13,6 @@ use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
-use pnet_packet::{Packet, tcp::TcpPacket};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -250,45 +249,6 @@ impl DnsProcessor {
             meta.dst_port(),
             timestamp_micros,
             meta.is_response,
-        )
-    }
-
-    #[allow(dead_code)]
-    fn process_tcp_packet(
-        &self,
-        data: &[u8],
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        timestamp_micros: i64,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let tcp = TcpPacket::new(data).ok_or("Failed to parse TCP packet")?;
-        let (src_port, dst_port) = (tcp.get_source(), tcp.get_destination());
-
-        if !(src_port == 53 || dst_port == 53) {
-            return Ok(Vec::new());
-        }
-
-        let tcp_payload = tcp.payload();
-        let dns_data = tcp_payload
-            .get(2..)
-            .filter(|payload| {
-                let dns_length = u16::from_be_bytes([tcp_payload[0], tcp_payload[1]]) as usize;
-                payload.len() >= dns_length
-            })
-            .ok_or("Incomplete DNS message in TCP packet")?;
-
-        let is_response = src_port == 53;
-        let (header, queries) = self.decode_dns_questions(dns_data)?;
-
-        self.build_dns_records(
-            &header,
-            queries.as_slice(),
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            timestamp_micros,
-            is_response,
         )
     }
 
