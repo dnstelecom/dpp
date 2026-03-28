@@ -72,11 +72,22 @@ fn format_information(args: &AppConfig) -> &'static str {
     }
 }
 
-fn shutdown_output_message(graceful_signal_shutdown: bool) -> OutputMessage {
-    if graceful_signal_shutdown {
-        OutputMessage::Abort
-    } else {
-        OutputMessage::Shutdown
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunTermination {
+    Completed,
+    InterruptedBySignal,
+}
+
+impl RunTermination {
+    fn output_shutdown_message(self) -> OutputMessage {
+        match self {
+            RunTermination::Completed => OutputMessage::Shutdown,
+            RunTermination::InterruptedBySignal => OutputMessage::Abort,
+        }
+    }
+
+    fn graceful_signal_shutdown(self) -> bool {
+        matches!(self, RunTermination::InterruptedBySignal)
     }
 }
 
@@ -501,8 +512,12 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let processing_seconds = start_time.elapsed().as_secs_f64();
 
     let io_flush_start = Instant::now();
-    let graceful_signal_shutdown = shutdown_requested.load(AtomicOrdering::SeqCst);
-    let shutdown_result = tx.send(shutdown_output_message(graceful_signal_shutdown));
+    let termination = if shutdown_requested.load(AtomicOrdering::SeqCst) {
+        RunTermination::InterruptedBySignal
+    } else {
+        RunTermination::Completed
+    };
+    let shutdown_result = tx.send(termination.output_shutdown_message());
     drop(tx);
 
     if let Some(memory_thread) = memory_thread {
@@ -526,7 +541,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
         let warnings = RunWarningsSummary {
             non_monotonic_capture_timestamps: non_monotonic_timestamp_warning(&packet_parser),
-            graceful_signal_shutdown,
+            graceful_signal_shutdown: termination.graceful_signal_shutdown(),
         };
         let summary = build_run_summary(
             &args,
@@ -837,12 +852,7 @@ mod tests {
     #[test]
     fn signal_shutdown_uses_abort_message_for_output_teardown() {
         assert!(matches!(
-            shutdown_output_message(true),
-            OutputMessage::Abort
-        ));
-
-        assert!(matches!(
-            shutdown_output_message(true),
+            RunTermination::InterruptedBySignal.output_shutdown_message(),
             OutputMessage::Abort
         ));
     }
@@ -850,7 +860,7 @@ mod tests {
     #[test]
     fn normal_completion_keeps_shutdown_message_for_output_teardown() {
         assert!(matches!(
-            shutdown_output_message(false),
+            RunTermination::Completed.output_shutdown_message(),
             OutputMessage::Shutdown
         ));
     }

@@ -46,14 +46,12 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProtoRecordType(HickoryRecordType);
 
-/// Converts `HickoryRecordType` into `ProtoRecordType`.
 impl From<HickoryRecordType> for ProtoRecordType {
     fn from(code: HickoryRecordType) -> Self {
         ProtoRecordType(code)
     }
 }
 
-/// Converts `ProtoRecordType` back into `HickoryRecordType`.
 impl From<ProtoRecordType> for HickoryRecordType {
     fn from(wrapped: ProtoRecordType) -> Self {
         wrapped.0
@@ -66,7 +64,6 @@ impl ProtoRecordType {
     }
 }
 
-/// Custom ordering for `ProtoRecordType` based on the internal numeric representation.
 impl Ord for ProtoRecordType {
     fn cmp(&self, other: &Self) -> Ordering {
         let self_value: u16 = self.0.into();
@@ -81,7 +78,6 @@ impl PartialOrd for ProtoRecordType {
     }
 }
 
-/// Implements `Serialize` trait for `ProtoRecordType`.
 impl Serialize for ProtoRecordType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -91,7 +87,6 @@ impl Serialize for ProtoRecordType {
     }
 }
 
-/// Implements `Deserialize` trait for `ProtoRecordType`.
 impl<'de> Deserialize<'de> for ProtoRecordType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -105,7 +100,6 @@ impl<'de> Deserialize<'de> for ProtoRecordType {
     }
 }
 
-/// Implements `fmt::Display` for `ProtoRecordType`.
 impl fmt::Display for ProtoRecordType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
@@ -316,67 +310,18 @@ impl<const N: usize> FixedSizeString<N> {
         ArrayString::from(value).map(Into::into)
     }
 
-    /// Retrieves the string slice contained within the `FixedSizeString`.
-    ///
-    /// # Returns
-    ///
-    /// A string slice representing the contents of the `FixedSizeString`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let fixed_string: FixedSizeString<10> = FixedSizeString::new("Hello").unwrap();
-    /// assert_eq!(fixed_string.as_str(), "Hello");
-    /// ```
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }
 
 impl<const N: usize> fmt::Display for FixedSizeString<N> {
-    /// Formats the `FixedSizeString` for display purposes.
-    ///
-    /// This implementation allows `FixedSizeString` instances to be printed using `{}` in format strings.
-    ///
-    /// # Parameters
-    ///
-    /// - `f`: The formatter.
-    ///
-    /// # Returns
-    ///
-    /// A `fmt::Result` indicating the success or failure of the formatting operation.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let fixed_string: FixedSizeString<10> = FixedSizeString::new("Hello").unwrap();
-    /// println!("{}", fixed_string); // Outputs: Hello
-    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0.as_str())
     }
 }
 
 impl<const N: usize> Serialize for FixedSizeString<N> {
-    /// Serializes the `FixedSizeString` into a string format.
-    ///
-    /// This implementation allows `FixedSizeString` instances to be serialized using Serde.
-    ///
-    /// # Parameters
-    ///
-    /// - `serializer`: The serializer to which the string will be serialized.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating the success or failure of the serialization operation.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let fixed_string: FixedSizeString<10> = FixedSizeString::new("Hello").unwrap();
-    /// let serialized = serde_json::to_string(&fixed_string).unwrap();
-    /// assert_eq!(serialized, "\"Hello\"");
-    /// ```
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -386,51 +331,12 @@ impl<const N: usize> Serialize for FixedSizeString<N> {
 }
 
 impl<const N: usize> From<ArrayString<N>> for FixedSizeString<N> {
-    /// Converts an `ArrayString` into a `FixedSizeString`.
-    ///
-    /// This implementation allows for seamless conversion from `ArrayString` to `FixedSizeString`.
-    ///
-    /// # Parameters
-    ///
-    /// - `array_string`: The `ArrayString` instance to be converted.
-    ///
-    /// # Returns
-    ///
-    /// A new `FixedSizeString` containing the contents of the provided `ArrayString`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let array_string: ArrayString<10> = ArrayString::from("Hello").unwrap();
-    /// let fixed_string: FixedSizeString<10> = array_string.into();
-    /// assert_eq!(fixed_string.as_str(), "Hello");
-    /// ```
     fn from(array_string: ArrayString<N>) -> Self {
         FixedSizeString(array_string)
     }
 }
 
 impl<'de, const N: usize> Deserialize<'de> for FixedSizeString<N> {
-    /// Deserializes a string into a `FixedSizeString`.
-    ///
-    /// This implementation allows `FixedSizeString` instances to be deserialized using Serde.
-    /// If the incoming string exceeds the predefined capacity `N`, deserialization will fail.
-    ///
-    /// # Parameters
-    ///
-    /// - `deserializer`: The deserializer from which the string will be deserialized.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing the deserialized `FixedSizeString` or a deserialization error.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let json_str = "\"Hello\"";
-    /// let fixed_string: FixedSizeString<10> = serde_json::from_str(json_str).unwrap();
-    /// assert_eq!(fixed_string.as_str(), "Hello");
-    /// ```
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,

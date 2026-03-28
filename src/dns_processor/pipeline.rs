@@ -11,7 +11,6 @@ use seahash::SeaHasher;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::net::IpAddr;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -228,26 +227,6 @@ impl PendingBatchBuffer {
     }
 }
 
-fn map_index(flow_key: Option<CanonicalFlowKey>, shard_count: usize, per_thread: bool) -> usize {
-    if per_thread {
-        let mut hasher = SeaHasher::new();
-        let flow_key = flow_key.unwrap_or(CanonicalFlowKey {
-            client_ip: IpAddr::from([0, 0, 0, 0]),
-            client_port: 0,
-            resolver_ip: IpAddr::from([0, 0, 0, 0]),
-        });
-        (
-            flow_key.client_ip,
-            flow_key.client_port,
-            flow_key.resolver_ip,
-        )
-            .hash(&mut hasher);
-        (hasher.finish() as usize) % shard_count
-    } else {
-        0
-    }
-}
-
 fn emit_record(tx: &Sender<OutputMessage>, record: crate::record::DnsRecord) {
     if let Err(err) = tx.send(OutputMessage::Record(record)) {
         tracing::error!("Failed to send DnsRecord: {}", err);
@@ -260,30 +239,30 @@ fn join_thread<T>(handle: thread::JoinHandle<anyhow::Result<T>>, label: &str) ->
         .map_err(|err| io::Error::other(format!("{label} panicked: {:?}", err)))?
 }
 
-fn logical_shard_count(num_threads: usize, per_thread: bool) -> usize {
-    if per_thread {
-        num_threads.saturating_mul(MATCHER_SHARD_FACTOR).max(1)
-    } else {
-        1
+fn logical_shard_count(num_threads: usize, shard_parallelism_enabled: bool) -> usize {
+    if !shard_parallelism_enabled {
+        return 1;
     }
+
+    num_threads.saturating_mul(MATCHER_SHARD_FACTOR).max(1)
 }
 
 fn matcher_worker_count(
     execution_budget: ExecutionBudget,
-    per_thread: bool,
+    shard_parallelism_enabled: bool,
     shard_count: usize,
 ) -> usize {
-    if per_thread && execution_budget.uses_staged_pipeline() {
-        execution_budget
-            .staged_worker_budget
-            .min(shard_count)
-            .max(1)
-    } else {
+    if !shard_parallelism_enabled || !execution_budget.uses_staged_pipeline() {
         1
+    } else {
+        debug_assert!(shard_count > 0);
+        execution_budget.staged_worker_budget.min(shard_count)
     }
 }
 
 fn worker_shard_ranges(shard_count: usize, worker_count: usize) -> Vec<Range<usize>> {
+    debug_assert!(shard_count > 0);
+    debug_assert!(worker_count > 0);
     (0..worker_count)
         .map(|worker_idx| {
             let start = worker_idx * shard_count / worker_count;
@@ -297,7 +276,7 @@ fn worker_for_shard(shard_idx: usize, worker_ranges: &[Range<usize>]) -> usize {
     worker_ranges
         .iter()
         .position(|range| range.contains(&shard_idx))
-        .unwrap_or(worker_ranges.len().saturating_sub(1))
+        .expect("worker ranges must cover every shard index")
 }
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
@@ -311,11 +290,33 @@ fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardPr
     merged.output_records.extend(shard_result.output_records);
 }
 
+fn routed_shard_capacity_hint(packet_count: usize, shard_count: usize) -> usize {
+    debug_assert!(shard_count > 0);
+    (packet_count / shard_count) + 1
+}
+
+fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
+    debug_assert!(shard_count > 0);
+    if shard_count == 1 {
+        return 0;
+    }
+
+    let mut hasher = SeaHasher::new();
+    (
+        flow_key.client_ip,
+        flow_key.client_port,
+        flow_key.resolver_ip,
+    )
+        .hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
+}
+
 fn route_batch_to_worker_batches(
     mut packet_batch: PacketBatch,
     shard_count: usize,
     worker_ranges: &[Range<usize>],
 ) -> RoutedWorkerBatches {
+    debug_assert!(shard_count > 0);
     sort_packet_batch(packet_batch.as_mut_slice());
     let batch_max_timestamp_micros = packet_batch.last().map(|packet| packet.timestamp_micros);
 
@@ -324,7 +325,10 @@ fn route_batch_to_worker_batches(
         .map(|range| {
             (0..range.len())
                 .map(|_| {
-                    RoutedDnsPackets::with_capacity((packet_batch.len() / shard_count.max(1)) + 1)
+                    RoutedDnsPackets::with_capacity(routed_shard_capacity_hint(
+                        packet_batch.len(),
+                        shard_count,
+                    ))
                 })
                 .collect()
         })
@@ -336,7 +340,7 @@ fn route_batch_to_worker_batches(
             continue;
         };
 
-        let shard_idx = map_index(Some(udp_dns_meta.flow_key), shard_count, true);
+        let shard_idx = shard_map_index(udp_dns_meta.flow_key, shard_count);
         let worker_idx = worker_for_shard(shard_idx, worker_ranges);
         let local_shard_idx = shard_idx - worker_ranges[worker_idx].start;
         worker_batches[worker_idx][local_shard_idx].push(packet_data, udp_dns_meta);
@@ -379,17 +383,18 @@ fn run_phase_processing_worker(
     batch_rx: Receiver<PacketBatch>,
     tx: Sender<OutputMessage>,
     shard_count: usize,
-    per_thread: bool,
+    shard_parallelism_enabled: bool,
     shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
-    let (mut query_maps, mut response_maps): (Vec<QueryMap>, Vec<ResponseMap>) = if per_thread {
-        (
-            (0..shard_count).map(|_| QueryMap::new()).collect(),
-            (0..shard_count).map(|_| ResponseMap::new()).collect(),
-        )
-    } else {
-        (vec![QueryMap::new()], vec![ResponseMap::new()])
-    };
+    let (mut query_maps, mut response_maps): (Vec<QueryMap>, Vec<ResponseMap>) =
+        if shard_parallelism_enabled {
+            (
+                (0..shard_count).map(|_| QueryMap::new()).collect(),
+                (0..shard_count).map(|_| ResponseMap::new()).collect(),
+            )
+        } else {
+            (vec![QueryMap::new()], vec![ResponseMap::new()])
+        };
 
     let mut counters = PipelineCounters::default();
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -679,11 +684,13 @@ impl DnsProcessor {
         packet_count: &Arc<AtomicUsize>,
         tx: &Sender<OutputMessage>,
         execution_budget: ExecutionBudget,
-        per_thread: bool,
+        shard_parallelism_enabled: bool,
         shutdown_requested: Arc<AtomicBool>,
     ) -> anyhow::Result<ProcessingCounters> {
-        let shard_count = logical_shard_count(execution_budget.available_cpus, per_thread);
-        let worker_count = matcher_worker_count(execution_budget, per_thread, shard_count);
+        let shard_count =
+            logical_shard_count(execution_budget.available_cpus, shard_parallelism_enabled);
+        let worker_count =
+            matcher_worker_count(execution_budget, shard_parallelism_enabled, shard_count);
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(BATCH_PREFETCH_DEPTH);
 
         if execution_budget.uses_staged_pipeline() {
@@ -734,7 +741,7 @@ impl DnsProcessor {
                             batch_rx,
                             output_tx,
                             shard_count,
-                            per_thread,
+                            shard_parallelism_enabled,
                             shutdown_requested,
                         )
                     }

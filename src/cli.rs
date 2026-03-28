@@ -6,8 +6,8 @@
  */
 
 use crate::config::{
-    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, MAX_MATCH_TIMEOUT_MS, OutputFormat, ReportFormat,
-    output_path_targets_stdout,
+    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget,
+    ReportFormat, output_target_for_path,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -89,22 +89,18 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .or(env_output_filename)
         .unwrap_or_else(|| PathBuf::from(format.default_output_filename()));
 
+    let output_target = output_target_for_path(&output_filename);
     validate_output_path(&output_filename)?;
-    validate_output_mode(&output_filename, format, report_format)?;
+    validate_output_mode(output_target, format, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
     let v2 = matches.get_flag("v2") || env_v2;
-    let silent =
-        matches.get_flag("silent") || env_silent || output_path_targets_stdout(&output_filename);
+    let silent = resolve_silent_mode(&matches, env_silent, output_target);
     let affinity = matches.get_flag("affinity") || env_affinity;
     let dns_wire_fast_path = matches.get_flag("dns_wire_fast_path") || env_dns_wire_fast_path;
     let monotonic_capture = matches.get_flag("monotonic_capture") || env_monotonic_capture;
 
-    if (zstd || v2) && format != OutputFormat::Parquet {
-        bail!(
-            "The '--zstd' and '--v2' flags|env_vars can only be used with the '--format parquet' option|env_var."
-        );
-    }
+    validate_parquet_only_flags(format, zstd, v2)?;
 
     Ok(AppConfig {
         filename,
@@ -295,6 +291,24 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
     }
 }
 
+fn resolve_silent_mode(
+    matches: &ArgMatches,
+    env_silent: bool,
+    output_target: OutputTarget,
+) -> bool {
+    matches.get_flag("silent") || env_silent || matches!(output_target, OutputTarget::Stdout)
+}
+
+fn validate_parquet_only_flags(format: OutputFormat, zstd: bool, v2: bool) -> Result<()> {
+    if (zstd || v2) && format != OutputFormat::Parquet {
+        bail!(
+            "The '--zstd' and '--v2' flags|env_vars can only be used with the '--format parquet' option|env_var."
+        );
+    }
+
+    Ok(())
+}
+
 fn parse_match_timeout_ms(value: &str) -> Result<u64> {
     let timeout_ms = value
         .parse::<u64>()
@@ -315,7 +329,7 @@ fn parse_match_timeout_ms(value: &str) -> Result<u64> {
 }
 
 fn validate_output_path(output_path: &Path) -> Result<()> {
-    if output_path_targets_stdout(output_path) {
+    if matches!(output_target_for_path(output_path), OutputTarget::Stdout) {
         return Ok(());
     }
 
@@ -337,15 +351,15 @@ fn validate_output_path(output_path: &Path) -> Result<()> {
 }
 
 fn validate_output_mode(
-    output_path: &Path,
+    output_target: OutputTarget,
     format: OutputFormat,
     report_format: ReportFormat,
 ) -> Result<()> {
-    if output_path_targets_stdout(output_path) && !matches!(format, OutputFormat::Csv) {
+    if output_target == OutputTarget::Stdout && !matches!(format, OutputFormat::Csv) {
         bail!("Error: stdout output is supported only for '--format csv'.");
     }
 
-    if output_path_targets_stdout(output_path) && matches!(report_format, ReportFormat::Json) {
+    if output_target == OutputTarget::Stdout && matches!(report_format, ReportFormat::Json) {
         bail!("Error: '--report-format json' cannot be used when output_filename is '-'.");
     }
 
@@ -547,8 +561,9 @@ mod tests {
 
     #[test]
     fn json_report_format_is_rejected_for_stdout_output() {
-        let error = validate_output_mode(Path::new("-"), OutputFormat::Csv, ReportFormat::Json)
-            .expect_err("json report format must be rejected for stdout output");
+        let error =
+            validate_output_mode(OutputTarget::Stdout, OutputFormat::Csv, ReportFormat::Json)
+                .expect_err("json report format must be rejected for stdout output");
 
         assert!(
             error
@@ -559,8 +574,12 @@ mod tests {
 
     #[test]
     fn parquet_format_is_rejected_for_stdout_output() {
-        let error = validate_output_mode(Path::new("-"), OutputFormat::Parquet, ReportFormat::Text)
-            .expect_err("parquet format must be rejected for stdout output");
+        let error = validate_output_mode(
+            OutputTarget::Stdout,
+            OutputFormat::Parquet,
+            ReportFormat::Text,
+        )
+        .expect_err("parquet format must be rejected for stdout output");
 
         assert!(
             error
@@ -571,7 +590,7 @@ mod tests {
 
     #[test]
     fn text_report_format_is_allowed_for_stdout_output() {
-        validate_output_mode(Path::new("-"), OutputFormat::Csv, ReportFormat::Text)
+        validate_output_mode(OutputTarget::Stdout, OutputFormat::Csv, ReportFormat::Text)
             .expect("text report format remains valid for stdout output");
     }
 }

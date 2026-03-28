@@ -401,6 +401,8 @@ impl DnsProcessor {
         self.remove_query_entry(query_map, query);
         output_records.push(DnsProcessor::create_matched_record(query, response));
         *matched_query_response_count += 1;
+        // Saturating subtraction still permits a negative RTT when response timestamps regress
+        // relative to the matched query, so clamp before casting to u64.
         *matched_rtt_sum_micros += response
             .timestamp_micros
             .saturating_sub(query.timestamp_micros)
@@ -419,6 +421,8 @@ impl DnsProcessor {
         self.remove_response_entry(response_map, response);
         output_records.push(DnsProcessor::create_matched_record(query, response));
         *matched_query_response_count += 1;
+        // Saturating subtraction still permits a negative RTT when response timestamps regress
+        // relative to the matched query, so clamp before casting to u64.
         *matched_rtt_sum_micros += response
             .timestamp_micros
             .saturating_sub(query.timestamp_micros)

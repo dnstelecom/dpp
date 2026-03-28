@@ -76,31 +76,6 @@ const SELECTED_ALLOCATOR: SelectedAllocator = tcmalloc_better::TCMalloc;
 ))]
 pub(crate) const ALLOCATOR_NAME: &str = "tcmalloc-better";
 
-#[cfg(all(
-    feature = "allocator-tcmalloc",
-    not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))
-))]
-type SelectedAllocator = std::alloc::System;
-#[cfg(all(
-    feature = "allocator-tcmalloc",
-    not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))
-))]
-const SELECTED_ALLOCATOR: SelectedAllocator = std::alloc::System;
-#[cfg(all(
-    feature = "allocator-tcmalloc",
-    not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))
-))]
-pub(crate) const ALLOCATOR_NAME: &str = "tcmalloc-better (unsupported target)";
-
 #[global_allocator]
 static GLOBAL_ALLOCATOR: SelectedAllocator = SELECTED_ALLOCATOR;
 

@@ -218,6 +218,8 @@ pub(crate) fn configure_logger(
 
 pub(crate) fn install_shutdown_signal_handler() -> Result<Arc<AtomicBool>, RuntimeError> {
     if let Some(flag) = SHUTDOWN_SIGNAL.get() {
+        // SAFETY: Caller must ensure no concurrent run() is still draining before resetting
+        // the shared shutdown flag for a new invocation.
         flag.store(false, AtomicOrdering::SeqCst);
         return Ok(Arc::clone(flag));
     }
