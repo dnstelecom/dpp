@@ -314,9 +314,7 @@ impl DnsProcessor {
         timeline_key: TimelineKey,
         response_code: HickoryResponseCode,
     ) {
-        let payload = ResponseEventPayload {
-            response_code,
-        };
+        let payload = ResponseEventPayload { response_code };
 
         let replaced = state
             .response_map
@@ -362,7 +360,10 @@ impl DnsProcessor {
         let (response_key, _) =
             timeline.first_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)?;
 
-        Some((response_key.timestamp_micros - query_timestamp_micros, response_key))
+        Some((
+            response_key.timestamp_micros - query_timestamp_micros,
+            response_key,
+        ))
     }
 
     pub(super) fn find_closest_query(

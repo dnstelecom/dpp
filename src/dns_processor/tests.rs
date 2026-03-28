@@ -121,7 +121,13 @@ fn insert_query(
     state: &mut MatcherShardState,
     query: super::types::DnsQuery,
 ) {
-    let identity = (query.id, query.name, query.src_ip, query.src_port, query.query_type);
+    let identity = (
+        query.id,
+        query.name,
+        query.src_ip,
+        query.src_port,
+        query.query_type,
+    );
     let key = super::types::TimelineKey::new(
         query.timestamp_micros,
         query.packet_ordinal,
