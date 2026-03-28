@@ -21,9 +21,13 @@ use crate::record::DnsRecord;
 const INLINE_TIMELINE_CAPACITY: usize = 1;
 
 // Matcher identity preserves the observed presentation-form QNAME bytes and does not lowercase
-// them before building in-flight keys. This is an accepted operational hypothesis for the current
-// offline capture path: responses are expected to preserve the query's 0x20 casing. If a capture
-// violates that assumption, query/response pairs that differ only by case may not match.
+// them before building in-flight keys. RFC 4343 defines ASCII label comparison as
+// case-insensitive, and a protocol-compliant response is allowed to differ from the query's 0x20
+// casing, including when name compression reuses label bytes from another wire location. Community
+// Edition intentionally does not canonicalize names here: byte-preserving matching aligns better
+// with the real behavior we target on offline caching-resolver workloads. As a result, a
+// query/response pair that differs only by case may fail to match even on otherwise valid DNS
+// traffic.
 pub(super) type QueryIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
 pub(super) type ResponseIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
 
