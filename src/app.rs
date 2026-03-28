@@ -72,6 +72,14 @@ fn format_information(args: &AppConfig) -> &'static str {
     }
 }
 
+fn shutdown_output_message(graceful_signal_shutdown: bool) -> OutputMessage {
+    if graceful_signal_shutdown {
+        OutputMessage::Abort
+    } else {
+        OutputMessage::Shutdown
+    }
+}
+
 fn display_parquet_format_information(args: &AppConfig) {
     info!("Format is: {}", format_information(args));
 }
@@ -392,7 +400,7 @@ fn display_text_summary(summary: &RunSummary) {
         tracing::warn!(
             "{}",
             runtime::emphasize_warning(
-                "A termination signal was received. DPP stopped accepting new batches, drained in-flight work, and flushed output before exit."
+                "A termination signal was received. DPP stopped accepting new batches, drained already accepted work, skipped synthetic timeout finalization for pending unmatched queries, and discarded any still-buffered output tail before exit."
             )
         );
     }
@@ -487,13 +495,14 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         &tx,
         execution_budget,
         true,
-        shutdown_requested.as_ref(),
+        Arc::clone(&shutdown_requested),
     )
     .map_err(|source| AppRunError::Processing { source })?;
     let processing_seconds = start_time.elapsed().as_secs_f64();
 
     let io_flush_start = Instant::now();
-    let shutdown_result = tx.send(OutputMessage::Shutdown);
+    let graceful_signal_shutdown = shutdown_requested.load(AtomicOrdering::SeqCst);
+    let shutdown_result = tx.send(shutdown_output_message(graceful_signal_shutdown));
     drop(tx);
 
     if let Some(memory_thread) = memory_thread {
@@ -517,7 +526,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
         let warnings = RunWarningsSummary {
             non_monotonic_capture_timestamps: non_monotonic_timestamp_warning(&packet_parser),
-            graceful_signal_shutdown: shutdown_requested.load(AtomicOrdering::SeqCst),
+            graceful_signal_shutdown,
         };
         let summary = build_run_summary(
             &args,
@@ -823,6 +832,27 @@ mod tests {
         assert_eq!(summary.metrics.timed_out_queries, 2);
         assert!((summary.metrics.timed_out_query_ratio - 0.2).abs() < f64::EPSILON);
         assert_eq!(summary.metrics.average_matched_rtt_ms, Some(2.0));
+    }
+
+    #[test]
+    fn signal_shutdown_uses_abort_message_for_output_teardown() {
+        assert!(matches!(
+            shutdown_output_message(true),
+            OutputMessage::Abort
+        ));
+
+        assert!(matches!(
+            shutdown_output_message(true),
+            OutputMessage::Abort
+        ));
+    }
+
+    #[test]
+    fn normal_completion_keeps_shutdown_message_for_output_teardown() {
+        assert!(matches!(
+            shutdown_output_message(false),
+            OutputMessage::Shutdown
+        ));
     }
 
     #[test]

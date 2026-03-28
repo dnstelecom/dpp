@@ -336,4 +336,43 @@ mod tests {
         assert!(!bytes.is_empty());
         assert_eq!(&bytes[..4], b"PAR1");
     }
+
+    #[test]
+    fn parquet_writer_drops_buffered_rows_on_abort() {
+        let filename = temp_test_path("parquet-writer-abort", "parquet");
+        let config = AppConfig {
+            filename: PathBuf::from("input.pcap"),
+            output_filename: filename.clone(),
+            format: OutputFormat::Parquet,
+            report_format: crate::config::ReportFormat::Text,
+            match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            monotonic_capture: false,
+            zstd: false,
+            v2: false,
+            silent: true,
+            num_cpus: 1,
+            requested_threads: None,
+            affinity: false,
+            bonded: 0,
+            anonymize: None,
+            dns_wire_fast_path: false,
+        };
+        let file = File::create(&filename).expect("creates parquet file");
+        let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
+        let (tx, rx) = channel::unbounded();
+
+        tx.send(OutputMessage::Record(test_dns_record()))
+            .expect("record is sent");
+        tx.send(OutputMessage::Abort).expect("abort is sent");
+
+        parquet_writer(writer, rx).expect("parquet writer completes successfully");
+
+        let reader =
+            SerializedFileReader::new(File::open(&filename).expect("opens parquet output"))
+                .expect("parquet output is readable");
+        assert_eq!(reader.metadata().num_row_groups(), 0);
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+
+        fs::remove_file(filename).expect("removes temp parquet file");
+    }
 }
