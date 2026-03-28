@@ -118,13 +118,8 @@ pub fn start_tracking()
                     // Convert RSS from bytes to kibibytes (KiB) for reporting.
                     let current_rss_kib = (process.memory() / 1024) as usize;
 
-                    // Load the current maximum memory usage observed.
-                    let max_usage = memory_usage_clone.load(AtomicOrdering::SeqCst);
-
-                    // If the current RSS exceeds the recorded maximum, update it.
-                    if current_rss_kib > max_usage {
-                        memory_usage_clone.store(current_rss_kib, AtomicOrdering::SeqCst);
-                    }
+                    // Atomically keep the highest observed RSS even if update patterns change later.
+                    memory_usage_clone.fetch_max(current_rss_kib, AtomicOrdering::SeqCst);
                 }
 
                 // Sleep for 100 milliseconds before the next check to reduce CPU usage.
