@@ -220,6 +220,11 @@ and `query_type`) inside the configured match window (`1200ms` by default) are d
 query. Deduplicated retries increment a separate counter and do not emit extra timeout or matched
 records.
 
+For QNAME matching, DPP preserves the observed presentation-form name bytes and does not lowercase
+them before building matcher identity keys. This is an accepted operational hypothesis for the
+current offline capture path: responses are expected to preserve the query's 0x20 casing. If a
+capture violates that assumption, a query and response that differ only by case may fail to match.
+
 Timeout records use the current community-edition sentinel encoding:
 
 - `response_timestamp = 0`
@@ -373,6 +378,7 @@ Additional notes:
 - **Monotonic-capture mode is explicit:** Batched timeout eviction is available only with `--monotonic-capture` because it depends on globally monotonic packet timestamps. If the capture is not monotonic, DPP aborts and recommends `reordercap`.
 - **Scaling ceilings on skewed workloads:** DPP auto-sizes from all available CPUs, but flow-affinity ceilings can still limit scaling before linear speedup.
 - **Duplicate query handling:** Duplicate in-flight DNS queries and responses are preserved and resolved through deterministic matcher tie-breakers derived from capture order. Duplicate-heavy workloads can still increase matcher memory usage, and Parquet output may vary byte-for-byte because writers remain asynchronous.
+- **QNAME casing hypothesis:** Matcher identity preserves observed QNAME casing instead of canonicalizing names to lowercase. DPP explicitly assumes the capture path preserves 0x20 query casing in responses; if that hypothesis is false for a workload, names that differ only by case may not match.
 
 ## Commercial Edition
 

@@ -5,7 +5,6 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use arrayvec::ArrayString;
 use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
@@ -13,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
 use super::types::{ProcessedDnsRecord, QueryMap, ResponseMap};
+use crate::custom_types::DnsName255;
 use crate::test_support::{
     encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload,
 };
@@ -35,22 +35,22 @@ fn test_processor_with_monotonic_capture(match_timeout_micros: i64) -> DnsProces
         .expect("processor initializes")
 }
 
-fn test_name() -> ArrayString<255> {
-    ArrayString::from("example.com").expect("test name fits")
+fn test_name() -> DnsName255 {
+    DnsName255::new("example.com").expect("test name fits")
 }
 
-fn named_test_name(name: &str) -> ArrayString<255> {
-    ArrayString::from(name).expect("test name fits")
+fn named_test_name(name: &str) -> DnsName255 {
+    DnsName255::new(name).expect("test name fits")
 }
 
-fn expected_formatted_name(name: &Name) -> ArrayString<255> {
+fn expected_formatted_name(name: &Name) -> DnsName255 {
     let ascii = name.to_ascii();
     let formatted = ascii
         .strip_suffix('.')
         .filter(|stripped| !stripped.is_empty())
         .unwrap_or(ascii.as_str());
 
-    ArrayString::from(formatted).unwrap_or_default()
+    DnsName255::new(formatted).unwrap_or_default()
 }
 
 fn pending_query_count(query_map: &QueryMap) -> usize {
@@ -577,8 +577,11 @@ fn parser_domain_formatter_preserves_overflow_fallback() {
     let labels = [vec![1u8; 63], vec![1u8; 63], vec![1u8; 63], vec![1u8; 58]];
     let name = Name::from_labels(labels.iter().map(Vec::as_slice)).expect("valid long raw name");
 
-    assert_eq!(expected_formatted_name(&name), ArrayString::new());
-    assert_eq!(DnsProcessor::format_domain_name(&name), ArrayString::new());
+    assert_eq!(expected_formatted_name(&name), DnsName255::default());
+    assert_eq!(
+        DnsProcessor::format_domain_name(&name),
+        DnsName255::default()
+    );
 }
 
 #[test]

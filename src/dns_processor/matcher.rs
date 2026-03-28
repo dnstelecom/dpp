@@ -76,7 +76,7 @@ impl DnsProcessor {
             source_ip: query.src_ip,
             source_port: query.src_port,
             id: query.id,
-            name: query.name.into(),
+            name: query.name,
             query_type: ProtoRecordType::from(query.query_type),
             response_code: ProtoResponseCode::from(response.response_code),
         }
@@ -89,7 +89,7 @@ impl DnsProcessor {
             source_ip: query.src_ip,
             source_port: query.src_port,
             id: query.id,
-            name: query.name.into(),
+            name: query.name,
             query_type: ProtoRecordType::from(query.query_type),
             response_code: ProtoResponseCode::from(HickoryResponseCode::ServFail),
         }

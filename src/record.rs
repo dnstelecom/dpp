@@ -5,7 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::custom_types::{FixedSizeString, ProtoRecordType, ProtoResponseCode};
+use crate::custom_types::{DnsName255, ProtoRecordType, ProtoResponseCode};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
@@ -21,7 +21,7 @@ pub(crate) struct DnsRecord {
     pub(crate) source_ip: IpAddr,
     pub(crate) source_port: u16,
     pub(crate) id: u16,
-    pub(crate) name: FixedSizeString<255>,
+    pub(crate) name: DnsName255,
     pub(crate) query_type: ProtoRecordType,
     pub(crate) response_code: ProtoResponseCode,
 }

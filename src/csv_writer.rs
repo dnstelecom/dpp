@@ -137,7 +137,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_types::FixedSizeString;
+    use crate::custom_types::DnsName255;
     use crate::test_support::{temp_test_path, test_dns_record};
     use crossbeam::channel;
     use std::fs;
@@ -174,8 +174,7 @@ mod tests {
         let file = File::create(&filename).expect("creates csv file");
         let (tx, rx) = channel::unbounded();
         let mut record = test_dns_record();
-        record.name =
-            FixedSizeString::<255>::new("exa,mple\"name\nwrapped\rline").expect("test name fits");
+        record.name = DnsName255::new("exa,mple\"name\nwrapped\rline").expect("test name fits");
 
         tx.send(OutputMessage::Record(record))
             .expect("record is sent");

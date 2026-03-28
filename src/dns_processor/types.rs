@@ -5,17 +5,21 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use arrayvec::ArrayString;
 use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
+use crate::custom_types::DnsName255;
 use crate::record::DnsRecord;
 
+// Matcher identity preserves the observed presentation-form QNAME bytes and does not lowercase
+// them before building in-flight keys. This is an accepted operational hypothesis for the current
+// offline capture path: responses are expected to preserve the query's 0x20 casing. If a capture
+// violates that assumption, query/response pairs that differ only by case may not match.
 pub(super) type QueryKey = (
     u16,
-    ArrayString<255>,
+    DnsName255,
     IpAddr,
     u16,
     HickoryRecordType,
@@ -23,10 +27,10 @@ pub(super) type QueryKey = (
     u64,
     u32,
 );
-pub(super) type QueryIdentityKey = (u16, ArrayString<255>, IpAddr, u16, HickoryRecordType);
+pub(super) type QueryIdentityKey = (u16, DnsName255, IpAddr, u16, HickoryRecordType);
 pub(super) type ResponseKey = (
     u16,
-    ArrayString<255>,
+    DnsName255,
     IpAddr,
     u16,
     HickoryRecordType,
@@ -34,7 +38,7 @@ pub(super) type ResponseKey = (
     u64,
     u32,
 );
-pub(super) type ResponseIdentityKey = (u16, ArrayString<255>, IpAddr, u16, HickoryRecordType);
+pub(super) type ResponseIdentityKey = (u16, DnsName255, IpAddr, u16, HickoryRecordType);
 pub(super) type RecordDiscriminator = (u64, u32);
 pub(super) type QueryTimeline = BTreeMap<i64, BTreeMap<RecordDiscriminator, DnsQuery>>;
 pub(super) type ResponseTimeline = BTreeMap<i64, BTreeMap<RecordDiscriminator, DnsResponse>>;
@@ -68,7 +72,7 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
     pub(super) is_query: bool,
-    pub(super) name: ArrayString<255>,
+    pub(super) name: DnsName255,
     pub(super) query_type: HickoryRecordType,
     pub(super) response_code: HickoryResponseCode,
 }
@@ -76,7 +80,7 @@ pub(super) struct ProcessedDnsRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsQuery {
     pub(super) id: u16,
-    pub(super) name: ArrayString<255>,
+    pub(super) name: DnsName255,
     pub(super) src_ip: IpAddr,
     pub(super) src_port: u16,
     pub(super) timestamp_micros: i64,
@@ -88,7 +92,7 @@ pub(super) struct DnsQuery {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DnsResponse {
     pub(super) id: u16,
-    pub(super) name: ArrayString<255>,
+    pub(super) name: DnsName255,
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
     pub(super) timestamp_micros: i64,

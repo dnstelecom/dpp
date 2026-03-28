@@ -34,6 +34,12 @@ order within each shard and never backtracks. The key design choices:
    but doesn't create a second in-flight entry. One query → one terminal outcome (matched or
    timeout), always.
 
+   The current Community Edition identity key preserves the observed presentation-form QNAME bytes
+   and does not lowercase them before matching. This is an accepted operational hypothesis for the
+   supported offline capture path: responses are expected to preserve the query's 0x20 casing. If
+   that hypothesis is false for a capture, queries and responses that differ only by case may fail
+   to pair.
+
 5. **Closest-match pairing.** When a response arrives, the matcher finds the pending query with
    the closest timestamp (within the timeout window). When a query arrives and a buffered response
    already exists, the same closest-timestamp logic applies in reverse. This handles mild
@@ -53,6 +59,8 @@ These must hold for any valid implementation:
 - Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never leaks into the exported
   `DnsRecord`.
 - Duplicate responses remain distinguishable in matcher state until matched or discarded.
+- The accepted operational hypothesis for Community Edition captures is that response QNAME casing
+  preserves the query's 0x20 casing along the supported capture path.
 
 ## Why BTreeMap and not HashMap
 
