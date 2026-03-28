@@ -11,7 +11,7 @@ use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
-use super::types::{ProcessedDnsRecord, QueryMap, ResponseMap};
+use super::types::{MatcherShardState, ProcessedDnsRecord};
 use crate::custom_types::DnsName255;
 use crate::test_support::{
     encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload,
@@ -53,27 +53,23 @@ fn expected_formatted_name(name: &Name) -> DnsName255 {
     DnsName255::new(formatted).unwrap_or_default()
 }
 
-fn pending_query_count(query_map: &QueryMap) -> usize {
-    query_map
+fn test_shard_state() -> MatcherShardState {
+    MatcherShardState::default()
+}
+
+fn pending_query_count(state: &MatcherShardState) -> usize {
+    state
+        .query_map
         .values()
-        .map(|timeline| {
-            timeline
-                .values()
-                .map(std::collections::BTreeMap::len)
-                .sum::<usize>()
-        })
+        .map(super::types::Timeline::len)
         .sum()
 }
 
-fn pending_response_count(response_map: &ResponseMap) -> usize {
-    response_map
+fn pending_response_count(state: &MatcherShardState) -> usize {
+    state
+        .response_map
         .values()
-        .map(|timeline| {
-            timeline
-                .values()
-                .map(std::collections::BTreeMap::len)
-                .sum::<usize>()
-        })
+        .map(super::types::Timeline::len)
         .sum()
 }
 
@@ -235,8 +231,7 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
 #[test]
 fn deduplicates_later_pending_queries_inside_timeout_window() {
     let processor = test_processor();
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![
@@ -244,8 +239,7 @@ fn deduplicates_later_pending_queries_inside_timeout_window() {
             make_query_record_with_timestamp(1_300, 2, 0),
             make_response_record_with_timestamp(1_500, 3, 0),
         ],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
@@ -254,92 +248,76 @@ fn deduplicates_later_pending_queries_inside_timeout_window() {
     assert_eq!(batch_result.matched_query_response_count, 1);
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_000);
-    assert_eq!(pending_query_count(&query_map), 0);
-    assert_eq!(pending_response_count(&response_map), 0);
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 0);
 }
 
 #[test]
 fn duplicate_query_identity_requires_same_source_port() {
     let processor = test_processor();
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let mut second_query = make_query_record_with_timestamp(1_300, 2, 0);
     second_query.src_port = second_query.src_port.saturating_add(1);
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![make_query_record_with_timestamp(1_000, 1, 0), second_query],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
     assert_eq!(batch_result.dns_query_count, 2);
     assert_eq!(batch_result.duplicated_query_count, 0);
-    assert_eq!(pending_query_count(&query_map), 2);
+    assert_eq!(pending_query_count(&state), 2);
 }
 
 #[test]
 fn duplicate_responses_stay_distinct_and_tie_break_by_discriminator() {
     let processor = test_processor();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
     let query = make_query(9, 0);
 
     let first = make_response(11, 0);
     let second = make_response(11, 1);
 
-    let first_key = processor.create_response_key(
-        &first,
-        first.timestamp_micros,
-        first.packet_ordinal,
-        first.record_ordinal,
-    );
-    processor.insert_response_entry(&mut response_map, first.clone());
-    processor.insert_response_entry(&mut response_map, second.clone());
+    processor.insert_response_entry(&mut state, first.clone());
+    processor.insert_response_entry(&mut state, second.clone());
 
-    assert_eq!(pending_response_count(&response_map), 2);
-
-    let lower_bound_key = processor.create_response_key_from_query(
-        &query,
-        query.timestamp_micros,
-        u64::MIN,
-        u32::MIN,
-    );
-    let upper_bound_key = processor.create_response_key_from_query(
-        &query,
-        query.timestamp_micros
-            + i64::try_from(crate::config::DEFAULT_MATCH_TIMEOUT_MS)
-                .expect("default timeout fits into i64")
-                * 1_000,
-        u64::MAX,
-        u32::MAX,
-    );
+    assert_eq!(pending_response_count(&state), 2);
 
     let matched = processor
         .find_closest_response(
-            &response_map,
-            &lower_bound_key,
-            &upper_bound_key,
+            &state,
+            &processor.response_identity_from_query(&query),
+            query.timestamp_micros,
+            query.timestamp_micros
+                + i64::try_from(crate::config::DEFAULT_MATCH_TIMEOUT_MS)
+                    .expect("default timeout fits into i64")
+                    * 1_000,
             query.timestamp_micros,
         )
         .expect("a match is expected");
 
-    assert_eq!(matched.2, first_key);
+    assert_eq!(
+        state
+            .response_arena
+            .get(matched.1)
+            .expect("matched response handle resolves"),
+        &first
+    );
 }
 
 #[test]
 fn response_at_exact_match_timeout_boundary_still_matches() {
     let processor = test_processor_with_match_timeout_micros(1_200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![
             make_query_record_with_timestamp(1_000_000, 1, 0),
             make_response_record_with_timestamp(2_200_000, 2, 0),
         ],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
@@ -348,15 +326,14 @@ fn response_at_exact_match_timeout_boundary_still_matches() {
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_000_000);
     assert_eq!(batch_result.output_records[0].response_timestamp, 2_200_000);
-    assert_eq!(pending_query_count(&query_map), 0);
-    assert_eq!(pending_response_count(&response_map), 0);
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 0);
 }
 
 #[test]
 fn shorter_match_timeout_changes_pairing_window() {
     let processor = test_processor_with_match_timeout_micros(200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![
@@ -364,8 +341,7 @@ fn shorter_match_timeout_changes_pairing_window() {
             make_query_record_with_timestamp(1_300_000, 2, 0),
             make_response_record_with_timestamp(1_500_000, 3, 0),
         ],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
@@ -374,46 +350,42 @@ fn shorter_match_timeout_changes_pairing_window() {
     assert_eq!(batch_result.matched_query_response_count, 1);
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_300_000);
-    assert_eq!(pending_query_count(&query_map), 1);
-    assert_eq!(pending_response_count(&response_map), 0);
+    assert_eq!(pending_query_count(&state), 1);
+    assert_eq!(pending_response_count(&state), 0);
 }
 
 #[test]
 fn shard_processing_defers_timeout_until_finalization() {
     let processor = test_processor();
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![make_query_record(1, 0)],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
     assert_eq!(batch_result.dns_query_count, 1);
     assert!(batch_result.output_records.is_empty());
-    assert_eq!(pending_query_count(&query_map), 1);
+    assert_eq!(pending_query_count(&state), 1);
 
-    let finalization_result = processor.finalize_shard(&mut query_map, &mut response_map);
+    let finalization_result = processor.finalize_shard(&mut state);
 
     assert_eq!(finalization_result.output_records.len(), 1);
-    assert_eq!(pending_query_count(&query_map), 0);
+    assert_eq!(pending_query_count(&state), 0);
 }
 
 #[test]
 fn monotonic_capture_enables_batched_timeout_eviction() {
     let processor = test_processor_with_monotonic_capture(1_200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![
             make_query_record_with_timestamp(1_000_000, 1, 0),
             make_query_record_with_timestamp(2_500_000, 2, 0),
         ],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         None,
     );
 
@@ -421,76 +393,69 @@ fn monotonic_capture_enables_batched_timeout_eviction() {
     assert_eq!(batch_result.timeout_query_count, 1);
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_000_000);
-    assert_eq!(pending_query_count(&query_map), 1);
+    assert_eq!(pending_query_count(&state), 1);
 }
 
 #[test]
 fn monotonic_capture_preserves_query_at_exact_timeout_boundary() {
     let processor = test_processor_with_monotonic_capture(1_200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![make_query_record_with_timestamp(1_000_000, 1, 0)],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         Some(2_200_000),
     );
 
     assert_eq!(batch_result.timeout_query_count, 0);
     assert!(batch_result.output_records.is_empty());
-    assert_eq!(pending_query_count(&query_map), 1);
+    assert_eq!(pending_query_count(&state), 1);
 }
 
 #[test]
 fn monotonic_capture_evicts_unmatched_responses() {
     let processor = test_processor_with_monotonic_capture(1_200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![
             make_response_record_with_timestamp(1_000_000, 1, 0),
             make_query_record_with_timestamp(2_500_000, 2, 0),
         ],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         Some(2_500_000),
     );
 
     assert_eq!(batch_result.timeout_query_count, 0);
     assert!(batch_result.output_records.is_empty());
-    assert_eq!(pending_query_count(&query_map), 1);
-    assert_eq!(pending_response_count(&response_map), 0);
+    assert_eq!(pending_query_count(&state), 1);
+    assert_eq!(pending_response_count(&state), 0);
 }
 
 #[test]
 fn monotonic_capture_uses_batch_watermark_for_sparse_shards() {
     let processor = test_processor_with_monotonic_capture(1_200_000);
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     let batch_result = processor.process_shard_records_with_batch_watermark(
         vec![make_query_record_with_timestamp(1_000_000, 1, 0)],
-        &mut query_map,
-        &mut response_map,
+        &mut state,
         Some(2_500_000),
     );
 
     assert_eq!(batch_result.timeout_query_count, 1);
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_000_000);
-    assert_eq!(pending_query_count(&query_map), 0);
+    assert_eq!(pending_query_count(&state), 0);
 }
 
 #[test]
 fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
     let processor = test_processor();
-    let mut query_map: QueryMap = std::collections::BTreeMap::new();
-    let mut response_map: ResponseMap = std::collections::BTreeMap::new();
+    let mut state = test_shard_state();
 
     processor.insert_query_entry(
-        &mut query_map,
+        &mut state,
         super::types::DnsQuery {
             id: 42,
             name: named_test_name("b.example"),
@@ -503,7 +468,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
         },
     );
     processor.insert_query_entry(
-        &mut query_map,
+        &mut state,
         super::types::DnsQuery {
             id: 42,
             name: named_test_name("a.example"),
@@ -516,7 +481,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
         },
     );
     processor.insert_query_entry(
-        &mut query_map,
+        &mut state,
         super::types::DnsQuery {
             id: 42,
             name: named_test_name("a.example"),
@@ -529,7 +494,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
         },
     );
 
-    let finalization_result = processor.finalize_shard(&mut query_map, &mut response_map);
+    let finalization_result = processor.finalize_shard(&mut state);
 
     let observed = finalization_result
         .output_records
@@ -544,6 +509,104 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             ("a.example".to_string(), 2_000),
             ("b.example".to_string(), 1_500),
         ]
+    );
+}
+
+#[test]
+fn timeline_overflow_preserves_sorted_finalization_order() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+
+    processor.insert_query_entry(
+        &mut state,
+        super::types::DnsQuery {
+            id: 42,
+            name: test_name(),
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 53_000,
+            timestamp_micros: 1_300,
+            packet_ordinal: 4,
+            record_ordinal: 0,
+            query_type: HickoryRecordType::A,
+        },
+    );
+    processor.insert_query_entry(
+        &mut state,
+        super::types::DnsQuery {
+            id: 42,
+            name: test_name(),
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 53_000,
+            timestamp_micros: 1_100,
+            packet_ordinal: 2,
+            record_ordinal: 0,
+            query_type: HickoryRecordType::A,
+        },
+    );
+    processor.insert_query_entry(
+        &mut state,
+        super::types::DnsQuery {
+            id: 42,
+            name: test_name(),
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 53_000,
+            timestamp_micros: 1_400,
+            packet_ordinal: 5,
+            record_ordinal: 0,
+            query_type: HickoryRecordType::A,
+        },
+    );
+    processor.insert_query_entry(
+        &mut state,
+        super::types::DnsQuery {
+            id: 42,
+            name: test_name(),
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 53_000,
+            timestamp_micros: 1_200,
+            packet_ordinal: 3,
+            record_ordinal: 0,
+            query_type: HickoryRecordType::A,
+        },
+    );
+    processor.insert_query_entry(
+        &mut state,
+        super::types::DnsQuery {
+            id: 42,
+            name: test_name(),
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            src_port: 53_000,
+            timestamp_micros: 1_000,
+            packet_ordinal: 1,
+            record_ordinal: 0,
+            query_type: HickoryRecordType::A,
+        },
+    );
+
+    let finalization_result = processor.finalize_shard(&mut state);
+    let observed = finalization_result
+        .output_records
+        .into_iter()
+        .map(|record| record.request_timestamp)
+        .collect::<Vec<_>>();
+
+    assert_eq!(observed, vec![1_000, 1_100, 1_200, 1_300, 1_400]);
+}
+
+#[test]
+fn entry_arena_rejects_stale_handles_after_slot_reuse() {
+    let mut arena = super::types::EntryArena::default();
+    let first = arena.alloc(make_query(1, 0));
+    let removed = arena.remove(first).expect("first query removed");
+    assert_eq!(removed, make_query(1, 0));
+
+    let second = arena.alloc(make_query(2, 0));
+
+    assert!(arena.get(first).is_none());
+    assert!(arena.remove(first).is_none());
+    assert_eq!(
+        arena.get(second).expect("replacement handle resolves"),
+        &make_query(2, 0)
     );
 }
 

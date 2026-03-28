@@ -18,7 +18,7 @@ use std::thread;
 
 use super::DnsProcessor;
 use super::parser::{CanonicalFlowKey, ParsedUdpDnsMeta};
-use super::types::{ProcessedDnsRecord, QueryMap, ResponseMap, ShardProcessingResult};
+use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::OutputMessage;
 use crate::packet_parser::{PacketBatch, PacketData, PacketParser, sort_packet_batch};
@@ -386,15 +386,13 @@ fn run_phase_processing_worker(
     shard_parallelism_enabled: bool,
     shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
-    let (mut query_maps, mut response_maps): (Vec<QueryMap>, Vec<ResponseMap>) =
-        if shard_parallelism_enabled {
-            (
-                (0..shard_count).map(|_| QueryMap::new()).collect(),
-                (0..shard_count).map(|_| ResponseMap::new()).collect(),
-            )
-        } else {
-            (vec![QueryMap::new()], vec![ResponseMap::new()])
-        };
+    let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
+        (0..shard_count)
+            .map(|_| MatcherShardState::default())
+            .collect()
+    } else {
+        vec![MatcherShardState::default()]
+    };
 
     let mut counters = PipelineCounters::default();
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -410,14 +408,12 @@ fn run_phase_processing_worker(
         let mut shard_results: Vec<(usize, ShardProcessingResult)> = shard_batches
             .into_par_iter()
             .map(|mut by_local_shard| by_local_shard.pop().unwrap_or_default())
-            .zip(query_maps.par_iter_mut())
-            .zip(response_maps.par_iter_mut())
+            .zip(shard_states.par_iter_mut())
             .enumerate()
-            .map(|(map_idx, ((shard_records, query_map), response_map))| {
+            .map(|(map_idx, (shard_records, state))| {
                 let shard_result = dns_processor.process_shard_records_with_batch_watermark(
                     parse_shard_packets(&dns_processor, shard_records),
-                    query_map,
-                    response_map,
+                    state,
                     batch_max_timestamp_micros,
                 );
                 (map_idx, shard_result)
@@ -432,16 +428,10 @@ fn run_phase_processing_worker(
     }
 
     if !shutdown_requested.load(AtomicOrdering::SeqCst) {
-        let mut finalization_results: Vec<(usize, ShardProcessingResult)> = query_maps
+        let mut finalization_results: Vec<(usize, ShardProcessingResult)> = shard_states
             .par_iter_mut()
-            .zip(response_maps.par_iter_mut())
             .enumerate()
-            .map(|(map_idx, (query_map, response_map))| {
-                (
-                    map_idx,
-                    dns_processor.finalize_shard(query_map, response_map),
-                )
-            })
+            .map(|(map_idx, state)| (map_idx, dns_processor.finalize_shard(state)))
             .collect();
 
         finalization_results.sort_by_key(|(map_idx, _)| *map_idx);
@@ -499,26 +489,19 @@ fn run_matcher_worker(
     shutdown_requested: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
-    let mut query_maps: Vec<QueryMap> = (0..logical_shard_count).map(|_| QueryMap::new()).collect();
-    let mut response_maps: Vec<ResponseMap> = (0..logical_shard_count)
-        .map(|_| ResponseMap::new())
+    let mut shard_states: Vec<MatcherShardState> = (0..logical_shard_count)
+        .map(|_| MatcherShardState::default())
         .collect();
 
     while let Ok(work) = batch_rx.recv() {
         let mut merged = ShardProcessingResult::default();
 
-        for ((shard_packets, query_map), response_map) in work
-            .shard_packets
-            .into_iter()
-            .zip(query_maps.iter_mut())
-            .zip(response_maps.iter_mut())
-        {
+        for (shard_packets, state) in work.shard_packets.into_iter().zip(shard_states.iter_mut()) {
             merge_shard_results(
                 &mut merged,
                 dns_processor.process_shard_records_with_batch_watermark(
                     parse_shard_packets(&dns_processor, shard_packets),
-                    query_map,
-                    response_map,
+                    state,
                     work.batch_max_timestamp_micros,
                 ),
             );
@@ -541,11 +524,8 @@ fn run_matcher_worker(
 
     let mut finalization = ShardProcessingResult::default();
     if !shutdown_requested.load(AtomicOrdering::SeqCst) {
-        for (query_map, response_map) in query_maps.iter_mut().zip(response_maps.iter_mut()) {
-            merge_shard_results(
-                &mut finalization,
-                dns_processor.finalize_shard(query_map, response_map),
-            );
+        for state in &mut shard_states {
+            merge_shard_results(&mut finalization, dns_processor.finalize_shard(state));
         }
     }
 
