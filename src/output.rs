@@ -67,16 +67,10 @@ pub(crate) fn create_writer_thread(
 ) -> Result<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>, OutputError> {
     match config.format {
         OutputFormat::Csv => {
-            let sink: Box<dyn Write + Send> = if config.writes_output_to_stdout() {
-                Box::new(io::stdout())
-            } else {
-                Box::new(File::create(&config.output_filename).map_err(|source| {
-                    OutputError::CreateCsvFile {
-                        path: config.output_filename.clone(),
-                        source,
-                    }
-                })?)
-            };
+            let sink = create_output_sink(config).map_err(|source| OutputError::CreateCsvFile {
+                path: config.output_filename.clone(),
+                source,
+            })?;
 
             Ok(thread::Builder::new()
                 .name("DPP_CSV_Writer".to_string())
@@ -87,16 +81,11 @@ pub(crate) fn create_writer_thread(
                 })?)
         }
         OutputFormat::Parquet => {
-            let sink: Box<dyn Write + Send> = if config.writes_output_to_stdout() {
-                Box::new(io::stdout())
-            } else {
-                Box::new(File::create(&config.output_filename).map_err(|source| {
-                    OutputError::CreateParquetWriter {
-                        path: config.output_filename.clone(),
-                        source: Box::new(source),
-                    }
-                })?)
-            };
+            let sink =
+                create_output_sink(config).map_err(|source| OutputError::CreateParquetWriter {
+                    path: config.output_filename.clone(),
+                    source: Box::new(source),
+                })?;
             let parquet_writer =
                 parquet_writer::create_parquet_writer(sink, config).map_err(|source| {
                     OutputError::CreateParquetWriter {
@@ -113,5 +102,13 @@ pub(crate) fn create_writer_thread(
                     source,
                 })?)
         }
+    }
+}
+
+fn create_output_sink(config: &AppConfig) -> io::Result<Box<dyn Write + Send>> {
+    if config.writes_output_to_stdout() {
+        Ok(Box::new(io::stdout()))
+    } else {
+        File::create(&config.output_filename).map(|file| Box::new(file) as _)
     }
 }

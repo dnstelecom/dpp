@@ -44,6 +44,12 @@ pub(crate) const PARQUET_WRITE_BATCH_SIZE: usize = 65_536;
 /// POSIX-style output path sentinel that directs exported records to standard output.
 pub(crate) const STDOUT_OUTPUT_SENTINEL: &str = "-";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputTarget {
+    File,
+    Stdout,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OutputFormat {
@@ -60,8 +66,12 @@ impl OutputFormat {
     }
 }
 
-pub(crate) fn output_path_targets_stdout(path: &Path) -> bool {
-    path == Path::new(STDOUT_OUTPUT_SENTINEL)
+pub(crate) fn output_target_for_path(path: &Path) -> OutputTarget {
+    if path == Path::new(STDOUT_OUTPUT_SENTINEL) {
+        OutputTarget::Stdout
+    } else {
+        OutputTarget::File
+    }
 }
 
 impl fmt::Display for OutputFormat {
@@ -162,14 +172,17 @@ impl ExecutionBudget {
             };
         }
 
+        let staged_worker_budget = available_cpus
+            .saturating_sub(STAGED_PIPELINE_NON_WORKER_THREADS)
+            .max(1);
+        debug_assert!(staged_worker_budget > 0);
+
         Self {
             available_cpus,
             model: ExecutionModel::Staged,
             rayon_threads: None,
             staged_reserved_service_threads: STAGED_PIPELINE_NON_WORKER_THREADS,
-            staged_worker_budget: available_cpus
-                .saturating_sub(STAGED_PIPELINE_NON_WORKER_THREADS)
-                .max(1),
+            staged_worker_budget,
         }
     }
 
@@ -179,8 +192,12 @@ impl ExecutionBudget {
 }
 
 impl AppConfig {
+    pub(crate) fn output_target(&self) -> OutputTarget {
+        output_target_for_path(&self.output_filename)
+    }
+
     pub(crate) fn writes_output_to_stdout(&self) -> bool {
-        output_path_targets_stdout(&self.output_filename)
+        matches!(self.output_target(), OutputTarget::Stdout)
     }
 
     pub(crate) fn match_timeout_micros(&self) -> i64 {
@@ -275,8 +292,11 @@ mod tests {
 
     #[test]
     fn stdout_output_sentinel_is_detected() {
-        assert!(output_path_targets_stdout(Path::new("-")));
-        assert!(!output_path_targets_stdout(Path::new("dns_output.csv")));
+        assert_eq!(output_target_for_path(Path::new("-")), OutputTarget::Stdout);
+        assert_eq!(
+            output_target_for_path(Path::new("dns_output.csv")),
+            OutputTarget::File
+        );
 
         let mut config = test_config();
         config.output_filename = PathBuf::from("-");
