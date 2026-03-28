@@ -258,14 +258,23 @@ use `-p dns-pcap-generator`, or run the same commands directly inside that direc
 Example:
 
 ```bash
-cargo run -p dns-pcap-generator --release --bin dns-pcap-generator -- synthetic/server1-like.pcap \
+cargo run -p dns-pcap-generator --release --bin dns-pcap-generator -- \
+  --profile-dir tools/dns-pcap-generator/profiles/server1-jul-2024 \
+  synthetic/server1-like.pcap \
   --duration-seconds 300 \
-  --qps 30000 \
-  --duplicate-rate 0.08 \
-  --timeout-rate 0.03
+  --qps 30000
 ```
 
-To regenerate the embedded positive-domain catalog from a local CSV:
+The generator always runs from a fitted profile artifact directory:
+
+```bash
+cargo run -p dns-pcap-generator --release --bin dns-pcap-generator -- \
+  --profile-dir tools/dns-pcap-generator/profiles/server1-jul-2024 \
+  synthetic/server1-like-fitted.pcap \
+  --transactions 500000
+```
+
+To regenerate the workspace positive-domain catalog from a local CSV:
 
 ```bash
 cargo run -p dns-catalog-builder --release -- \
@@ -274,11 +283,14 @@ cargo run -p dns-catalog-builder --release -- \
   --top 10000
 ```
 
-The default profile is shaped after a representative July 2024 resolver workload but keeps only
-sanitized, non-client-specific. See [docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md) for the full contract and
-current modeling assumptions. Response latency is also calibrated from the local July 2024 CSV so
-matched RTT stays in the same microsecond-heavy regime instead of an arbitrary millisecond range,
-with the exact timing profile sourced from `tools/dns-pcap-generator/config/dns-pcap-generator.toml` at build time.
+The checked-in `server1-jul-2024` profile is shaped after a representative July 2024 resolver
+workload while keeping only sanitized, non-client-specific domains. Its
+`fitted-generator.toml` lives under `tools/dns-pcap-generator/profiles/server1-jul-2024`, while
+the profile's `catalog_path` points back to `tools/dns-pcap-generator/catalog_data.tsv` so the
+sanitized catalog remains a single reviewable source of truth. The generator verifies the
+referenced catalog digest before generation. See
+[docs/synthetic-pcap-generator.md](docs/synthetic-pcap-generator.md) for the full contract and
+current modeling assumptions.
 
 For captures that are already globally monotonic by timestamp, `--monotonic-capture` or
 `DPP_MONOTONIC_CAPTURE=1` enables batched timeout eviction inside the matcher. This can reduce
@@ -377,8 +389,11 @@ DPP Commercial Edition extends that foundation with broader capture support, ent
 | Batch-oriented processing                             | Live/continuous ingestion                                                                       |
 | Deterministic pseudonymization with file-based keying | Commercial anonymization/compliance features                                                    |
 | Current DNS field and message coverage                | Extended DNS protocol coverage                                                                  |
+| Standalone synthetic DNS PCAP generation             | Profile extraction, fitting, and validation pipeline for calibrated synthetic DNS traffic       |
+| Checked-in runtime traffic profiles                  | Fitted profiles derived from reference captures, with validation reports and tuning artifacts   |
 | Manual binary-oriented deployment                     | Containerized delivery for easier deployment in cloud-native environments                       |
 | Built-in runtime reporting                            | Prometheus/OpenTelemetry metrics                                                                |
+| CLI-oriented offline workflows                        | Programmatic DPP library API with observer hooks for canonical per-query telemetry              |
 | GPL/community distribution                            | Flexible commercial licensing for both source code and pre-built binaries                       |
 | Self-service benchmarking                             | Benchmark/tuning help                                                                           |
 | Current parsing and processing stack                  | An alternative packet parsing and DNS processing stack aimed at broader protocol coverage       |

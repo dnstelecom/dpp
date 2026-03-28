@@ -651,11 +651,11 @@ dependencies = [
 name = "dns-pcap-generator"
 version = "0.21.0"
 dependencies = [
- "anyhow",
  "clap",
  "pcap-file",
  "seahash",
  "serde",
+ "sha2",
  "thiserror 2.0.18",
  "toml",
 ]

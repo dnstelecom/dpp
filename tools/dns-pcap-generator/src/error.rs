@@ -28,12 +28,6 @@ pub enum Error {
     #[error("invalid value for --resolvers: expected at most {max}, got {value}")]
     TooManyResolvers { value: usize, max: usize },
 
-    #[error("--duplicate-max must be greater than 0")]
-    InvalidDuplicateMax,
-
-    #[error("invalid value for {flag}: expected a value between 0.0 and 1.0, got {value}")]
-    RateOutOfRange { flag: &'static str, value: f64 },
-
     #[error("--transactions must be greater than 0")]
     InvalidTransactions,
 
@@ -82,6 +76,54 @@ pub enum Error {
         source: std::num::ParseIntError,
     },
 
+    #[error("failed to read catalog '{path}'")]
+    CatalogRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to read fitted profile '{path}'")]
+    FittedProfileRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to parse fitted profile '{path}'")]
+    FittedProfileParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("invalid fitted profile '{path}': {message}")]
+    FittedProfileInvalid { path: PathBuf, message: String },
+
+    #[error("failed to compute SHA-256 for '{path}'")]
+    InputHashOpen {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to read '{path}' while computing SHA-256")]
+    InputHashRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "fitted profile '{profile_path}' references catalog hash {expected_sha256}, but '{catalog_path}' hashed to {actual_sha256}"
+    )]
+    CatalogHashMismatch {
+        profile_path: PathBuf,
+        catalog_path: PathBuf,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+
     #[error("DNS name cannot be empty")]
     EmptyDnsName,
 
@@ -93,17 +135,35 @@ pub enum Error {
 
     #[error("profile '{profile}' must expose at least {minimum} positive domains, found {found}")]
     ProfileTooFewPositiveDomains {
-        profile: &'static str,
+        profile: String,
         minimum: usize,
         found: usize,
     },
 
     #[error("profile '{profile}' contains a disallowed domain '{domain}'")]
-    ProfileDisallowedDomain {
-        profile: &'static str,
-        domain: String,
-    },
+    ProfileDisallowedDomain { profile: String, domain: String },
 
     #[error("profile '{profile}' has no response code weights")]
-    ProfileMissingResponseCodes { profile: &'static str },
+    ProfileMissingResponseCodes { profile: String },
+
+    #[error("profile '{profile}' has no duplicate retry-count weights")]
+    ProfileMissingDuplicateRetryCounts { profile: String },
+
+    #[error("profile '{profile}' has no query-type weights for {category}")]
+    ProfileMissingQueryTypeWeights {
+        profile: String,
+        category: &'static str,
+    },
+
+    #[error("profile '{profile}' has no response-delay buckets for {bucket_family}")]
+    ProfileMissingResponseDelayBuckets {
+        profile: String,
+        bucket_family: &'static str,
+    },
+
+    #[error("profile '{profile}' has no retry-delay ranges for {range_family}")]
+    ProfileMissingRetryDelayRanges {
+        profile: String,
+        range_family: &'static str,
+    },
 }

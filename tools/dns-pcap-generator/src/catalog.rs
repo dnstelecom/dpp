@@ -7,14 +7,11 @@
 
 use crate::error::{Error, Result};
 use crate::model::WeightedDomain;
-use std::sync::LazyLock;
+use std::borrow::Cow;
+use std::fs;
+use std::path::Path;
 
-pub(crate) static SERVER1_JUL_2024_POSITIVE_DOMAINS: LazyLock<Vec<WeightedDomain>> =
-    LazyLock::new(|| {
-        load_catalog(include_str!("../catalog_data.tsv")).expect("catalog data must decode")
-    });
-
-fn load_catalog(tsv: &str) -> Result<Vec<WeightedDomain>> {
+pub(crate) fn load_catalog(tsv: &str) -> Result<Vec<WeightedDomain>> {
     let mut domains = Vec::new();
     for (line_number, line) in tsv.lines().enumerate() {
         if line.trim().is_empty() {
@@ -29,10 +26,19 @@ fn load_catalog(tsv: &str) -> Result<Vec<WeightedDomain>> {
                 line: line_number + 1,
                 source,
             })?;
-        // SAFETY: intentional leak — catalog is loaded once for the process lifetime
-        let name = Box::leak(name.to_string().into_boxed_str());
-        domains.push(WeightedDomain { name, weight });
+        domains.push(WeightedDomain {
+            name: Cow::Owned(name.to_string()),
+            weight,
+        });
     }
 
     Ok(domains)
+}
+
+pub(crate) fn load_catalog_file(path: &Path) -> Result<Vec<WeightedDomain>> {
+    let tsv = fs::read_to_string(path).map_err(|source| Error::CatalogRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    load_catalog(&tsv)
 }
