@@ -103,12 +103,12 @@ pub(crate) fn make_udp_dns_packet(
 pub(crate) fn test_dns_record() -> DnsRecord {
     DnsRecord {
         request_timestamp: 1,
-        response_timestamp: 2,
+        response_timestamp: Some(2),
         source_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         source_port: 53_000,
         id: 42,
         name: DnsNameBuf::new("example.com").expect("test name fits"),
         query_type: ProtoRecordType::from(HickoryRecordType::A),
-        response_code: ProtoResponseCode::from(HickoryResponseCode::NoError),
+        response_code: Some(ProtoResponseCode::from(HickoryResponseCode::NoError)),
     }
 }

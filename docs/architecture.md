@@ -111,7 +111,8 @@ repeating it for full DNS question decoding.
 - `src/record.rs`
   Canonical exported `DnsRecord` contract. Internal matcher discriminators and shard metadata must
   never leak into this type. Timeout records currently encode "no response observed in the match
-  window" as `response_timestamp = 0` together with `response_code = ServFail`.
+  window" by leaving response fields absent. The canonical timeout signal is an absent
+  `response_timestamp`; `response_code` is absent because no DNS response exists.
 
 - `src/output.rs`
   Writer lifecycle boundary. Owns output control messages and the writer-thread factory. The

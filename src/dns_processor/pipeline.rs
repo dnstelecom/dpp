@@ -994,7 +994,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(output_records.len(), 1);
-        assert_eq!(output_records[0].response_timestamp, 0);
+        assert_eq!(output_records[0].response_timestamp, None);
+        assert_eq!(output_records[0].response_code, None);
     }
 
     #[test]
