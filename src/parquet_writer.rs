@@ -27,13 +27,13 @@ pub fn build_dns_schema() -> Result<TypePtr, Box<dyn Error + Send + Sync>> {
     let message_type = "
     message schema {
         REQUIRED INT64 request_timestamp (TIMESTAMP(MICROS,true));
-        REQUIRED INT64 response_timestamp (TIMESTAMP(MICROS,true));
+        OPTIONAL INT64 response_timestamp (TIMESTAMP(MICROS,true));
         REQUIRED BYTE_ARRAY source_ip (UTF8);
         REQUIRED INT32 source_port;
         REQUIRED INT32 id;
         REQUIRED BYTE_ARRAY name (UTF8);
         REQUIRED BYTE_ARRAY query_type (UTF8);
-        REQUIRED BYTE_ARRAY response_code (UTF8);
+        OPTIONAL BYTE_ARRAY response_code (UTF8);
     }
     ";
     Ok(Arc::new(parse_message_type(message_type)?))
@@ -101,6 +101,25 @@ where
     Ok(())
 }
 
+fn write_optional_column<Type>(
+    row_group_writer: &mut parquet::file::writer::SerializedRowGroupWriter<'_, impl Write + Send>,
+    values: &[Type::T],
+    definition_levels: &[i16],
+    missing_column_error: &'static str,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    Type: DataType,
+{
+    let mut column_writer = row_group_writer.next_column()?.ok_or_else(|| {
+        Box::<dyn Error + Send + Sync>::from(io::Error::other(missing_column_error))
+    })?;
+    column_writer
+        .typed::<Type>()
+        .write_batch(values, Some(definition_levels), None)?;
+    column_writer.close()?;
+    Ok(())
+}
+
 fn flush_buffer_async_parquet<W>(
     parquet_writer: &mut SerializedFileWriter<W>,
     buffer: &mut Vec<DnsRecord>,
@@ -111,16 +130,23 @@ where
     let len = buffer.len();
     let mut request_timestamps = Vec::with_capacity(len);
     let mut response_timestamps = Vec::with_capacity(len);
+    let mut response_timestamp_definition_levels = Vec::with_capacity(len);
     let mut source_ports = Vec::with_capacity(len);
     let mut ids = Vec::with_capacity(len);
     let mut source_ips = Vec::with_capacity(len);
     let mut names = Vec::with_capacity(len);
     let mut query_types = Vec::with_capacity(len);
     let mut response_codes = Vec::with_capacity(len);
+    let mut response_code_definition_levels = Vec::with_capacity(len);
 
     for record in buffer.iter() {
         request_timestamps.push(record.request_timestamp);
-        response_timestamps.push(record.response_timestamp);
+        if let Some(response_timestamp) = record.response_timestamp {
+            response_timestamps.push(response_timestamp);
+            response_timestamp_definition_levels.push(1);
+        } else {
+            response_timestamp_definition_levels.push(0);
+        }
         source_ports.push(i32::from(record.source_port));
         ids.push(i32::from(record.id));
 
@@ -128,7 +154,12 @@ where
         source_ips.push(ByteArray::from(source_ip.as_str()));
         names.push(ByteArray::from(record.name.as_str()));
         query_types.push(ByteArray::from(record.query_type.as_str()));
-        response_codes.push(ByteArray::from(record.response_code.as_str()));
+        if let Some(response_code) = &record.response_code {
+            response_codes.push(ByteArray::from(response_code.as_str()));
+            response_code_definition_levels.push(1);
+        } else {
+            response_code_definition_levels.push(0);
+        }
     }
 
     let mut row_group_writer = parquet_writer.next_row_group()?;
@@ -137,9 +168,10 @@ where
         &request_timestamps,
         "Missing Parquet INT64 column",
     )?;
-    write_column::<Int64Type>(
+    write_optional_column::<Int64Type>(
         &mut row_group_writer,
         &response_timestamps,
+        &response_timestamp_definition_levels,
         "Missing Parquet INT64 column",
     )?;
     write_column::<ByteArrayType>(
@@ -163,9 +195,10 @@ where
         &query_types,
         "Missing Parquet BYTE_ARRAY column",
     )?;
-    write_column::<ByteArrayType>(
+    write_optional_column::<ByteArrayType>(
         &mut row_group_writer,
         &response_codes,
+        &response_code_definition_levels,
         "Missing Parquet BYTE_ARRAY column",
     )?;
     row_group_writer.close()?;
@@ -196,6 +229,7 @@ mod tests {
     use crate::test_support::{temp_test_path, test_dns_record};
     use crossbeam::channel;
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::Field;
     use std::fs;
     use std::fs::File;
     use std::io;
@@ -372,6 +406,64 @@ mod tests {
                 .expect("parquet output is readable");
         assert_eq!(reader.metadata().num_row_groups(), 0);
         assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+
+        fs::remove_file(filename).expect("removes temp parquet file");
+    }
+
+    #[test]
+    fn parquet_writer_preserves_null_response_fields_for_timeout_records() {
+        let filename = temp_test_path("parquet-writer-timeout", "parquet");
+        let config = AppConfig {
+            filename: PathBuf::from("input.pcap"),
+            output_filename: filename.clone(),
+            format: OutputFormat::Parquet,
+            report_format: crate::config::ReportFormat::Text,
+            match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            monotonic_capture: false,
+            zstd: false,
+            v2: false,
+            silent: true,
+            num_cpus: 1,
+            requested_threads: None,
+            affinity: false,
+            bonded: 0,
+            anonymize: None,
+            dns_wire_fast_path: false,
+        };
+        let file = File::create(&filename).expect("creates parquet file");
+        let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
+        let (tx, rx) = channel::unbounded();
+        let mut record = test_dns_record();
+        record.response_timestamp = None;
+        record.response_code = None;
+
+        tx.send(OutputMessage::Record(record))
+            .expect("record is sent");
+        tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
+
+        parquet_writer(writer, rx).expect("parquet writer completes successfully");
+
+        let reader =
+            SerializedFileReader::new(File::open(&filename).expect("opens parquet output"))
+                .expect("parquet output is readable");
+        let schema = reader.metadata().file_metadata().schema_descr();
+        assert_eq!(schema.column(1).max_def_level(), 1);
+        assert_eq!(schema.column(7).max_def_level(), 1);
+
+        let row = reader
+            .get_row_iter(None)
+            .expect("parquet rows are readable")
+            .next()
+            .expect("one row exists")
+            .expect("row decodes");
+        assert!(matches!(
+            row.get_column_iter().nth(1),
+            Some((_, Field::Null))
+        ));
+        assert!(matches!(
+            row.get_column_iter().nth(7),
+            Some((_, Field::Null))
+        ));
 
         fs::remove_file(filename).expect("removes temp parquet file");
     }

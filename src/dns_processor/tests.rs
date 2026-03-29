@@ -366,7 +366,10 @@ fn response_at_exact_match_timeout_boundary_still_matches() {
     assert_eq!(batch_result.timeout_query_count, 0);
     assert_eq!(batch_result.output_records.len(), 1);
     assert_eq!(batch_result.output_records[0].request_timestamp, 1_000_000);
-    assert_eq!(batch_result.output_records[0].response_timestamp, 2_200_000);
+    assert_eq!(
+        batch_result.output_records[0].response_timestamp,
+        Some(2_200_000)
+    );
     assert_eq!(pending_query_count(&state), 0);
     assert_eq!(pending_response_count(&state), 0);
 }

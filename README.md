@@ -229,13 +229,14 @@ because that better matches the real behavior we target on offline caching-resol
 a result, a query and response that differ only by case may fail to match even on otherwise valid
 DNS traffic.
 
-Timeout records use the current community-edition sentinel encoding:
+Timeout records leave response fields empty:
 
-- `response_timestamp = 0`
-- `response_code = ServFail`
+- `response_timestamp = NULL` in Parquet and an empty field in CSV
+- `response_code = NULL` in Parquet and an empty field in CSV
 
 This means "no matching response was observed inside the configured timeout window". It does not
-mean the upstream server actually returned `ServFail`.
+mean the upstream server actually returned `ServFail`. Downstream timeout detection should key off
+the absent `response_timestamp`; `response_code` is absent because no DNS response exists.
 
 With `--report-format json` or `DPP_REPORT_FORMAT=json`, DPP suppresses routine `info`/`warn`
 reporting and emits one final JSON summary object to `stdout`. This keeps CSV or Parquet output in

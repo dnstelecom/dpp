@@ -38,6 +38,12 @@ fn append_csv_number<T: itoa::Integer>(buffer: &mut Vec<u8>, value: T) {
     buffer.extend_from_slice(formatter.format(value).as_bytes());
 }
 
+fn append_optional_csv_number<T: itoa::Integer>(buffer: &mut Vec<u8>, value: Option<T>) {
+    if let Some(value) = value {
+        append_csv_number(buffer, value);
+    }
+}
+
 fn append_ip_addr(buffer: &mut Vec<u8>, value: std::net::IpAddr) {
     let mut ip_buffer = arrayvec::ArrayString::<45>::new();
     write!(&mut ip_buffer, "{value}").expect("ip address fits into stack buffer");
@@ -70,7 +76,7 @@ fn encode_csv_record(row_buffer: &mut Vec<u8>, record: &DnsRecord) {
     row_buffer.clear();
     append_csv_number(row_buffer, record.request_timestamp);
     row_buffer.push(b',');
-    append_csv_number(row_buffer, record.response_timestamp);
+    append_optional_csv_number(row_buffer, record.response_timestamp);
     row_buffer.push(b',');
     append_ip_addr(row_buffer, record.source_ip);
     row_buffer.push(b',');
@@ -82,7 +88,9 @@ fn encode_csv_record(row_buffer: &mut Vec<u8>, record: &DnsRecord) {
     row_buffer.push(b',');
     row_buffer.extend_from_slice(record.query_type.as_str().as_bytes());
     row_buffer.push(b',');
-    row_buffer.extend_from_slice(record.response_code.as_str().as_bytes());
+    if let Some(response_code) = &record.response_code {
+        row_buffer.extend_from_slice(response_code.as_str().as_bytes());
+    }
     row_buffer.push(b'\n');
 }
 
@@ -204,6 +212,36 @@ mod tests {
             .expect("one row exists")
             .expect("row parses");
         assert_eq!(&row[5], "exa,mple\"name\nwrapped\rline");
+
+        fs::remove_file(filename).expect("removes temp csv file");
+    }
+
+    #[test]
+    fn writes_timeout_records_with_empty_response_fields() {
+        let filename = temp_test_path("csv-writer-timeout", "csv");
+        let file = File::create(&filename).expect("creates csv file");
+        let (tx, rx) = channel::unbounded();
+        let mut record = test_dns_record();
+        record.response_timestamp = None;
+        record.response_code = None;
+
+        tx.send(OutputMessage::Record(record))
+            .expect("record is sent");
+        tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
+
+        csv_writer(file, rx).expect("csv writer completes successfully");
+
+        let output = fs::read_to_string(&filename).expect("reads csv output");
+        assert!(output.contains("1,,1.1.1.1,53000,42,example.com,A,\n"));
+
+        let mut reader = csv::Reader::from_path(&filename).expect("opens csv reader");
+        let row = reader
+            .records()
+            .next()
+            .expect("one row exists")
+            .expect("row parses");
+        assert_eq!(&row[1], "");
+        assert_eq!(&row[7], "");
 
         fs::remove_file(filename).expect("removes temp csv file");
     }

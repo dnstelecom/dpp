@@ -11,17 +11,16 @@ use std::net::IpAddr;
 
 /// Canonical exported DNS record contract shared by CSV and Parquet writers.
 ///
-/// Timeout records use `response_timestamp = 0` and `response_code = ServFail` as the current
-/// community-edition sentinel encoding for "no matching response was observed inside the configured
-/// timeout window".
+/// Timeout records leave response fields absent, which encodes "no matching response was observed
+/// inside the configured timeout window".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DnsRecord {
     pub(crate) request_timestamp: i64,
-    pub(crate) response_timestamp: i64,
+    pub(crate) response_timestamp: Option<i64>,
     pub(crate) source_ip: IpAddr,
     pub(crate) source_port: u16,
     pub(crate) id: u16,
     pub(crate) name: DnsNameBuf,
     pub(crate) query_type: ProtoRecordType,
-    pub(crate) response_code: ProtoResponseCode,
+    pub(crate) response_code: Option<ProtoResponseCode>,
 }

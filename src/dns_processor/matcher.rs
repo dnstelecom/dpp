@@ -54,13 +54,13 @@ impl DnsProcessor {
         let &(id, name, src_ip, src_port, query_type) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
-            response_timestamp: response_timestamp_micros,
+            response_timestamp: Some(response_timestamp_micros),
             source_ip: src_ip,
             source_port: src_port,
             id,
             name,
             query_type: ProtoRecordType::from(query_type),
-            response_code: ProtoResponseCode::from(response_code),
+            response_code: Some(ProtoResponseCode::from(response_code)),
         }
     }
 
@@ -71,13 +71,13 @@ impl DnsProcessor {
         let &(id, name, src_ip, src_port, query_type) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
-            response_timestamp: 0,
+            response_timestamp: None,
             source_ip: src_ip,
             source_port: src_port,
             id,
             name,
             query_type: ProtoRecordType::from(query_type),
-            response_code: ProtoResponseCode::from(HickoryResponseCode::ServFail),
+            response_code: None,
         }
     }
 

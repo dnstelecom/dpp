@@ -5,13 +5,6 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-#![cfg(test)]
-
-use crate::custom_types::{DnsNameBuf, ProtoRecordType, ProtoResponseCode};
-use crate::record::DnsRecord;
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
-use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +15,7 @@ pub(crate) fn temp_test_path(prefix: &str, extension: &str) -> PathBuf {
         .as_nanos();
 
     std::env::temp_dir().join(format!(
-        "dpp-test-{prefix}-{}-{unique}.{extension}",
+        "dpp-integration-{prefix}-{}-{unique}.{extension}",
         std::process::id()
     ))
 }
@@ -89,26 +82,4 @@ pub(crate) fn make_udp_dns_packet_with_payload(
     packet.extend_from_slice(dns_payload);
 
     packet
-}
-
-pub(crate) fn make_udp_dns_packet(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    src_port: u16,
-    dst_port: u16,
-) -> Vec<u8> {
-    make_udp_dns_packet_with_payload(src_ip, dst_ip, src_port, dst_port, &[0_u8; 12])
-}
-
-pub(crate) fn test_dns_record() -> DnsRecord {
-    DnsRecord {
-        request_timestamp: 1,
-        response_timestamp: Some(2),
-        source_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        source_port: 53_000,
-        id: 42,
-        name: DnsNameBuf::new("example.com").expect("test name fits"),
-        query_type: ProtoRecordType::from(HickoryRecordType::A),
-        response_code: Some(ProtoResponseCode::from(HickoryResponseCode::NoError)),
-    }
 }

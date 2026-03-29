@@ -78,6 +78,6 @@ possible, but slower and more error-prone.
 - The matcher is the authoritative owner of in-flight state. No other module may hold or mutate
   query/response pairing data.
 - Adding a new matching strategy (e.g., bidirectional or streaming) requires a new RFC.
-- Timeout records encode "no response observed" as `response_timestamp = 0` with
-  `response_code = ServFail`. This is a convention, not a protocol truth — downstream consumers
-  should be aware.
+- Timeout records encode "no response observed" by leaving response fields absent. The canonical
+  timeout signal is an absent `response_timestamp`; `response_code` is absent because no DNS
+  response exists.
