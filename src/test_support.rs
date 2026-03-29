@@ -7,7 +7,7 @@
 
 #![cfg(test)]
 
-use crate::custom_types::{FixedSizeString, ProtoRecordType, ProtoResponseCode};
+use crate::custom_types::{DnsNameBuf, ProtoRecordType, ProtoResponseCode};
 use crate::record::DnsRecord;
 use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
@@ -107,7 +107,7 @@ pub(crate) fn test_dns_record() -> DnsRecord {
         source_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         source_port: 53_000,
         id: 42,
-        name: FixedSizeString::<255>::new("example.com").expect("test name fits"),
+        name: DnsNameBuf::new("example.com").expect("test name fits"),
         query_type: ProtoRecordType::from(HickoryRecordType::A),
         response_code: ProtoResponseCode::from(HickoryResponseCode::NoError),
     }

@@ -34,6 +34,15 @@ order within each shard and never backtracks. The key design choices:
    but doesn't create a second in-flight entry. One query → one terminal outcome (matched or
    timeout), always.
 
+   The current Community Edition identity key preserves the observed presentation-form QNAME bytes
+   and does not lowercase them before matching. This is a deliberate Community Edition trade-off,
+   not a protocol guarantee. RFC 4343 defines ASCII label comparison as case-insensitive, and a
+   valid response is allowed to differ from the query's 0x20 casing, including when name
+   compression reuses label bytes from another wire location. Community Edition still keeps
+   byte-preserving identity because that better matches the real behavior it targets on offline
+   caching-resolver workloads. Queries and responses that differ only by case may therefore fail
+   to pair even on otherwise valid DNS traffic.
+
 5. **Closest-match pairing.** When a response arrives, the matcher finds the pending query with
    the closest timestamp (within the timeout window). When a query arrives and a buffered response
    already exists, the same closest-timestamp logic applies in reverse. This handles mild
@@ -53,6 +62,9 @@ These must hold for any valid implementation:
 - Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never leaks into the exported
   `DnsRecord`.
 - Duplicate responses remain distinguishable in matcher state until matched or discarded.
+- Community Edition intentionally preserves observed QNAME bytes instead of RFC-4343-style
+  case-insensitive canonicalization. Case-only query/response mismatches are therefore an accepted
+  limitation even on otherwise valid DNS traffic.
 
 ## Why BTreeMap and not HashMap
 

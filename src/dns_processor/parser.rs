@@ -5,7 +5,6 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use arrayvec::ArrayString;
 use hickory_proto::op::Header;
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
@@ -18,6 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
 use super::types::ProcessedDnsRecord;
+use crate::custom_types::DnsNameBuf;
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -92,7 +92,7 @@ struct DecodedDnsHeader {
 }
 
 struct DecodedDnsQuestion {
-    name: ArrayString<255>,
+    name: DnsNameBuf,
     query_type: HickoryRecordType,
 }
 
@@ -139,17 +139,17 @@ impl DnsProcessor {
     }
 
     #[inline]
-    pub(super) fn format_domain_name(name: &Name) -> ArrayString<255> {
-        let mut formatted = ArrayString::<255>::new();
+    pub(super) fn format_domain_name(name: &Name) -> DnsNameBuf {
+        let mut formatted = DnsNameBuf::default();
 
         if Self::write_domain_name(name, &mut formatted) {
             return formatted;
         }
 
-        ArrayString::<255>::from(Self::remove_trailing_dot(&name.to_ascii())).unwrap_or_default()
+        DnsNameBuf::new(Self::remove_trailing_dot(&name.to_ascii())).unwrap_or_default()
     }
 
-    fn write_domain_name(name: &Name, output: &mut ArrayString<255>) -> bool {
+    fn write_domain_name(name: &Name, output: &mut DnsNameBuf) -> bool {
         let mut labels = name.iter();
         let Some(first_label) = labels.next() else {
             return !name.is_fqdn() || output.try_push('.').is_ok();
@@ -168,7 +168,7 @@ impl DnsProcessor {
         true
     }
 
-    fn write_label_ascii(label: &[u8], output: &mut ArrayString<255>) -> bool {
+    fn write_label_ascii(label: &[u8], output: &mut DnsNameBuf) -> bool {
         if Self::is_plain_ascii_label(label) {
             // SAFETY: `is_plain_ascii_label` only accepts ASCII bytes that can be copied
             // directly into the presentation form without further escaping.
@@ -209,7 +209,7 @@ impl DnsProcessor {
         matches!(byte, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'-')
     }
 
-    fn write_ascii_byte(byte: u8, is_first: bool, output: &mut ArrayString<255>) -> bool {
+    fn write_ascii_byte(byte: u8, is_first: bool, output: &mut DnsNameBuf) -> bool {
         match byte {
             b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_' => output.try_push(byte as char).is_ok(),
             b'-' if !is_first => output.try_push('-').is_ok(),
@@ -221,7 +221,7 @@ impl DnsProcessor {
         }
     }
 
-    fn write_octal_escape(byte: u8, output: &mut ArrayString<255>) -> bool {
+    fn write_octal_escape(byte: u8, output: &mut DnsNameBuf) -> bool {
         output.try_push('\\').is_ok()
             && output
                 .try_push(char::from(b'0' + ((byte >> 6) & 0b111)))
@@ -371,8 +371,8 @@ impl DnsProcessor {
     fn read_wire_domain_name(
         dns_data: &[u8],
         cursor: &mut usize,
-    ) -> Result<ArrayString<255>, &'static str> {
-        let mut output = ArrayString::<255>::new();
+    ) -> Result<DnsNameBuf, &'static str> {
+        let mut output = DnsNameBuf::default();
         let mut position = *cursor;
         let mut resume_position = None;
         let mut wrote_label = false;

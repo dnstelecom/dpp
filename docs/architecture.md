@@ -259,6 +259,13 @@ The DNS matcher must preserve these invariants:
 - Repeated pending queries with the same match identity inside the configured timeout window
   (`1200ms` by default) are deduplicated to the earliest canonical query. Later duplicates are
   counted separately and must not create extra matched or timeout records.
+- Match identity preserves the observed presentation-form QNAME bytes instead of lowercasing them.
+  This is a deliberate Community Edition trade-off, not a protocol guarantee. RFC 4343 defines
+  ASCII label comparison as case-insensitive, and a valid response is allowed to differ from the
+  query's 0x20 casing, including when name compression reuses label bytes from another wire
+  location. Community Edition still keeps byte-preserving identity because that better matches the
+  real behavior it targets on offline caching-resolver workloads. Pairs that differ only by case
+  may therefore fail to match even on otherwise valid DNS traffic.
 - Batched timeout eviction is valid only when the input capture is globally monotonic by packet
   timestamp. In that mode, queries older than `current_watermark - match_timeout` may be emitted
   as timeouts during shard processing, and stale responses older than the same threshold may be
