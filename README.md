@@ -140,6 +140,10 @@ dpp input.pcap - > output.csv
 dpp --report-format json input.pcap output.csv > dpp-summary.json
 ```
 
+If `output_filename` is omitted, DPP chooses the default file name from the resolved output format:
+`dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or `pq`. Use `-` only when you
+want CSV records on stdout.
+
 ### Create an anonymization key
 
 `--anonymize` expects a text file. DPP reads the file contents as a passphrase and derives the
@@ -170,10 +174,10 @@ Notes:
 
 ### Arguments
 
-| Argument          | Description                                                            |
-|-------------------|------------------------------------------------------------------------|
-| `filename`        | Path to the input PCAP file                                            |
-| `output_filename` | Output file name; use `-` for CSV stdout output; defaults to `dns_output.csv` or `dns_output.parquet` |
+| Argument          | Description                                                                                                                                                       |
+|-------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `filename`        | Path to the input PCAP file                                                                                                                                       |
+| `output_filename` | Optional output file path. If omitted, DPP writes to `dns_output.csv` for `csv` and to `dns_output.parquet` for `parquet` or `pq`. Use `-` for CSV stdout output. |
 
 ### Options
 
@@ -181,7 +185,7 @@ Notes:
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------|
 | `-s, --silent`                    | Suppress info-level log output                                                                                      |
 | `-f, --format <csv\|parquet\|pq>` | Select output format; stdout output is supported only for `csv`                                                     |
-| `--report-format <text\|json>`    | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -`   |
+| `--report-format <text\|json>`    | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -`    |
 | `--match-timeout-ms <MS>`         | Set the DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`            |
 | `--monotonic-capture`             | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
 | `-b, --bonded <N>`                | Set I/O channel capacity; `0` uses the safe default bounded capacity                                                |
@@ -195,21 +199,25 @@ Notes:
 
 ### Environment variables
 
-| Variable                 | Description                                                                                                         |
-|--------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `DPP_FILENAME`           | Input PCAP path                                                                                                     |
-| `DPP_OUTPUT_FILENAME`    | Output file name; use `-` for CSV stdout output                                                                     |
-| `DPP_FORMAT`             | Output format: `csv`, `parquet`, or `pq`                                                                            |
+| Variable                 | Description                                                                                                               |
+|--------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `DPP_FILENAME`           | Input PCAP path                                                                                                           |
+| `DPP_OUTPUT_FILENAME`    | Optional output file path; use `-` for CSV stdout output                                                                  |
+| `DPP_FORMAT`             | Output format: `csv`, `parquet`, or `pq`                                                                                  |
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
-| `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                    |
-| `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
-| `DPP_BONDED`             | I/O channel capacity; `0` uses the default bounded capacity                                                         |
-| `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                          |
-| `DPP_V2`                 | Enable Parquet Version 2                                                                                            |
-| `DPP_AFFINITY`           | Enable CPU affinity                                                                                                 |
-| `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                              |
-| `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                      |
-| `DPP_SILENT`             | Suppress info-level log output                                                                                      |
+| `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                          |
+| `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected       |
+| `DPP_BONDED`             | I/O channel capacity; `0` uses the default bounded capacity                                                               |
+| `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
+| `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
+| `DPP_AFFINITY`           | Enable CPU affinity                                                                                                       |
+| `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                                    |
+| `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                            |
+| `DPP_SILENT`             | Suppress info-level log output                                                                                            |
+
+If neither `output_filename` nor `DPP_OUTPUT_FILENAME` is set, DPP chooses the default output path
+from the resolved format: `dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or
+`pq`.
 
 When `output_filename` is `-`, DPP writes CSV records to stdout, suppresses non-error log output, and does not emit
 the final text report. `--format parquet`, `--report-format json`, and `DPP_REPORT_FORMAT=json` are rejected in this
@@ -312,7 +320,8 @@ optimization does not silently weaken matching semantics.
 The log below is illustrative. Exact throughput, memory usage, and match counters depend on the hardware, build profile, capture shape, and matcher revision.
 
 ```bash
-# On Intel(R) Atom(TM) x7425E with power-save profile
+# On Intel(R) Atom(TM) x7425E with power-save profile.
+# No output file name is specified here, so CSV mode uses the default output path: dns_output.csv.
 $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wire-fast-path --monotonic-capture 
 04:15:01.046  INFO DNS Packet Parser (DPP) community edition, version hash: dbed8b3
 04:15:01.046  INFO Git Commit Author: k.mikhailov@dnstele.com
@@ -350,6 +359,21 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:16.718  INFO Processing completed in: "00:00:15.672"
 
 ```
+
+### What DPP produces in CSV output
+
+DPP writes one row per canonical DNS query outcome.
+
+```csv
+request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code
+1774783431482391,1774783431503127,10.0.0.1,53000,4660,example.com,A,No Error
+1774783447118904,,10.0.0.2,53001,48879,example.org,A,
+```
+What this tells you:
+
+- the first query for example.com A was matched with a response about 20.736 ms later;
+- the second query for example.org A had no matching response within the timeout window;
+- empty response_timestamp and response_code mean timeout.
 
 ## Performance Optimization
 
@@ -400,8 +424,8 @@ DPP Commercial Edition extends that foundation with broader capture support, ent
 | Batch-oriented processing                             | Live/continuous ingestion                                                                       |
 | Deterministic pseudonymization with file-based keying | Commercial anonymization/compliance features                                                    |
 | Current DNS field and message coverage                | Extended DNS protocol coverage                                                                  |
-| Standalone synthetic DNS PCAP generation             | Profile extraction, fitting, and validation pipeline for calibrated synthetic DNS traffic       |
-| Checked-in runtime traffic profiles                  | Fitted profiles derived from reference captures, with validation reports and tuning artifacts   |
+| Standalone synthetic DNS PCAP generation              | Profile extraction, fitting, and validation pipeline for calibrated synthetic DNS traffic       |
+| Checked-in runtime traffic profiles                   | Fitted profiles derived from reference captures, with validation reports and tuning artifacts   |
 | Manual binary-oriented deployment                     | Containerized delivery for easier deployment in cloud-native environments                       |
 | Built-in runtime reporting                            | Prometheus/OpenTelemetry metrics                                                                |
 | CLI-oriented offline workflows                        | Programmatic DPP library API with observer hooks for canonical per-query telemetry              |
