@@ -9,6 +9,7 @@ use crate::allocator;
 use crate::config::{AppConfig, ReportFormat, WORKER_STACK_SIZE_MB};
 use crate::error::RuntimeError;
 use crate::monitor_memory;
+use crate::pipeio::BrokenPipeTolerantMakeWriter;
 use num_format::{Locale, ToFormattedString};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -27,6 +28,10 @@ use tracing_subscriber::fmt::time::ChronoLocal;
 
 fn rayon_thread_name(index: usize) -> String {
     format!("DPP_Rayon_{index}")
+}
+
+fn pipe_tolerant_stderr() -> BrokenPipeTolerantMakeWriter<fn() -> io::Stderr> {
+    BrokenPipeTolerantMakeWriter::new(io::stderr)
 }
 
 pub(crate) fn maybe_start_memory_monitoring(
@@ -201,6 +206,7 @@ pub(crate) fn configure_logger(
         .with_thread_names(false)
         .with_target(false)
         .with_thread_ids(false)
+        .with_writer(pipe_tolerant_stderr())
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).map_err(|error| {

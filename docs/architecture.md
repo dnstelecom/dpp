@@ -13,8 +13,9 @@ DPP Community Edition has a single supported matching model:
 - forward-only matching with deterministic ordering by `(timestamp_micros, packet_ordinal)`
 - offline processing from PCAP input into CSV or Parquet output
 - optional final JSON run summary through the canonical report-format contract; stdout export mode
-  is CSV-only, rejects JSON reports, suppresses text reports, and signal-driven shutdown drops any
-  still-buffered output tail before final writer teardown
+  is CSV-only, rejects JSON reports, suppresses text reports, treats downstream stdout pipe
+  closure as graceful CLI termination, suppresses broken-pipe log noise if stderr itself is closed,
+  and signal-driven shutdown drops any still-buffered output tail before final writer teardown
 - optional `--monotonic-capture` mode for globally ordered captures
 
 The matcher is the authoritative owner of in-flight query/response state. Parsing may run in
@@ -117,7 +118,8 @@ repeating it for full DNS question decoding.
 - `src/output.rs`
   Writer lifecycle boundary. Owns output control messages and the writer-thread factory. The
   handoff channel from processing to output is bounded by configuration and must not become
-  unbounded ambient state.
+  unbounded ambient state. Broken-pipe closure on stdout is treated as a downstream-close outcome;
+  regular file-write failures remain fatal.
 
 - `src/monitor_memory.rs`
   Optional RSS tracking helper with an explicit stop/join lifecycle. The monitor must not detach
@@ -160,8 +162,9 @@ repeating it for full DNS question decoding.
   Bootstrap and host-runtime boundary. Logger setup, build/system reporting, optional memory
   monitoring, signal handling, and Rayon pool creation live here so CLI parsing and app
   orchestration do not carry side-effectful runtime bootstrap responsibilities directly. The logger
-  remains human-readable; machine-readable final JSON reporting is selected through the canonical
-  CLI/config contract and emitted from the top-level app orchestration layer.
+  remains human-readable and suppresses broken-pipe noise when stderr itself is a closed pipe;
+  machine-readable final JSON reporting is selected through the canonical CLI/config contract and
+  emitted from the top-level app orchestration layer.
 
 - `src/main.rs`
   Thin entrypoint that delegates to `src/cli.rs`, `src/runtime.rs`, and `src/app.rs`, then returns
