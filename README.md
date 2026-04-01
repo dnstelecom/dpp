@@ -55,6 +55,9 @@ DPP reads offline PCAP files, extracts DNS traffic, matches queries with respons
 
 ## Architecture
 
+The table below is a high-level map of the system. For the canonical architecture reference,
+ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/architecture.md).
+
 | Layer                       | Components                                                    | Responsibility                                                                         |
 |-----------------------------|---------------------------------------------------------------|----------------------------------------------------------------------------------------|
 | Configuration and contracts | `src/config.rs`, `src/cli.rs`, `src/record.rs`                | Runtime constants, CLI/environment contract, and exported `DnsRecord` schema           |
@@ -67,6 +70,7 @@ DPP reads offline PCAP files, extracts DNS traffic, matches queries with respons
 
 ## Documentation
 
+- Canonical architecture reference: [docs/architecture.md](docs/architecture.md)
 - Architecture decision records: [docs/rfc/README.md](docs/rfc/README.md)
 - Benchmark workflow: [benches/README.md](benches/README.md)
 - Benchmark harness: [benches/benchmark.sh](benches/benchmark.sh)
