@@ -17,6 +17,7 @@ mod monitor_memory;
 mod output;
 mod packet_parser;
 mod parquet_writer;
+mod pipeio;
 mod record;
 mod runtime;
 #[cfg(test)]

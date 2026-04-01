@@ -28,7 +28,6 @@ const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
 
-#[derive(Default)]
 struct PipelineCounters {
     dns_query_count: usize,
     duplicated_query_count: usize,
@@ -37,6 +36,22 @@ struct PipelineCounters {
     timeout_query_count: usize,
     matched_rtt_sum_micros: u64,
     out_of_order_combined_count: usize,
+    output_channel_open: bool,
+}
+
+impl Default for PipelineCounters {
+    fn default() -> Self {
+        Self {
+            dns_query_count: 0,
+            duplicated_query_count: 0,
+            dns_response_count: 0,
+            matched_query_response_count: 0,
+            timeout_query_count: 0,
+            matched_rtt_sum_micros: 0,
+            out_of_order_combined_count: 0,
+            output_channel_open: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,7 +66,12 @@ pub(crate) struct ProcessingCounters {
 }
 
 impl PipelineCounters {
-    fn absorb(&mut self, tx: &Sender<OutputMessage>, shard_result: ShardProcessingResult) {
+    fn absorb(
+        &mut self,
+        tx: &Sender<OutputMessage>,
+        shard_result: ShardProcessingResult,
+        output_closed: &AtomicBool,
+    ) -> bool {
         self.dns_query_count += shard_result.dns_query_count;
         self.duplicated_query_count += shard_result.duplicated_query_count;
         self.dns_response_count += shard_result.dns_response_count;
@@ -60,9 +80,18 @@ impl PipelineCounters {
         self.matched_rtt_sum_micros += shard_result.matched_rtt_sum_micros;
         self.out_of_order_combined_count += shard_result.out_of_order_combined_count;
 
-        for record in shard_result.output_records {
-            emit_record(tx, record);
+        if !self.output_channel_open {
+            return false;
         }
+
+        for record in shard_result.output_records {
+            if !emit_record(tx, record, output_closed) {
+                self.output_channel_open = false;
+                return false;
+            }
+        }
+
+        true
     }
 
     fn finalize(self, total_packets_processed: usize) -> ProcessingCounters {
@@ -227,10 +256,25 @@ impl PendingBatchBuffer {
     }
 }
 
-fn emit_record(tx: &Sender<OutputMessage>, record: crate::record::DnsRecord) {
-    if let Err(err) = tx.send(OutputMessage::Record(record)) {
-        tracing::error!("Failed to send DnsRecord: {}", err);
+fn stop_requested(shutdown_requested: &AtomicBool, output_closed: &AtomicBool) -> bool {
+    shutdown_requested.load(AtomicOrdering::SeqCst) || output_closed.load(AtomicOrdering::Relaxed)
+}
+
+fn emit_record(
+    tx: &Sender<OutputMessage>,
+    record: crate::record::DnsRecord,
+    output_closed: &AtomicBool,
+) -> bool {
+    if output_closed.load(AtomicOrdering::Relaxed) {
+        return false;
     }
+
+    if tx.send(OutputMessage::Record(record)).is_err() {
+        output_closed.store(true, AtomicOrdering::Relaxed);
+        return false;
+    }
+
+    true
 }
 
 fn join_thread<T>(handle: thread::JoinHandle<anyhow::Result<T>>, label: &str) -> anyhow::Result<T> {
@@ -385,6 +429,7 @@ fn run_phase_processing_worker(
     shard_count: usize,
     shard_parallelism_enabled: bool,
     shutdown_requested: Arc<AtomicBool>,
+    output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
         (0..shard_count)
@@ -396,6 +441,10 @@ fn run_phase_processing_worker(
 
     let mut counters = PipelineCounters::default();
     while let Ok(packet_batch) = batch_rx.recv() {
+        if output_closed.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches: shard_batches,
@@ -423,11 +472,13 @@ fn run_phase_processing_worker(
         shard_results.sort_by_key(|(map_idx, _)| *map_idx);
 
         for (_, shard_result) in shard_results {
-            counters.absorb(&tx, shard_result);
+            if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
+                return Ok(counters);
+            }
         }
     }
 
-    if !shutdown_requested.load(AtomicOrdering::SeqCst) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
         let mut finalization_results: Vec<(usize, ShardProcessingResult)> = shard_states
             .par_iter_mut()
             .enumerate()
@@ -437,7 +488,9 @@ fn run_phase_processing_worker(
         finalization_results.sort_by_key(|(map_idx, _)| *map_idx);
 
         for (_, shard_result) in finalization_results {
-            counters.absorb(&tx, shard_result);
+            if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
+                return Ok(counters);
+            }
         }
     }
 
@@ -448,11 +501,16 @@ fn run_parser_stage(
     batch_rx: Receiver<PacketBatch>,
     worker_txs: Vec<Sender<MatcherBatchWork>>,
     shard_count: usize,
+    output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let worker_ranges = worker_shard_ranges(shard_count, worker_txs.len());
     let mut batch_seq = 0_u64;
 
     while let Ok(packet_batch) = batch_rx.recv() {
+        if output_closed.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
@@ -471,6 +529,13 @@ fn run_parser_stage(
                         worker_idx,
                         err
                     )
+                })
+                .or_else(|error| {
+                    if output_closed.load(AtomicOrdering::Relaxed) {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
                 })?;
         }
 
@@ -487,6 +552,7 @@ fn run_matcher_worker(
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
     shutdown_requested: Arc<AtomicBool>,
+    output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
     let mut shard_states: Vec<MatcherShardState> = (0..logical_shard_count)
@@ -494,6 +560,10 @@ fn run_matcher_worker(
         .collect();
 
     while let Ok(work) = batch_rx.recv() {
+        if output_closed.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+
         let mut merged = ShardProcessingResult::default();
 
         for (shard_packets, state) in work.shard_packets.into_iter().zip(shard_states.iter_mut()) {
@@ -519,11 +589,18 @@ fn run_matcher_worker(
                     worker_idx,
                     err
                 )
+            })
+            .or_else(|error| {
+                if output_closed.load(AtomicOrdering::Relaxed) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
             })?;
     }
 
     let mut finalization = ShardProcessingResult::default();
-    if !shutdown_requested.load(AtomicOrdering::SeqCst) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
         for state in &mut shard_states {
             merge_shard_results(&mut finalization, dns_processor.finalize_shard(state));
         }
@@ -540,6 +617,13 @@ fn run_matcher_worker(
                 worker_idx,
                 err
             )
+        })
+        .or_else(|error| {
+            if output_closed.load(AtomicOrdering::Relaxed) {
+                Ok(())
+            } else {
+                Err(error)
+            }
         })?;
 
     Ok(())
@@ -549,6 +633,7 @@ fn run_aggregator(
     result_rx: Receiver<MatcherWorkerEvent>,
     tx: Sender<OutputMessage>,
     worker_count: usize,
+    output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let mut counters = PipelineCounters::default();
     let mut pending_batches = PendingBatchBuffer::new(worker_count);
@@ -566,7 +651,9 @@ fn run_aggregator(
 
                 while let Some(ready_results) = pending_batches.pop_ready() {
                     for shard_result in ready_results {
-                        counters.absorb(&tx, shard_result);
+                        if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
+                            return Ok(counters);
+                        }
                     }
                 }
             }
@@ -574,6 +661,10 @@ fn run_aggregator(
                 finalizations[worker_idx] = Some(result);
             }
         }
+    }
+
+    if output_closed.load(AtomicOrdering::Relaxed) {
+        return Ok(counters);
     }
 
     if !pending_batches.is_empty() {
@@ -590,7 +681,9 @@ fn run_aggregator(
                 worker_idx
             )
         })?;
-        counters.absorb(&tx, shard_result);
+        if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
+            return Ok(counters);
+        }
     }
 
     Ok(counters)
@@ -603,6 +696,7 @@ fn run_staged_processing_pipeline(
     shard_count: usize,
     worker_count: usize,
     shutdown_requested: Arc<AtomicBool>,
+    output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let worker_ranges = worker_shard_ranges(shard_count, worker_count);
     let (result_tx, result_rx) =
@@ -622,6 +716,7 @@ fn run_staged_processing_pipeline(
                     let dns_processor = Arc::clone(&dns_processor);
                     let result_tx = result_tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_matcher_worker(
                             dns_processor,
@@ -630,6 +725,7 @@ fn run_staged_processing_pipeline(
                             worker_rx,
                             result_tx,
                             shutdown_requested,
+                            output_closed,
                         )
                     }
                 })?,
@@ -639,9 +735,12 @@ fn run_staged_processing_pipeline(
 
     let parser_handle = thread::Builder::new()
         .name("DPP_Parser".to_string())
-        .spawn(move || run_parser_stage(batch_rx, worker_txs, shard_count))?;
+        .spawn({
+            let output_closed = Arc::clone(&output_closed);
+            move || run_parser_stage(batch_rx, worker_txs, shard_count, output_closed)
+        })?;
 
-    let aggregator_result = run_aggregator(result_rx, tx, worker_count);
+    let aggregator_result = run_aggregator(result_rx, tx, worker_count, output_closed);
 
     let parser_result = join_thread(parser_handle, "Parser stage");
     let worker_result =
@@ -666,6 +765,7 @@ impl DnsProcessor {
         execution_budget: ExecutionBudget,
         shard_parallelism_enabled: bool,
         shutdown_requested: Arc<AtomicBool>,
+        output_closed: Arc<AtomicBool>,
     ) -> anyhow::Result<ProcessingCounters> {
         let shard_count =
             logical_shard_count(execution_budget.available_cpus, shard_parallelism_enabled);
@@ -697,6 +797,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_staged_processing_pipeline(
                             dns_processor,
@@ -705,6 +806,7 @@ impl DnsProcessor {
                             shard_count,
                             worker_count,
                             shutdown_requested,
+                            output_closed,
                         )
                     }
                 })?
@@ -715,6 +817,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_phase_processing_worker(
                             dns_processor,
@@ -723,28 +826,42 @@ impl DnsProcessor {
                             shard_count,
                             shard_parallelism_enabled,
                             shutdown_requested,
+                            output_closed,
                         )
                     }
                 })?
         };
 
         let mut processed_packet_count = 0usize;
-        while !shutdown_requested.load(AtomicOrdering::SeqCst) {
+        while !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
             let Some(packet_batch) = packet_parser.next_batch(PACKET_BATCH_SIZE)? else {
                 break;
             };
 
-            if shutdown_requested.load(AtomicOrdering::SeqCst) {
+            if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
                 break;
             }
 
-            processed_packet_count += packet_batch.len();
-            batch_tx.send(packet_batch).map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to hand off packet batch to processing pipeline: {}",
-                    err
-                )
-            })?;
+            let packet_batch_len = packet_batch.len();
+            batch_tx
+                .send(packet_batch)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to hand off packet batch to processing pipeline: {}",
+                        err
+                    )
+                })
+                .or_else(|error| {
+                    if output_closed.load(AtomicOrdering::Relaxed) {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })?;
+            if output_closed.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            processed_packet_count += packet_batch_len;
         }
 
         if shutdown_requested.load(AtomicOrdering::SeqCst) {
@@ -768,7 +885,7 @@ mod tests {
     use crate::packet_parser::PacketParser;
     use crate::test_support::{
         classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
-        make_udp_dns_packet_with_payload, temp_test_path,
+        make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
     };
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -980,6 +1097,7 @@ mod tests {
             1,
             false,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
@@ -1016,6 +1134,7 @@ mod tests {
             1,
             false,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
@@ -1056,6 +1175,7 @@ mod tests {
             batch_rx,
             result_tx,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("matcher worker completes");
 
@@ -1074,5 +1194,37 @@ mod tests {
         };
         assert_eq!(finalization.timeout_query_count, 0);
         assert!(finalization.output_records.is_empty());
+    }
+
+    #[test]
+    fn pipeline_counters_stop_emitting_after_output_channel_closes() {
+        let (output_tx, output_rx) = crossbeam::channel::bounded(1);
+        drop(output_rx);
+        let output_closed = AtomicBool::new(false);
+
+        let mut counters = PipelineCounters::default();
+        assert!(!counters.absorb(
+            &output_tx,
+            ShardProcessingResult {
+                output_records: vec![test_dns_record(), test_dns_record()],
+                dns_query_count: 1,
+                ..Default::default()
+            },
+            &output_closed,
+        ));
+        assert!(!counters.absorb(
+            &output_tx,
+            ShardProcessingResult {
+                output_records: vec![test_dns_record()],
+                timeout_query_count: 2,
+                ..Default::default()
+            },
+            &output_closed,
+        ));
+
+        assert!(!counters.output_channel_open);
+        assert!(output_closed.load(AtomicOrdering::Relaxed));
+        assert_eq!(counters.dns_query_count, 1);
+        assert_eq!(counters.timeout_query_count, 2);
     }
 }

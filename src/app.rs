@@ -10,15 +10,17 @@ use crate::dns_processor::{DnsProcessor, ProcessingCounters};
 use crate::error::{AppRunError, OutputError};
 use crate::output::OutputMessage;
 use crate::packet_parser::{NonMonotonicTimestampSample, PacketParser};
+use crate::pipeio::BrokenPipeTolerantWriter;
 use crate::{output, runtime};
 use crossbeam::channel;
 use num_format::{Locale, ToFormattedString};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fs::canonicalize;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 use tracing::info;
 
@@ -55,6 +57,10 @@ fn finalize_output_shutdown(
     shutdown_result: Result<(), crossbeam::channel::SendError<OutputMessage>>,
     writer_result: Result<(), OutputError>,
 ) -> Result<(), OutputError> {
+    if matches!(writer_result, Err(OutputError::DownstreamClosed)) {
+        return Ok(());
+    }
+
     writer_result?;
     shutdown_result.map_err(|source| OutputError::OutputControlSend {
         source: Box::new(source),
@@ -75,6 +81,7 @@ fn format_information(args: &AppConfig) -> &'static str {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTermination {
     Completed,
+    DownstreamClosed,
     InterruptedBySignal,
 }
 
@@ -82,7 +89,9 @@ impl RunTermination {
     fn output_shutdown_message(self) -> OutputMessage {
         match self {
             RunTermination::Completed => OutputMessage::Shutdown,
-            RunTermination::InterruptedBySignal => OutputMessage::Abort,
+            RunTermination::DownstreamClosed | RunTermination::InterruptedBySignal => {
+                OutputMessage::Abort
+            }
         }
     }
 
@@ -442,15 +451,35 @@ fn display_text_summary(summary: &RunSummary) {
     );
 }
 
-fn emit_json_summary(summary: &RunSummary) -> anyhow::Result<()> {
-    serde_json::to_writer(std::io::stdout(), summary)?;
-    println!();
-    Ok(())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SummaryEmission {
+    Emitted,
+    DownstreamClosed,
+}
+
+fn emit_json_summary_to_writer(
+    writer: impl Write,
+    summary: &RunSummary,
+) -> anyhow::Result<SummaryEmission> {
+    let (mut writer, downstream_closed) = BrokenPipeTolerantWriter::new(writer);
+    serde_json::to_writer(&mut writer, summary)?;
+    writer.write_all(b"\n")?;
+    if downstream_closed.is_closed() {
+        Ok(SummaryEmission::DownstreamClosed)
+    } else {
+        Ok(SummaryEmission::Emitted)
+    }
+}
+
+fn emit_json_summary(summary: &RunSummary) -> anyhow::Result<SummaryEmission> {
+    let stdout = std::io::stdout();
+    emit_json_summary_to_writer(stdout.lock(), summary)
 }
 
 pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let start_time = Instant::now();
     let shutdown_requested = runtime::install_shutdown_signal_handler()?;
+    let output_closed = Arc::new(AtomicBool::new(false));
     let execution_budget = args.execution_budget();
     if let Some(rayon_threads) = execution_budget.rayon_threads {
         runtime::create_thread_pool(rayon_threads, args.affinity)?;
@@ -507,6 +536,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         execution_budget,
         true,
         Arc::clone(&shutdown_requested),
+        Arc::clone(&output_closed),
     )
     .map_err(|source| AppRunError::Processing { source })?;
     let processing_seconds = start_time.elapsed().as_secs_f64();
@@ -514,6 +544,8 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let io_flush_start = Instant::now();
     let termination = if shutdown_requested.load(AtomicOrdering::SeqCst) {
         RunTermination::InterruptedBySignal
+    } else if output_closed.load(AtomicOrdering::Relaxed) {
+        RunTermination::DownstreamClosed
     } else {
         RunTermination::Completed
     };
@@ -530,10 +562,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let writer_result = writer_thread
         .join()
         .map_err(|e| OutputError::WriterThreadPanic(format!("{:?}", e)))?;
-    finalize_output_shutdown(
-        shutdown_result,
-        writer_result.map_err(|source| OutputError::WriterThreadFailure { source }),
-    )?;
+    finalize_output_shutdown(shutdown_result, writer_result)?;
+
+    if matches!(termination, RunTermination::DownstreamClosed) {
+        return Ok(());
+    }
 
     if !args.writes_output_to_stdout() {
         let final_write_post_processing_seconds = io_flush_start.elapsed().as_secs_f64();
@@ -557,7 +590,13 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         match args.report_format {
             ReportFormat::Text => display_text_summary(&summary),
             ReportFormat::Json => {
-                emit_json_summary(&summary).map_err(|source| AppRunError::JsonSummary { source })?
+                if matches!(
+                    emit_json_summary(&summary)
+                        .map_err(|source| AppRunError::JsonSummary { source })?,
+                    SummaryEmission::DownstreamClosed
+                ) {
+                    return Ok(());
+                }
             }
         }
     }
@@ -630,6 +669,17 @@ mod tests {
         let result = finalize_output_shutdown(shutdown_result, Ok(()));
 
         assert!(matches!(result, Err(OutputError::OutputControlSend { .. })));
+    }
+
+    #[test]
+    fn finalize_output_shutdown_treats_downstream_closed_as_success() {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        drop(rx);
+
+        let shutdown_result = tx.send(OutputMessage::Shutdown);
+        let result = finalize_output_shutdown(shutdown_result, Err(OutputError::DownstreamClosed));
+
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -849,10 +899,69 @@ mod tests {
         assert_eq!(summary.metrics.average_matched_rtt_ms, Some(2.0));
     }
 
+    struct BrokenPipeJsonSink {
+        bytes_until_broken_pipe: usize,
+        written: Vec<u8>,
+    }
+
+    impl Write for BrokenPipeJsonSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let writable = self.bytes_until_broken_pipe.min(buf.len());
+            self.written.extend_from_slice(&buf[..writable]);
+            self.bytes_until_broken_pipe -= writable;
+
+            if writable == buf.len() {
+                Ok(writable)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe closed",
+                ))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_summary_treats_broken_pipe_as_downstream_closed() {
+        let config = test_config();
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters::default(),
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+        let mut sink = BrokenPipeJsonSink {
+            bytes_until_broken_pipe: 4,
+            written: Vec::new(),
+        };
+
+        let result = emit_json_summary_to_writer(&mut sink, &summary)
+            .expect("broken pipe is treated as downstream closed");
+
+        assert_eq!(result, SummaryEmission::DownstreamClosed);
+        assert!(!sink.written.is_empty());
+    }
+
     #[test]
     fn signal_shutdown_uses_abort_message_for_output_teardown() {
         assert!(matches!(
             RunTermination::InterruptedBySignal.output_shutdown_message(),
+            OutputMessage::Abort
+        ));
+    }
+
+    #[test]
+    fn downstream_closed_uses_abort_message_for_output_teardown() {
+        assert!(matches!(
+            RunTermination::DownstreamClosed.output_shutdown_message(),
             OutputMessage::Abort
         ));
     }
