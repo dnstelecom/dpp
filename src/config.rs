@@ -41,13 +41,29 @@ pub(crate) const WORKER_STACK_SIZE_MB: usize = 16;
 /// Parquet row-group batch size.
 pub(crate) const PARQUET_WRITE_BATCH_SIZE: usize = 65_536;
 
-/// POSIX-style output path sentinel that directs exported records to standard output.
-pub(crate) const STDOUT_OUTPUT_SENTINEL: &str = "-";
+/// POSIX-style stream sentinel shared by stdin and stdout CLI paths.
+pub(crate) const STDIO_STREAM_SENTINEL: &str = "-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputTarget {
     File,
     Stdout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InputSource {
+    File(PathBuf),
+    Stdin,
+}
+
+impl InputSource {
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        if path == Path::new(STDIO_STREAM_SENTINEL) {
+            Self::Stdin
+        } else {
+            Self::File(path)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -67,7 +83,7 @@ impl OutputFormat {
 }
 
 pub(crate) fn output_target_for_path(path: &Path) -> OutputTarget {
-    if path == Path::new(STDOUT_OUTPUT_SENTINEL) {
+    if path == Path::new(STDIO_STREAM_SENTINEL) {
         OutputTarget::Stdout
     } else {
         OutputTarget::File
@@ -125,7 +141,7 @@ impl FromStr for ReportFormat {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppConfig {
-    pub(crate) filename: PathBuf,
+    pub(crate) input_source: InputSource,
     pub(crate) output_filename: PathBuf,
     pub(crate) format: OutputFormat,
     pub(crate) report_format: ReportFormat,
@@ -234,7 +250,7 @@ mod tests {
 
     fn test_config() -> AppConfig {
         AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: PathBuf::from("output.csv"),
             format: OutputFormat::Csv,
             report_format: ReportFormat::Text,

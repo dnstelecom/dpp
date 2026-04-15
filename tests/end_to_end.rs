@@ -8,10 +8,11 @@
 mod support;
 
 use self::support::{
-    classic_pcap_bytes, encode_dns_header, make_udp_dns_packet_with_payload, temp_test_path,
+    classic_pcap_bytes, encode_dns_header, make_udp_dns_packet_with_payload, pcapng_bytes,
+    temp_test_path,
 };
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::process::Stdio;
 
@@ -77,6 +78,136 @@ fn matched_query_response_pair_round_trips_to_exact_csv_record() {
     );
 
     fs::remove_file(&input_path).expect("remove input pcap");
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn stdin_stream_round_trips_to_exact_csv_record() {
+    let output_path = temp_test_path("stdin-query-response", "csv");
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    query_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    query_payload.extend_from_slice(&1_u16.to_be_bytes());
+    query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    response_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    response_payload.extend_from_slice(&1_u16.to_be_bytes());
+    response_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let input_bytes = classic_pcap_bytes(&[(1, 0, &query_packet), (1, 200_000, &response_packet)]);
+
+    let mut child = Command::new(dpp_binary())
+        .arg("-s")
+        .arg("-")
+        .arg(&output_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dpp executed");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&input_bytes)
+        .expect("pcap stream written");
+
+    let output = child.wait_with_output().expect("dpp exits");
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let csv_output = fs::read_to_string(&output_path).expect("csv output readable");
+    assert_eq!(
+        csv_output,
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200000,10.0.0.1,53000,4660,example.com,A,No Error\n"
+        )
+    );
+
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn stdin_pcapng_stream_round_trips_to_exact_csv_record() {
+    let output_path = temp_test_path("stdin-pcapng-query-response", "csv");
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    query_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    query_payload.extend_from_slice(&1_u16.to_be_bytes());
+    query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    response_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    response_payload.extend_from_slice(&1_u16.to_be_bytes());
+    response_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let input_bytes = pcapng_bytes(&[(1_000_000, &query_packet), (1_200_000, &response_packet)]);
+
+    let mut child = Command::new(dpp_binary())
+        .arg("-s")
+        .arg("-")
+        .arg(&output_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("dpp executed");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&input_bytes)
+        .expect("pcapng stream written");
+
+    let output = child.wait_with_output().expect("dpp exits");
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let csv_output = fs::read_to_string(&output_path).expect("csv output readable");
+    assert_eq!(
+        csv_output,
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200000,10.0.0.1,53000,4660,example.com,A,No Error\n"
+        )
+    );
+
     fs::remove_file(&output_path).expect("remove output csv");
 }
 

@@ -6,11 +6,12 @@
  */
 
 use crate::config::{
-    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget,
-    ReportFormat, output_target_for_path,
+    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, InputSource, MAX_MATCH_TIMEOUT_MS, OutputFormat,
+    OutputTarget, ReportFormat, output_target_for_path,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::{env, fs, thread};
 
@@ -38,18 +39,13 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
 
     let matches = build_cli(version).get_matches();
 
-    let filename = matches
+    let input_source = matches
         .get_one::<String>("filename")
         .map(PathBuf::from)
         .or(env_filename)
+        .map(InputSource::from_path)
         .ok_or_else(|| anyhow!("Input filename is required"))?;
-
-    if !filename.exists() {
-        bail!(
-            "Error: The specified pcap file '{}' does not exist.",
-            filename.display()
-        );
-    }
+    validate_input_source(&input_source)?;
 
     let anonymize = matches
         .get_one::<String>("anonymize")
@@ -103,7 +99,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     validate_parquet_only_flags(format, zstd, v2)?;
 
     Ok(AppConfig {
-        filename,
+        input_source,
         output_filename,
         format,
         report_format,
@@ -130,7 +126,7 @@ fn build_cli(version: &'static str) -> Command {
             "ENVIRONMENT VARIABLES:
   DPP_OUTPUT_FILENAME   Name of the output file (use '-' to write CSV records to stdout; used if [output_filename] argument is not provided)
   DPP_ANONYMIZE         Path to the key file
-  DPP_FILENAME          Path to the input PCAP file (used if [filename] argument is not provided)
+  DPP_FILENAME          Path to the input PCAP file, or '-' to read the capture from stdin (used if [filename] argument is not provided)
   DPP_AFFINITY          Set to 'true' to use cpu affinity
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
@@ -147,6 +143,7 @@ fn build_cli(version: &'static str) -> Command {
 EXAMPLES:
   dpp -s -f parquet input.pcap dns_output.pq
   dpp input.pcap - > output.csv
+  cat input.pcap | dpp - dns_output.csv
   DPP_FILENAME=input.pcap DPP_FORMAT=parquet dpp
 
 LICENSE INFORMATION:
@@ -165,7 +162,7 @@ LICENSE INFORMATION:
         )
         .arg(
             Arg::new("filename")
-                .help("Path to the input PCAP file")
+                .help("Path to the input PCAP file, or '-' to read the capture stream from stdin")
                 .index(1),
         )
         .arg(
@@ -366,6 +363,54 @@ fn validate_output_mode(
     Ok(())
 }
 
+fn validate_input_source(input_source: &InputSource) -> Result<()> {
+    match input_source {
+        InputSource::Stdin => validate_stdin_input(),
+        InputSource::File(path) => validate_input_path(path),
+    }
+}
+
+fn validate_input_path(input_path: &Path) -> Result<()> {
+    if !input_path.exists() {
+        bail!(
+            "Error: The specified pcap file '{}' does not exist.",
+            input_path.display()
+        );
+    }
+
+    let metadata = fs::metadata(input_path).with_context(|| {
+        format!(
+            "Failed to retrieve metadata for the input pcap file '{}'",
+            input_path.display()
+        )
+    })?;
+
+    if !metadata.is_file() {
+        bail!(
+            "Error: The input pcap path '{}' is not a regular file.",
+            input_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_stdin_input() -> Result<()> {
+    #[cfg(windows)]
+    {
+        bail!("Error: Reading the input capture from stdin is not supported on Windows.");
+    }
+
+    #[cfg(not(windows))]
+    {
+        if std::io::stdin().is_terminal() {
+            bail!("Error: Input filename '-' requires a PCAP stream on stdin.");
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_anonymize_path(anonymize_path: Option<&Path>) -> Result<()> {
     let Some(anonymize_path) = anonymize_path else {
         return Ok(());
@@ -557,6 +602,21 @@ mod tests {
     #[test]
     fn stdout_output_sentinel_is_accepted() {
         validate_output_path(Path::new("-")).expect("stdout sentinel is accepted");
+    }
+
+    #[test]
+    fn stdin_input_sentinel_is_accepted() {
+        validate_input_source(&InputSource::from_path(PathBuf::from("-")))
+            .expect("stdin sentinel is accepted when the test stdin is not a tty");
+    }
+
+    #[test]
+    fn missing_input_pcap_is_rejected() {
+        let path = unique_temp_path("missing-input.pcap");
+
+        let error = validate_input_path(path.as_path()).expect_err("missing input must fail");
+
+        assert!(error.to_string().contains("does not exist"));
     }
 
     #[test]

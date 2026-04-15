@@ -5,7 +5,13 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use pcap_file::DataLink;
+use pcap_file::pcapng::PcapNgWriter;
+use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
+use pcap_file::pcapng::blocks::interface_description::InterfaceDescriptionBlock;
+use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn temp_test_path(prefix: &str, extension: &str) -> PathBuf {
@@ -36,6 +42,26 @@ pub(crate) fn classic_pcap_bytes(packets: &[(u32, u32, &[u8])]) -> Vec<u8> {
     }
 
     bytes
+}
+
+pub(crate) fn pcapng_bytes(packets: &[(u64, &[u8])]) -> Vec<u8> {
+    let mut writer = PcapNgWriter::new(Vec::new()).expect("pcapng writer initializes");
+    writer
+        .write_pcapng_block(InterfaceDescriptionBlock::new(DataLink::ETHERNET, 0xFFFF))
+        .expect("pcapng interface block writes");
+
+    for (timestamp_micros, payload) in packets {
+        let mut packet = EnhancedPacketBlock::default();
+        packet.interface_id = 0;
+        packet.timestamp = Duration::from_micros(*timestamp_micros);
+        packet.original_len = payload.len() as u32;
+        packet.data = Cow::Borrowed(*payload);
+        writer
+            .write_pcapng_block(packet)
+            .expect("pcapng packet block writes");
+    }
+
+    writer.into_inner()
 }
 
 pub(crate) fn encode_dns_header(id: u16, flags: u16, query_count: u16) -> Vec<u8> {

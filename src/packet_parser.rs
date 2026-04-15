@@ -5,12 +5,14 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::config::PACKET_BATCH_SIZE;
+use crate::config::{InputSource, PACKET_BATCH_SIZE};
 use anyhow::{Context, Result};
 use pcap::{Capture, Error as LibpcapError, Offline};
 use pcap_file::pcap::PcapReader;
+use pcap_file::pcapng::PcapNgReader;
+use pcap_file::pcapng::{Block as PcapNgBlock, blocks::packet::PacketBlock};
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Read};
+use std::io::{BufReader, Cursor, ErrorKind, Read};
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
@@ -74,27 +76,73 @@ pub(crate) struct NonMonotonicTimestampSample {
     pub(crate) current_timestamp_micros: i64,
 }
 
+type StreamReader = Box<dyn Read + Send>;
+type BufferedCaptureInput = BufReader<CaptureInputReader>;
+
 enum PacketBackend {
-    Classic(PcapReader<BufReader<File>>),
+    Classic(PcapReader<BufferedCaptureInput>),
+    PcapNg(PcapNgReader<BufferedCaptureInput>),
     Libpcap(Capture<Offline>),
 }
 
 impl PacketBackend {
+    fn from_input_source(input_source: &InputSource) -> Result<Self> {
+        match input_source {
+            InputSource::File(path) => Self::from_file(path),
+            InputSource::Stdin => Self::from_stdin(),
+        }
+    }
+
     fn from_file(filename: &Path) -> Result<Self> {
         if is_classic_pcap(filename)? {
             let file = File::open(filename).with_context(|| {
                 format!("Unable to open classic pcap file '{}'", filename.display())
             })?;
-            let reader = PcapReader::new(BufReader::new(file)).with_context(|| {
-                format!(
-                    "Unable to parse classic pcap header from '{}'",
-                    filename.display()
-                )
-            })?;
+            let reader = PcapReader::new(BufReader::new(CaptureInputReader::File(file)))
+                .with_context(|| {
+                    format!(
+                        "Unable to parse classic pcap header from '{}'",
+                        filename.display()
+                    )
+                })?;
             return Ok(Self::Classic(reader));
         }
 
         Ok(Self::Libpcap(Capture::from_file(filename)?))
+    }
+
+    #[cfg(not(windows))]
+    fn from_stdin() -> Result<Self> {
+        Self::from_stream(Box::new(std::io::stdin()), "stdin")
+    }
+
+    #[cfg(windows)]
+    fn from_stdin() -> Result<Self> {
+        anyhow::bail!("Reading the input capture from stdin is not supported on Windows.")
+    }
+
+    fn from_stream(reader: StreamReader, source_name: &str) -> Result<Self> {
+        let (reader, format) = probe_capture_stream(reader, source_name)?;
+
+        match format {
+            StreamFormat::ClassicPcap => {
+                let reader = PcapReader::new(BufReader::new(CaptureInputReader::Stream(reader)))
+                    .with_context(|| {
+                        format!("Unable to parse classic pcap header from '{source_name}'")
+                    })?;
+                Ok(Self::Classic(reader))
+            }
+            StreamFormat::PcapNg => {
+                let reader = PcapNgReader::new(BufReader::new(CaptureInputReader::Stream(reader)))
+                    .with_context(|| {
+                        format!("Unable to parse pcapng section header from '{source_name}'")
+                    })?;
+                Ok(Self::PcapNg(reader))
+            }
+            StreamFormat::Unknown => anyhow::bail!(
+                "Unsupported capture stream format on '{source_name}'. Stdin supports classic PCAP and PCAPNG streams."
+            ),
+        }
     }
 
     fn next_packet_data(&mut self) -> Result<Option<PacketData>> {
@@ -120,18 +168,32 @@ impl PacketBackend {
                 Err(LibpcapError::NoMorePackets) => Ok(None),
                 Err(err) => Err(err.into()),
             },
+            PacketBackend::PcapNg(reader) => loop {
+                let next_block = reader
+                    .next_block()
+                    .map(|result| result.map(|block| block.into_owned()));
+                match next_block {
+                    Some(Ok(block)) => {
+                        if let Some(packet) = pcapng_block_to_packet_data(reader, block)? {
+                            break Ok(Some(packet));
+                        }
+                    }
+                    Some(Err(err)) => break Err(err.into()),
+                    None => break Ok(None),
+                }
+            },
         }
     }
 }
 
 impl PacketParser {
-    /// Creates a new `PacketParser` instance by opening the specified capture file.
+    /// Creates a new `PacketParser` instance by opening the specified capture source.
     ///
     /// Classic pcap files use a pure-Rust streaming reader. Other formats fall back to libpcap to
-    /// preserve existing compatibility assumptions.
-    pub fn new(filename: &Path, enforce_monotonic_timestamps: bool) -> Result<Self> {
+    /// preserve existing compatibility assumptions. Stdin uses libpcap's offline stream reader.
+    pub fn new(input_source: &InputSource, enforce_monotonic_timestamps: bool) -> Result<Self> {
         Ok(Self {
-            backend: PacketBackend::from_file(filename)?,
+            backend: PacketBackend::from_input_source(input_source)?,
             enforce_monotonic_timestamps,
             packet_ordinal: 0,
             last_timestamp_micros: None,
@@ -215,6 +277,96 @@ fn is_classic_pcap(filename: &Path) -> Result<bool> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamFormat {
+    ClassicPcap,
+    PcapNg,
+    Unknown,
+}
+
+enum CaptureInputReader {
+    File(File),
+    Stream(ReplayReader<StreamReader>),
+}
+
+impl Read for CaptureInputReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buf),
+            Self::Stream(reader) => reader.read(buf),
+        }
+    }
+}
+
+struct ReplayReader<R> {
+    prefix: Cursor<Vec<u8>>,
+    inner: R,
+}
+
+impl<R> ReplayReader<R> {
+    fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix: Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<R: Read> Read for ReplayReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            let read = self.prefix.read(buf)?;
+            if read != 0 {
+                return Ok(read);
+            }
+        }
+
+        self.inner.read(buf)
+    }
+}
+
+fn probe_capture_stream(
+    mut reader: StreamReader,
+    source_name: &str,
+) -> Result<(ReplayReader<StreamReader>, StreamFormat)> {
+    let mut prefix = vec![0_u8; 4];
+    let mut read = 0;
+
+    while read < prefix.len() {
+        match reader.read(&mut prefix[read..]) {
+            Ok(0) => {
+                prefix.truncate(read);
+                break;
+            }
+            Ok(bytes_read) => read += bytes_read,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Unable to probe capture stream format from '{source_name}'")
+                });
+            }
+        }
+    }
+
+    let format = classify_stream_prefix(&prefix);
+    Ok((ReplayReader::new(prefix, reader), format))
+}
+
+fn classify_stream_prefix(prefix: &[u8]) -> StreamFormat {
+    if prefix.len() < 4 {
+        return StreamFormat::Unknown;
+    }
+
+    let magic = [prefix[0], prefix[1], prefix[2], prefix[3]];
+    if is_classic_pcap_magic(magic) {
+        StreamFormat::ClassicPcap
+    } else if is_pcapng_magic(magic) {
+        StreamFormat::PcapNg
+    } else {
+        StreamFormat::Unknown
+    }
+}
+
 fn is_classic_pcap_magic(magic: [u8; 4]) -> bool {
     matches!(
         magic,
@@ -223,6 +375,52 @@ fn is_classic_pcap_magic(magic: [u8; 4]) -> bool {
             | [0xa1, 0xb2, 0x3c, 0x4d]
             | [0x4d, 0x3c, 0xb2, 0xa1]
     )
+}
+
+fn is_pcapng_magic(magic: [u8; 4]) -> bool {
+    magic == [0x0a, 0x0d, 0x0d, 0x0a]
+}
+
+fn pcapng_block_to_packet_data(
+    reader: &PcapNgReader<BufferedCaptureInput>,
+    block: PcapNgBlock<'_>,
+) -> Result<Option<PacketData>> {
+    match block {
+        PcapNgBlock::EnhancedPacket(packet) => Ok(Some(PacketData {
+            data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
+            timestamp_micros: duration_to_micros(packet.timestamp),
+            packet_ordinal: 0,
+        })),
+        PcapNgBlock::Packet(packet) => Ok(Some(packet_block_to_packet_data(reader, packet)?)),
+        PcapNgBlock::SimplePacket(_) => anyhow::bail!(
+            "Unsupported pcapng Simple Packet Block: packet timestamps are required for offline DNS matching."
+        ),
+        _ => Ok(None),
+    }
+}
+
+fn packet_block_to_packet_data(
+    reader: &PcapNgReader<BufferedCaptureInput>,
+    packet: PacketBlock<'_>,
+) -> Result<PacketData> {
+    let interface = reader
+        .interfaces()
+        .get(packet.interface_id as usize)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pcapng packet references unknown interface {}",
+                packet.interface_id
+            )
+        })?;
+    let nanos_per_unit = u128::from(interface.ts_resolution()?.to_nano_secs());
+    let timestamp_nanos = u128::from(packet.timestamp).saturating_mul(nanos_per_unit);
+    let timestamp_micros = timestamp_nanos.saturating_div(1_000).min(i64::MAX as u128) as i64;
+
+    Ok(PacketData {
+        data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
+        timestamp_micros,
+        packet_ordinal: 0,
+    })
 }
 
 fn duration_to_micros(duration: Duration) -> i64 {
@@ -246,14 +444,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{classic_pcap_bytes, temp_test_path};
+    use crate::test_support::{classic_pcap_bytes, pcapng_bytes, temp_test_path};
     use std::fs;
+    use std::io::Cursor;
 
     fn packet(timestamp_micros: i64, sequence: u64) -> PacketData {
         PacketData {
             data: PacketPayload::owned(Box::from([])),
             timestamp_micros,
             packet_ordinal: sequence,
+        }
+    }
+
+    fn parser_from_stream(bytes: Vec<u8>) -> PacketParser {
+        PacketParser {
+            backend: PacketBackend::from_stream(Box::new(Cursor::new(bytes)), "test-stream")
+                .expect("stream parser opens"),
+            enforce_monotonic_timestamps: false,
+            packet_ordinal: 0,
+            last_timestamp_micros: None,
+            first_non_monotonic_timestamp: None,
+            non_monotonic_timestamp_count: 0,
         }
     }
 
@@ -267,11 +478,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_pcapng_magic_number() {
+        assert!(is_pcapng_magic([0x0a, 0x0d, 0x0d, 0x0a]));
+        assert!(!is_pcapng_magic([0xd4, 0xc3, 0xb2, 0xa1]));
+    }
+
+    #[test]
     fn reads_classic_pcap_payload_via_pure_rust_reader() {
         let path = temp_test_path("packet-parser-classic", "pcap");
         fs::write(&path, classic_pcap_bytes(&[(1, 2, &[1, 2, 3, 4])])).expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let batch = parser
             .next_batch(1)
             .expect("batch read succeeds")
@@ -287,11 +505,44 @@ mod tests {
     }
 
     #[test]
+    fn reads_classic_pcap_payload_via_stream_native_reader() {
+        let mut parser = parser_from_stream(classic_pcap_bytes(&[(1, 2, &[1, 2, 3, 4])]));
+        assert!(matches!(parser.backend, PacketBackend::Classic(_)));
+
+        let batch = parser
+            .next_batch(1)
+            .expect("batch read succeeds")
+            .expect("batch contains one packet");
+
+        let packet = &batch[0];
+        assert_eq!(packet.timestamp_micros, 1_000_002);
+        assert_eq!(packet.packet_ordinal, 0);
+        assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn reads_pcapng_payload_via_stream_native_reader() {
+        let mut parser = parser_from_stream(pcapng_bytes(&[(1_000_002, &[1, 2, 3, 4])]));
+        assert!(matches!(parser.backend, PacketBackend::PcapNg(_)));
+
+        let batch = parser
+            .next_batch(1)
+            .expect("batch read succeeds")
+            .expect("batch contains one packet");
+
+        let packet = &batch[0];
+        assert_eq!(packet.timestamp_micros, 1_000_002);
+        assert_eq!(packet.packet_ordinal, 0);
+        assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn empty_classic_pcap_returns_no_batches() {
         let path = temp_test_path("packet-parser-empty", "pcap");
         fs::write(&path, classic_pcap_bytes(&[])).expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let batch = parser.next_batch(8).expect("batch read succeeds");
 
         fs::remove_file(&path).expect("test pcap removed");
@@ -310,7 +561,8 @@ mod tests {
         )
         .expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let _ = parser.next_batch(8).expect("batch read succeeds");
 
         fs::remove_file(&path).expect("test pcap removed");
@@ -336,7 +588,8 @@ mod tests {
         )
         .expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let _ = parser.next_batch(8).expect("batch read succeeds");
 
         fs::remove_file(&path).expect("test pcap removed");
@@ -362,7 +615,8 @@ mod tests {
         )
         .expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, true).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), true).expect("parser opens");
         let error = parser
             .next_batch(8)
             .expect_err("non-monotonic capture must fail");
