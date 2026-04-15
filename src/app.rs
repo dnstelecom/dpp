@@ -5,7 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::config::{AppConfig, OutputFormat, ReportFormat};
+use crate::config::{AppConfig, InputSource, OutputFormat, ReportFormat};
 use crate::dns_processor::{DnsProcessor, ProcessingCounters};
 use crate::error::{AppRunError, OutputError};
 use crate::output::OutputMessage;
@@ -225,6 +225,13 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+fn input_source_string(input_source: &InputSource) -> String {
+    match input_source {
+        InputSource::File(path) => canonical_path_string(path),
+        InputSource::Stdin => "stdin".to_string(),
+    }
+}
+
 fn non_monotonic_timestamp_warning(
     packet_parser: &PacketParser,
 ) -> Option<NonMonotonicTimestampWarningSummary> {
@@ -314,7 +321,7 @@ fn build_run_summary(
             pid: std::process::id(),
         },
         config: RunConfigSummary {
-            input_filename: canonical_path_string(&args.filename),
+            input_filename: input_source_string(&args.input_source),
             output_filename: canonical_path_string(&args.output_filename),
             output_format: args.format,
             report_format: args.report_format,
@@ -525,7 +532,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         )
         .map_err(|source| AppRunError::DnsProcessorInit { source })?,
     );
-    let mut packet_parser = PacketParser::new(&args.filename, args.monotonic_capture)
+    let mut packet_parser = PacketParser::new(&args.input_source, args.monotonic_capture)
         .map_err(|source| AppRunError::PacketParserInit { source })?;
 
     let counters = DnsProcessor::dns_processing_loop(
@@ -616,7 +623,7 @@ mod tests {
 
     fn test_config() -> AppConfig {
         AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: PathBuf::from("output.csv"),
             format: OutputFormat::Csv,
             report_format: crate::config::ReportFormat::Text,
@@ -734,7 +741,7 @@ mod tests {
         format: OutputFormat,
     ) -> AppConfig {
         AppConfig {
-            filename,
+            input_source: InputSource::File(filename),
             output_filename,
             format,
             report_format: crate::config::ReportFormat::Text,

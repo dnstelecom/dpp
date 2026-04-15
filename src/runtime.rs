@@ -6,7 +6,7 @@
  */
 
 use crate::allocator;
-use crate::config::{AppConfig, ReportFormat, WORKER_STACK_SIZE_MB};
+use crate::config::{AppConfig, InputSource, ReportFormat, WORKER_STACK_SIZE_MB};
 use crate::error::RuntimeError;
 use crate::monitor_memory;
 use crate::pipeio::BrokenPipeTolerantMakeWriter;
@@ -77,32 +77,37 @@ pub(crate) fn create_thread_pool(num_threads: usize, affinity: bool) -> Result<(
 }
 
 pub(crate) fn log_accessible_input_file(args: &AppConfig) -> Result<(), RuntimeError> {
-    File::open(&args.filename).map_err(|error| {
-        error!(
-            "Error: Unable to open the specified pcap file '{}'. {}",
-            args.filename.display(),
-            error
-        );
-        RuntimeError::InputFileOpen {
-            path: args.filename.clone(),
-            source: io::Error::other(format!(
-                "Unable to open the specified pcap file '{}': {}",
-                args.filename.display(),
-                error
-            )),
-        }
-    })?;
+    match &args.input_source {
+        InputSource::Stdin => info!("Starting to process PCAP stream from stdin"),
+        InputSource::File(path) => {
+            File::open(path).map_err(|error| {
+                error!(
+                    "Error: Unable to open the specified pcap file '{}'. {}",
+                    path.display(),
+                    error
+                );
+                RuntimeError::InputFileOpen {
+                    path: path.clone(),
+                    source: io::Error::other(format!(
+                        "Unable to open the specified pcap file '{}': {}",
+                        path.display(),
+                        error
+                    )),
+                }
+            })?;
 
-    let canonical_path = std::fs::canonicalize(&args.filename).map_err(|source| {
-        RuntimeError::InputPathCanonicalize {
-            path: args.filename.clone(),
-            source,
+            let canonical_path = std::fs::canonicalize(path).map_err(|source| {
+                RuntimeError::InputPathCanonicalize {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            info!(
+                "Starting to process PCAP file: {}",
+                canonical_path.display()
+            );
         }
-    })?;
-    info!(
-        "Starting to process PCAP file: {}",
-        canonical_path.display()
-    );
+    }
 
     Ok(())
 }

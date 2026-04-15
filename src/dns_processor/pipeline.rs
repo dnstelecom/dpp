@@ -882,6 +882,7 @@ impl DnsProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::InputSource;
     use crate::packet_parser::PacketParser;
     use crate::test_support::{
         classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
@@ -909,7 +910,8 @@ mod tests {
             make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
         fs::write(&path, classic_pcap_bytes(&[(1, 0, &packet)])).expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let batch = parser
             .next_batch(1)
             .expect("batch read succeeds")
@@ -1037,7 +1039,8 @@ mod tests {
         )
         .expect("test pcap written");
 
-        let mut parser = PacketParser::new(&path, false).expect("parser opens");
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let batch = parser
             .next_batch(2)
             .expect("batch read succeeds")

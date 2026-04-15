@@ -11,7 +11,7 @@ fixes, performance work, and future refactors.
 DPP Community Edition has a single supported matching model:
 
 - forward-only matching with deterministic ordering by `(timestamp_micros, packet_ordinal)`
-- offline processing from PCAP input into CSV or Parquet output
+- offline processing from PCAP file input or EOF-terminated stdin PCAP streams into CSV or Parquet output
 - optional final JSON run summary through the canonical report-format contract; stdout export mode
   is CSV-only, rejects JSON reports, suppresses text reports, treats downstream stdout pipe
   closure as graceful CLI termination, suppresses broken-pipe log noise if stderr itself is closed,
@@ -87,9 +87,13 @@ repeating it for full DNS question decoding.
 
 - `src/packet_parser.rs`
   Reads packets from offline captures and exposes them to the rest of the pipeline. Classic PCAP
-  files use a pure-Rust streaming reader; PCAPNG and other non-classic formats currently fall back
-  to libpcap. The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file`
-  `3.0.0-rc1` release candidate until a stable line with the required functionality is available.
+  files use a pure-Rust streaming reader; regular-file PCAPNG and other non-classic formats
+  currently fall back to libpcap. EOF-terminated stdin capture streams are also supported through
+  parser-owned stream-native readers: classic PCAP stdin uses the same pure-Rust fast path family
+  as classic file input, and PCAPNG stdin uses a pure-Rust pcapng reader so stdin probing does not
+  need a temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
+  The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file` `3.0.0-rc1` release
+  candidate until a stable line with the required functionality is available.
   The parser can also enforce globally monotonic capture timestamps for the optional batched
   timeout-eviction path; when that contract is enabled, a timestamp regression becomes a hard
   processing error instead of a post-run warning.

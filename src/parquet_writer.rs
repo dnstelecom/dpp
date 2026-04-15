@@ -225,7 +225,7 @@ pub(crate) fn parquet_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OutputFormat;
+    use crate::config::{InputSource, OutputFormat};
     use crate::test_support::{temp_test_path, test_dns_record};
     use crossbeam::channel;
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -259,7 +259,7 @@ mod tests {
     fn parquet_writer_flushes_buffer_on_shutdown() {
         let filename = temp_test_path("parquet-writer-shutdown", "parquet");
         let config = AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: filename.clone(),
             format: OutputFormat::Parquet,
             report_format: crate::config::ReportFormat::Text,
@@ -297,7 +297,7 @@ mod tests {
     fn parquet_writer_flushes_buffer_when_channel_closes_without_explicit_shutdown() {
         let filename = temp_test_path("parquet-writer-channel-close", "parquet");
         let config = AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: filename.clone(),
             format: OutputFormat::Parquet,
             report_format: crate::config::ReportFormat::Text,
@@ -335,7 +335,7 @@ mod tests {
     fn parquet_writer_supports_non_file_sinks() {
         let shared = Arc::new(Mutex::new(Vec::new()));
         let config = AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: PathBuf::from("-"),
             format: OutputFormat::Parquet,
             report_format: crate::config::ReportFormat::Text,
@@ -375,7 +375,7 @@ mod tests {
     fn parquet_writer_drops_buffered_rows_on_abort() {
         let filename = temp_test_path("parquet-writer-abort", "parquet");
         let config = AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: filename.clone(),
             format: OutputFormat::Parquet,
             report_format: crate::config::ReportFormat::Text,
@@ -414,7 +414,7 @@ mod tests {
     fn parquet_writer_preserves_null_response_fields_for_timeout_records() {
         let filename = temp_test_path("parquet-writer-timeout", "parquet");
         let config = AppConfig {
-            filename: PathBuf::from("input.pcap"),
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
             output_filename: filename.clone(),
             format: OutputFormat::Parquet,
             report_format: crate::config::ReportFormat::Text,

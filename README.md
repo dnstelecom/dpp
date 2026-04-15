@@ -29,6 +29,7 @@ DPP is a Rust application for parsing, matching, and exporting DNS query/respons
 - [Build](#build)
 - [Usage](#usage)
 - [Example run](#example-run)
+- [A simple AWK analysis to measure DNS traffic latency](#a-simple-awk-analysis-to-measure-dns-traffic-latency)
 - [Performance Optimization](#performance-optimization)
 - [Limitations](#limitations)
 - [Commercial Edition](#commercial-edition)
@@ -40,7 +41,7 @@ DPP reads offline PCAP files, extracts DNS traffic, matches queries with respons
 
 ## Features
 
-- Offline capture parsing through a pure-Rust classic-PCAP reader with `libpcap` fallback for non-classic formats.
+- Offline capture parsing through a pure-Rust classic-PCAP reader, stream-native stdin support for classic PCAP and PCAPNG, and `libpcap` fallback for non-classic file inputs.
 - Multi-threaded processing with cheap packet routing, canonical flow-based shard ownership, and deterministic aggregation under parallel load.
 - Adaptive runtime behavior: low-core hosts fall back to a simpler phase-parallel path.
 - DNS query/response matching using source and destination IPs, ID, QNAME, QTYPE, and closely aligned timestamps.
@@ -61,7 +62,7 @@ ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/ar
 | Layer                       | Components                                                    | Responsibility                                                                         |
 |-----------------------------|---------------------------------------------------------------|----------------------------------------------------------------------------------------|
 | Configuration and contracts | `src/config.rs`, `src/cli.rs`, `src/record.rs`                | Runtime constants, CLI/environment contract, and exported `DnsRecord` schema           |
-| Input parsing               | `PacketParser`                                                | Offline capture input with pure-Rust classic-PCAP parsing and `libpcap` fallback       |
+| Input parsing               | `PacketParser`                                                | Offline capture input with pure-Rust classic-PCAP parsing, stream-native stdin parsing, and `libpcap` fallback for non-classic file inputs |
 | DNS processing              | `DnsProcessor`, `pipeline.rs`                                 | Packet routing, DNS decoding, matching, shard ownership, and deterministic aggregation |
 | Runtime and orchestration   | `src/app.rs`, `src/runtime.rs`, `src/allocator.rs`            | App lifecycle, bootstrap, reporting, thread-pool setup, and allocator selection        |
 | Output pipeline             | `src/output.rs`, `src/csv_writer.rs`, `src/parquet_writer.rs` | Async writer lifecycle and CSV/Parquet serialization                                   |
@@ -140,6 +141,9 @@ dpp -s -f parquet input.pcap dns_output.pq
 # Stream CSV records to stdout
 dpp input.pcap - > output.csv
 
+# Read an offline PCAP stream from stdin
+cat input.pcap | dpp - output.csv
+
 # Emit a machine-readable JSON summary object at the end of the run
 dpp --report-format json input.pcap output.csv > dpp-summary.json
 ```
@@ -180,7 +184,7 @@ Notes:
 
 | Argument          | Description                                                                                                                                                       |
 |-------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `filename`        | Path to the input PCAP file                                                                                                                                       |
+| `filename`        | Path to the input PCAP file. Use `-` to read a finite offline PCAP stream from `stdin`.                                                                         |
 | `output_filename` | Optional output file path. If omitted, DPP writes to `dns_output.csv` for `csv` and to `dns_output.parquet` for `parquet` or `pq`. Use `-` for CSV stdout output. |
 
 ### Options
@@ -205,7 +209,7 @@ Notes:
 
 | Variable                 | Description                                                                                                               |
 |--------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `DPP_FILENAME`           | Input PCAP path                                                                                                           |
+| `DPP_FILENAME`           | Input PCAP path. Use `-` to read a finite offline PCAP stream from `stdin`                                              |
 | `DPP_OUTPUT_FILENAME`    | Optional output file path; use `-` for CSV stdout output                                                                  |
 | `DPP_FORMAT`             | Output format: `csv`, `parquet`, or `pq`                                                                                  |
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
@@ -226,6 +230,13 @@ from the resolved format: `dns_output.csv` for `csv` and `dns_output.parquet` fo
 When `output_filename` is `-`, DPP writes CSV records to stdout, suppresses non-error log output, and does not emit
 the final text report. `--format parquet`, `--report-format json`, and `DPP_REPORT_FORMAT=json` are rejected in this
 mode.
+
+When `filename` is `-`, DPP reads a finite offline PCAP stream from `stdin` until EOF and then completes the run
+normally. This preserves the existing offline-processing contract: `stdin` is not treated as a live capture source.
+Classic PCAP streams on `stdin` now use the same pure-Rust parser family as classic file input, and PCAPNG streams
+also use a stream-native parser path. For regular files, non-classic formats still fall back to `libpcap`.
+Unsupported non-PCAP/non-PCAPNG stream magic on `stdin` is rejected explicitly instead of being redirected through a
+hidden temp-file or second ingest path.
 
 Repeated pending queries that share the same match identity (`id`, `name`, client IP, client port,
 and `query_type`) inside the configured match window (`1200ms` by default) are deduplicated to the earliest canonical
@@ -379,6 +390,66 @@ What this tells you:
 - the second query for example.org A had no matching response within the timeout window;
 - empty response_timestamp and response_code mean timeout.
 
+### A simple AWK analysis to measure DNS traffic latency
+```bash
+$ gawk -F',' '
+NR > 1 {
+    total++
+    req = $1
+    resp = $2
+
+    if (req == "") { invalid++; next }
+    if (resp == "") { timeout++; next }
+
+    d_ms = (resp - req) / 1000.0
+    if (d_ms < 0) { invalid++; next }
+
+    ok++
+    sum += d_ms
+    a[ok] = d_ms
+}
+END {
+    printf "total_rows:    %d\n", total
+    printf "ok_rows:       %d\n", ok
+    printf "timeout_rows:  %d\n", timeout
+    printf "invalid_rows:  %d\n", invalid
+    printf "timeout_ratio: %.4f%%\n", (total ? 100.0 * timeout / total : 0)
+
+    if (ok == 0) exit 0
+
+    asort(a)
+    mean = sum / ok
+    median = (ok % 2) ? a[(ok + 1) / 2] : (a[ok / 2] + a[ok / 2 + 1]) / 2
+
+    printf "mean_ms:       %.6f\n", mean
+    printf "median_ms:     %.6f\n", median
+    printf "p50_ms:        %.6f\n", pct(a, ok, 50)
+    printf "p95_ms:        %.6f\n", pct(a, ok, 95)
+    printf "p99_ms:        %.6f\n", pct(a, ok, 99)
+    printf "p99.9_ms:      %.6f\n", pct(a, ok, 99.9)
+}
+function pct(arr, n, p, rank, x) {
+    x = (p / 100) * n
+    rank = int(x)
+    if (x > rank) rank++
+    if (rank < 1) rank = 1
+    if (rank > n) rank = n
+    return arr[rank]
+}
+' dns_output.csv
+total_rows:    19646090
+ok_rows:       19630152
+timeout_rows:  15938
+bad_rows:      0
+mean_ms:       1.303967
+median_ms:     0.021000
+p50_ms:        0.021000
+p95_ms:        0.034000
+p99_ms:        34.479000
+p99.9_ms:      257.322000
+```
+
+
 ## Performance Optimization
 
 For best throughput on the target host:
@@ -402,9 +473,7 @@ Additional notes:
 ## Limitations
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
-- **PCAPNG support level:** DPP supports classic PCAP through its pure-Rust fast path. PCAPNG and
-  other non-classic formats currently depend on the `libpcap` fallback path instead of the
-  pure-Rust reader.
+- **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
 - **Outer encapsulation layers:** The fast extraction path assumes Ethernet followed by IPv4 or IPv6. Captures containing VLAN, QinQ, MPLS, or similar outer encapsulation layers may require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.
 - **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks.
