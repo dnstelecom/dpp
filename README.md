@@ -152,6 +152,39 @@ If `output_filename` is omitted, DPP chooses the default file name from the reso
 `dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or `pq`. Use `-` only when you
 want CSV records on stdout.
 
+The final text/JSON report includes both packet-level drop accounting and signal-shutdown
+record-loss accounting. `dropped_packets` is a packet-level derived aggregate over the detailed
+drop-path counters `routed_non_dns`, `unsupported_encapsulation`, `dns_decode_error`,
+`dns_name_error`, and `dropped_on_shutdown`. `decode_errors` is the derived sum of
+`dns_decode_error` and `dns_name_error`. Signal-driven record losses are surfaced separately as
+`skipped_finalization_records_on_shutdown`, `discarded_output_tail_records_on_shutdown`, and the
+derived `shutdown_record_losses`. `dns_name_error` remains a derived aggregate over the exact DNS
+name subreason counters `dns_name_truncated`, `dns_name_too_long`,
+`dns_name_compression_pointer_truncated`, `dns_name_compression_pointer_out_of_bounds`,
+`dns_name_compression_pointer_loop`, `dns_name_unsupported_label_encoding`, and
+`dns_name_label_truncated`.
+
+Policy notes:
+
+- `routed_non_dns` counts packets that were ingested successfully but did not qualify for the
+  UDP/53 DNS routing contract after successful Ethernet/IP/UDP routing.
+- `unsupported_encapsulation` counts packets whose Ethernet framing is outside the supported plain
+  IPv4/IPv6 path, plus malformed Ethernet/IP/UDP routing-stage packets.
+- `dns_decode_error` counts packets that reached UDP/53 routing but failed a structural DNS decode
+  check, including trivially short DNS payloads rejected before shard dispatch.
+- `dns_name_error` is the aggregate over exact DNS name parse failures. The summary also exposes
+  the detailed subreason counters listed above, and those buckets remain populated regardless of
+  whether `--dns-wire-fast-path` is enabled.
+- `dropped_on_shutdown` counts packets that were already read into a batch but intentionally not
+  handed to the processing pipeline after a termination signal was observed.
+- `skipped_finalization_records_on_shutdown` counts terminal records that would have been emitted
+  from pending unmatched queries during end-of-run matcher finalization, but were intentionally
+  skipped after a termination signal.
+- `discarded_output_tail_records_on_shutdown` counts already-materialized `DnsRecord` values that
+  remained buffered inside the async writer when abort teardown discarded the tail.
+- `shutdown_record_losses` is the derived sum of the two signal-shutdown record-loss counters above
+  and is not folded into packet counters.
+
 ### Create an anonymization key
 
 `--anonymize` expects a text file. DPP reads the file contents as a passphrase and derives the

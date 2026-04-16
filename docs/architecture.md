@@ -145,7 +145,25 @@ repeating it for full DNS question decoding.
   but only under a strict globally monotonic timestamp assumption. When that contract is active,
   the eviction watermark comes from the routed batch maximum timestamp, not from each shard's local
   maximum, so sparse shards still retire stale state against the global batch frontier. The
-  Community Edition scope is currently limited to DNS over UDP port 53.
+  authoritative packet drop accounting also lives inside this ownership boundary: `routed_non_dns`
+  counts packets that completed Ethernet/IP/UDP routing but still fell outside the UDP/53 DNS
+  contract, `unsupported_encapsulation` counts outer Ethernet framing outside the supported plain
+  IPv4/IPv6 path plus malformed routing-stage Ethernet/IP/UDP packets, `dns_decode_error` and
+  `dns_name_error` count packets that reached DNS decode but failed there, and `dropped_on_shutdown`
+  counts packets already read into a batch but intentionally not handed to downstream processing
+  after a termination signal. `dns_name_error` is itself derived from the exact name-parse
+  subreason counters `dns_name_truncated`, `dns_name_too_long`,
+  `dns_name_compression_pointer_truncated`, `dns_name_compression_pointer_out_of_bounds`,
+  `dns_name_compression_pointer_loop`, `dns_name_unsupported_label_encoding`, and
+  `dns_name_label_truncated`; that classification contract must hold regardless of whether the
+  optional runtime DNS wire fast path is enabled. The aggregate report fields `decode_errors` and
+  `dropped_packets`
+  are derived from those canonical packet counters instead of being maintained separately. Signal
+  shutdown also has numeric record-loss accounting at this boundary: pending unmatched queries that
+  skip finalization contribute to `skipped_finalization_records_on_shutdown`, buffered writer-tail
+  records discarded during abort contribute to `discarded_output_tail_records_on_shutdown`, and the
+  derived `shutdown_record_losses` keeps those record-level losses separate from packet-drop
+  counters. The Community Edition scope is currently limited to DNS over UDP port 53.
 
 - `src/csv_writer.rs` and `src/parquet_writer.rs`
   Consume finalized `DnsRecord` values and write them asynchronously. Writers must not become a
@@ -155,7 +173,9 @@ repeating it for full DNS question decoding.
   Top-level orchestration layer. Owns the ordered run sequence, process reporting, and shutdown
   coordination without taking ownership of canonical configuration or writer internals. The final
   run summary is also where aggregate matching-quality metrics such as timeout ratio and average
-  matched RTT are derived from authoritative processing counters.
+  matched RTT are derived from authoritative processing counters, alongside the derived packet-drop
+  aggregates `decode_errors` and `dropped_packets` and the derived shutdown record-loss aggregate
+  `shutdown_record_losses`.
 
 - `src/error.rs`
   Canonical top-level error taxonomy for the application, runtime bootstrap, and output lifecycle.

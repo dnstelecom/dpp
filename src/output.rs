@@ -25,6 +25,11 @@ pub(crate) enum OutputMessage {
     Abort,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WriterShutdownSummary {
+    pub(crate) discarded_output_tail_records: usize,
+}
+
 impl From<DnsRecord> for OutputMessage {
     fn from(record: DnsRecord) -> Self {
         OutputMessage::Record(record)
@@ -35,7 +40,7 @@ pub(crate) fn drain_output_messages<FlushFn>(
     rx: Receiver<OutputMessage>,
     buffer: &mut Vec<DnsRecord>,
     mut flush_buffer: FlushFn,
-) -> Result<(), Box<dyn Error + Send + Sync>>
+) -> Result<WriterShutdownSummary, Box<dyn Error + Send + Sync>>
 where
     FlushFn: FnMut(&mut Vec<DnsRecord>) -> Result<(), Box<dyn Error + Send + Sync>>,
 {
@@ -49,8 +54,11 @@ where
             }
             OutputMessage::Shutdown => break,
             OutputMessage::Abort => {
+                let summary = WriterShutdownSummary {
+                    discarded_output_tail_records: buffer.len(),
+                };
                 buffer.clear();
-                return Ok(());
+                return Ok(summary);
             }
         }
     }
@@ -59,13 +67,13 @@ where
         flush_buffer(buffer)?;
     }
 
-    Ok(())
+    Ok(WriterShutdownSummary::default())
 }
 
 pub(crate) fn create_writer_thread(
     config: &AppConfig,
     rx: crossbeam::channel::Receiver<OutputMessage>,
-) -> Result<JoinHandle<Result<(), OutputError>>, OutputError> {
+) -> Result<JoinHandle<Result<WriterShutdownSummary, OutputError>>, OutputError> {
     match config.format {
         OutputFormat::Csv => {
             let sink = create_output_sink(config).map_err(|source| OutputError::CreateCsvFile {

@@ -6,7 +6,7 @@
  */
 
 use crate::config::OUTPUT_FLUSH_THRESHOLD;
-use crate::output::{OutputMessage, drain_output_messages};
+use crate::output::{OutputMessage, WriterShutdownSummary, drain_output_messages};
 use crate::record::DnsRecord;
 use crossbeam::channel::Receiver;
 use memchr::{memchr, memchr3_iter};
@@ -124,7 +124,7 @@ fn flush_buffer_async_csv(
 pub(crate) fn csv_writer<W>(
     sink: W,
     rx: Receiver<OutputMessage>,
-) -> Result<(), Box<dyn Error + Send + Sync>>
+) -> Result<WriterShutdownSummary, Box<dyn Error + Send + Sync>>
 where
     W: Write,
 {
@@ -134,12 +134,12 @@ where
 
     csv_writer.write_all(CSV_HEADER)?;
 
-    drain_output_messages(rx, &mut buffer, |buffer| {
+    let shutdown_summary = drain_output_messages(rx, &mut buffer, |buffer| {
         flush_buffer_async_csv(&mut csv_writer, buffer, &mut row_buffer)
     })?;
 
     csv_writer.flush()?;
-    Ok(())
+    Ok(shutdown_summary)
 }
 
 #[cfg(test)]
@@ -291,12 +291,14 @@ mod tests {
         tx.send(OutputMessage::Abort).expect("abort is sent");
 
         let mut output = Vec::new();
-        csv_writer(&mut output, rx).expect("csv writer completes successfully");
+        let shutdown_summary =
+            csv_writer(&mut output, rx).expect("csv writer completes successfully");
 
         let output = String::from_utf8(output).expect("csv output is utf-8");
         assert_eq!(
             output,
             "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n"
         );
+        assert_eq!(shutdown_summary.discarded_output_tail_records, 1);
     }
 }

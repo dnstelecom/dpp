@@ -6,7 +6,7 @@
  */
 
 use crate::config::{AppConfig, OUTPUT_FLUSH_THRESHOLD, PARQUET_WRITE_BATCH_SIZE};
-use crate::output::{OutputMessage, drain_output_messages};
+use crate::output::{OutputMessage, WriterShutdownSummary, drain_output_messages};
 use crate::record::DnsRecord;
 use arrayvec::ArrayString;
 use crossbeam::channel::Receiver;
@@ -211,15 +211,15 @@ where
 pub(crate) fn parquet_writer(
     mut parquet_writer: SerializedFileWriter<impl Write + Send>,
     rx: Receiver<OutputMessage>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<WriterShutdownSummary, Box<dyn Error + Send + Sync>> {
     let mut buffer = Vec::with_capacity(OUTPUT_FLUSH_THRESHOLD);
 
-    drain_output_messages(rx, &mut buffer, |buffer| {
+    let shutdown_summary = drain_output_messages(rx, &mut buffer, |buffer| {
         flush_buffer_async_parquet(&mut parquet_writer, buffer)
     })?;
 
     parquet_writer.close()?;
-    Ok(())
+    Ok(shutdown_summary)
 }
 
 #[cfg(test)]
@@ -399,13 +399,15 @@ mod tests {
             .expect("record is sent");
         tx.send(OutputMessage::Abort).expect("abort is sent");
 
-        parquet_writer(writer, rx).expect("parquet writer completes successfully");
+        let shutdown_summary =
+            parquet_writer(writer, rx).expect("parquet writer completes successfully");
 
         let reader =
             SerializedFileReader::new(File::open(&filename).expect("opens parquet output"))
                 .expect("parquet output is readable");
         assert_eq!(reader.metadata().num_row_groups(), 0);
         assert_eq!(reader.metadata().file_metadata().num_rows(), 0);
+        assert_eq!(shutdown_summary.discarded_output_tail_records, 1);
 
         fs::remove_file(filename).expect("removes temp parquet file");
     }

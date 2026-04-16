@@ -48,6 +48,7 @@ pub struct PacketData {
 }
 
 /// Deterministic packet order used by the single supported matching mode.
+#[cfg(test)]
 pub(crate) fn sort_packet_batch(packet_batch: &mut [PacketData]) {
     packet_batch.sort_by(|a, b| {
         a.timestamp_micros

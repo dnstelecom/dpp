@@ -11,7 +11,8 @@ use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
-use super::types::{MatcherShardState, ProcessedDnsRecord};
+use super::parser::{DecodeErrorKind, RoutingDecision};
+use super::types::{DnsNameErrorKind, MatcherShardState, ProcessedDnsRecord};
 use crate::custom_types::DnsNameBuf;
 use crate::test_support::{
     encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload,
@@ -221,6 +222,29 @@ fn packet_flow_key_ignores_non_dns_udp_packets() {
     let packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
 
     assert!(DnsProcessor::packet_flow_key(&packet).is_none());
+}
+
+#[test]
+fn packet_routing_decision_marks_unsupported_outer_encapsulation() {
+    let packet = vec![
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x81, 0x00, 0, 0, 0x08, 0x00,
+    ];
+
+    assert!(matches!(
+        DnsProcessor::packet_routing_decision(&packet),
+        RoutingDecision::UnsupportedEncapsulation
+    ));
+}
+
+#[test]
+fn packet_routing_decision_marks_short_udp_dns_payload_as_decode_error() {
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &[0_u8; 4]);
+
+    assert!(matches!(
+        DnsProcessor::packet_routing_decision(&packet),
+        RoutingDecision::DnsDecodeError
+    ));
 }
 
 #[test]
@@ -765,6 +789,101 @@ fn parser_rejects_wire_name_compression_loops() {
         make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
 
     assert!(processor.process_packet_batch(&packet, 1_234_567).is_none());
+}
+
+#[test]
+fn parser_reports_compression_pointer_loop_as_specific_name_error() {
+    let processor = test_processor_with_dns_wire_fast_path();
+    let mut dns_payload = encode_dns_header(0xCAFE, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    assert!(matches!(
+        processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta),
+        Err(DecodeErrorKind::DnsNameError(
+            DnsNameErrorKind::CompressionPointerLoop
+        ))
+    ));
+}
+
+#[test]
+fn parser_without_fast_path_reports_compression_pointer_loop_as_specific_name_error() {
+    let processor = test_processor();
+    let mut dns_payload = encode_dns_header(0xCAFE, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    assert!(matches!(
+        processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta),
+        Err(DecodeErrorKind::DnsNameError(
+            DnsNameErrorKind::CompressionPointerLoop
+        ))
+    ));
+}
+
+#[test]
+fn parser_reports_compression_pointer_out_of_bounds_as_specific_name_error() {
+    let processor = test_processor_with_dns_wire_fast_path();
+    let mut dns_payload = encode_dns_header(0xCAFE, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0xC0, 0xFF]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    assert!(matches!(
+        processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta),
+        Err(DecodeErrorKind::DnsNameError(
+            DnsNameErrorKind::CompressionPointerOutOfBounds
+        ))
+    ));
+}
+
+#[test]
+fn parser_without_fast_path_reports_unsupported_label_encoding_as_specific_name_error() {
+    let processor = test_processor();
+    let mut dns_payload = encode_dns_header(0xCAFE, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0x80]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    assert!(matches!(
+        processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta),
+        Err(DecodeErrorKind::DnsNameError(
+            DnsNameErrorKind::UnsupportedLabelEncoding
+        ))
+    ));
+}
+
+#[test]
+fn parser_reports_unsupported_label_encoding_as_specific_name_error() {
+    let processor = test_processor_with_dns_wire_fast_path();
+    let mut dns_payload = encode_dns_header(0xCAFE, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0x80]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    assert!(matches!(
+        processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta),
+        Err(DecodeErrorKind::DnsNameError(
+            DnsNameErrorKind::UnsupportedLabelEncoding
+        ))
+    ));
 }
 
 #[test]

@@ -64,6 +64,68 @@ pub(super) struct ResponseEventPayload {
     pub(super) response_code: HickoryResponseCode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DnsNameErrorKind {
+    NameTruncated,
+    NameTooLong,
+    CompressionPointerTruncated,
+    CompressionPointerOutOfBounds,
+    CompressionPointerLoop,
+    UnsupportedLabelEncoding,
+    LabelTruncated,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DnsNameErrorCounters {
+    pub(crate) name_truncated: usize,
+    pub(crate) name_too_long: usize,
+    pub(crate) compression_pointer_truncated: usize,
+    pub(crate) compression_pointer_out_of_bounds: usize,
+    pub(crate) compression_pointer_loop: usize,
+    pub(crate) unsupported_label_encoding: usize,
+    pub(crate) label_truncated: usize,
+}
+
+impl DnsNameErrorCounters {
+    pub(super) fn record(&mut self, kind: DnsNameErrorKind) {
+        match kind {
+            DnsNameErrorKind::NameTruncated => self.name_truncated += 1,
+            DnsNameErrorKind::NameTooLong => self.name_too_long += 1,
+            DnsNameErrorKind::CompressionPointerTruncated => {
+                self.compression_pointer_truncated += 1;
+            }
+            DnsNameErrorKind::CompressionPointerOutOfBounds => {
+                self.compression_pointer_out_of_bounds += 1;
+            }
+            DnsNameErrorKind::CompressionPointerLoop => self.compression_pointer_loop += 1,
+            DnsNameErrorKind::UnsupportedLabelEncoding => {
+                self.unsupported_label_encoding += 1;
+            }
+            DnsNameErrorKind::LabelTruncated => self.label_truncated += 1,
+        }
+    }
+
+    pub(super) fn absorb(&mut self, other: Self) {
+        self.name_truncated += other.name_truncated;
+        self.name_too_long += other.name_too_long;
+        self.compression_pointer_truncated += other.compression_pointer_truncated;
+        self.compression_pointer_out_of_bounds += other.compression_pointer_out_of_bounds;
+        self.compression_pointer_loop += other.compression_pointer_loop;
+        self.unsupported_label_encoding += other.unsupported_label_encoding;
+        self.label_truncated += other.label_truncated;
+    }
+
+    pub(super) fn total(&self) -> usize {
+        self.name_truncated
+            + self.name_too_long
+            + self.compression_pointer_truncated
+            + self.compression_pointer_out_of_bounds
+            + self.compression_pointer_loop
+            + self.unsupported_label_encoding
+            + self.label_truncated
+    }
+}
+
 pub(super) enum Timeline<Record> {
     Inline(ArrayVec<(TimelineKey, Record), INLINE_TIMELINE_CAPACITY>),
     Tree(BTreeMap<TimelineKey, Record>),
@@ -221,7 +283,6 @@ impl<Record> Timeline<Record> {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Inline(entries) => entries.len(),
@@ -353,6 +414,11 @@ pub(super) struct ShardProcessingResult {
     pub(super) timeout_query_count: usize,
     pub(super) matched_rtt_sum_micros: u64,
     pub(super) out_of_order_combined_count: usize,
+    pub(super) routed_non_dns: usize,
+    pub(super) unsupported_encapsulation: usize,
+    pub(super) dns_decode_error: usize,
+    pub(super) dns_name_errors: DnsNameErrorCounters,
+    pub(super) skipped_finalization_records_on_shutdown: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -402,4 +468,10 @@ pub(super) struct DnsResponse {
 pub(super) struct MatcherShardState {
     pub(super) query_map: QueryMap,
     pub(super) response_map: ResponseMap,
+}
+
+impl MatcherShardState {
+    pub(super) fn pending_query_count(&self) -> usize {
+        self.query_map.values().map(Timeline::len).sum()
+    }
 }

@@ -19,6 +19,8 @@ pub(crate) use pipeline::ProcessingCounters;
 use std::io;
 use std::net::IpAddr;
 use std::path::Path;
+#[cfg(test)]
+pub(crate) use types::DnsNameErrorCounters;
 
 pub struct DnsProcessor {
     anonymizer: anonymizer::Anonymizer,

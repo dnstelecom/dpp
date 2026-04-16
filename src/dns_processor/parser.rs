@@ -12,11 +12,10 @@ use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
-use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
-use super::types::ProcessedDnsRecord;
+use super::types::{DnsNameErrorKind, ProcessedDnsRecord};
 use crate::custom_types::DnsNameBuf;
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -86,6 +85,20 @@ impl ParsedUdpDnsMeta {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RoutingDecision {
+    Routed(ParsedUdpDnsMeta),
+    RoutedNonDns,
+    UnsupportedEncapsulation,
+    DnsDecodeError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DecodeErrorKind {
+    DnsDecodeError,
+    DnsNameError(DnsNameErrorKind),
+}
+
 struct DecodedDnsHeader {
     id: u16,
     response_code: HickoryResponseCode,
@@ -98,8 +111,26 @@ struct DecodedDnsQuestion {
 
 impl DnsProcessor {
     #[inline]
+    pub(super) fn packet_routing_decision(data: &[u8]) -> RoutingDecision {
+        match Self::extract_udp_dns_meta(data) {
+            Ok(Some(meta)) => match meta.dns_data(data) {
+                Ok(dns_data) if dns_data.len() >= DNS_HEADER_LEN => RoutingDecision::Routed(meta),
+                Ok(_) | Err(_) => RoutingDecision::DnsDecodeError,
+            },
+            Ok(None) => RoutingDecision::RoutedNonDns,
+            Err(_) => RoutingDecision::UnsupportedEncapsulation,
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
     pub(super) fn packet_routing_meta(data: &[u8]) -> Option<ParsedUdpDnsMeta> {
-        Self::extract_udp_dns_meta(data).ok().flatten()
+        match Self::packet_routing_decision(data) {
+            RoutingDecision::Routed(meta) => Some(meta),
+            RoutingDecision::RoutedNonDns
+            | RoutingDecision::UnsupportedEncapsulation
+            | RoutingDecision::DnsDecodeError => None,
+        }
     }
 
     #[inline]
@@ -114,10 +145,12 @@ impl DnsProcessor {
         data: &[u8],
         timestamp_micros: i64,
     ) -> Option<Vec<ProcessedDnsRecord>> {
-        match Self::extract_udp_dns_meta(data) {
-            Ok(Some(meta)) => self.process_packet_batch_with_meta(data, timestamp_micros, meta),
-            Ok(None) => Some(Vec::new()),
-            Err(_) => None,
+        match Self::packet_routing_decision(data) {
+            RoutingDecision::Routed(meta) => self
+                .process_packet_batch_with_meta(data, timestamp_micros, meta)
+                .ok(),
+            RoutingDecision::RoutedNonDns => Some(Vec::new()),
+            RoutingDecision::UnsupportedEncapsulation | RoutingDecision::DnsDecodeError => None,
         }
     }
 
@@ -126,9 +159,8 @@ impl DnsProcessor {
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
-    ) -> Option<Vec<ProcessedDnsRecord>> {
+    ) -> Result<Vec<ProcessedDnsRecord>, DecodeErrorKind> {
         self.process_packet_with_meta(data, timestamp_micros, meta)
-            .ok()
     }
 
     #[inline]
@@ -237,10 +269,13 @@ impl DnsProcessor {
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let (header, queries) = self.decode_dns_questions(meta.dns_data(data)?)?;
+    ) -> Result<Vec<ProcessedDnsRecord>, DecodeErrorKind> {
+        let (header, queries) = self.decode_dns_questions(
+            meta.dns_data(data)
+                .map_err(|_| DecodeErrorKind::DnsDecodeError)?,
+        )?;
 
-        self.build_dns_records(
+        Ok(self.build_dns_records(
             &header,
             queries.as_slice(),
             meta.src_ip(),
@@ -249,7 +284,7 @@ impl DnsProcessor {
             meta.dst_port(),
             timestamp_micros,
             meta.is_response,
-        )
+        ))
     }
 
     fn build_dns_records(
@@ -262,8 +297,8 @@ impl DnsProcessor {
         dst_port: u16,
         timestamp_micros: i64,
         is_answer: bool,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let records = queries
+    ) -> Vec<ProcessedDnsRecord> {
+        queries
             .iter()
             .take(if is_answer { 1 } else { usize::MAX })
             .map(|query| {
@@ -290,37 +325,52 @@ impl DnsProcessor {
                     response_code,
                 }
             })
-            .collect::<Vec<ProcessedDnsRecord>>();
-
-        Ok(records)
+            .collect::<Vec<ProcessedDnsRecord>>()
     }
 
     fn decode_dns_questions(
         &self,
         dns_data: &[u8],
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DecodeErrorKind> {
         if self.dns_wire_fast_path {
-            Self::decode_dns_questions_fast(dns_data)
-                .or_else(|_| Self::decode_dns_questions_hickory(dns_data))
+            match Self::decode_dns_questions_fast(dns_data) {
+                Ok(decoded) => Ok(decoded),
+                Err(fast_error) => {
+                    Self::decode_dns_questions_hickory(dns_data).map_err(|fallback_error| {
+                        if let DecodeErrorKind::DnsNameError(kind) = fast_error {
+                            DecodeErrorKind::DnsNameError(kind)
+                        } else {
+                            fallback_error
+                        }
+                    })
+                }
+            }
         } else {
             Self::decode_dns_questions_hickory(dns_data)
+                .map_err(|error| Self::classify_hickory_decode_failure(dns_data, error))
+        }
+    }
+
+    fn classify_hickory_decode_failure(
+        dns_data: &[u8],
+        fallback_error: DecodeErrorKind,
+    ) -> DecodeErrorKind {
+        match Self::decode_dns_questions_fast(dns_data) {
+            Err(DecodeErrorKind::DnsNameError(kind)) => DecodeErrorKind::DnsNameError(kind),
+            _ => fallback_error,
         }
     }
 
     fn decode_dns_questions_fast(
         dns_data: &[u8],
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DecodeErrorKind> {
         if dns_data.len() < DNS_HEADER_LEN {
-            return Err("DNS data too short");
+            return Err(DecodeErrorKind::DnsDecodeError);
         }
 
-        let id = Self::parse_u16_at(dns_data, 0, "Failed to parse DNS header")?;
-        let flags = Self::parse_u16_at(dns_data, 2, "Failed to parse DNS header")?;
-        let query_count = usize::from(Self::parse_u16_at(
-            dns_data,
-            4,
-            "Failed to parse DNS question count",
-        )?);
+        let id = Self::parse_u16_at_decode(dns_data, 0)?;
+        let flags = Self::parse_u16_at_decode(dns_data, 2)?;
+        let query_count = usize::from(Self::parse_u16_at_decode(dns_data, 4)?);
         let header = DecodedDnsHeader {
             id,
             response_code: HickoryResponseCode::from(0, (flags & 0x000f) as u8),
@@ -330,13 +380,9 @@ impl DnsProcessor {
         let mut queries = Vec::with_capacity(query_count);
         for _ in 0..query_count {
             let name = Self::read_wire_domain_name(dns_data, &mut cursor)?;
-            let query_type = HickoryRecordType::from(Self::parse_u16_at(
-                dns_data,
-                cursor,
-                "DNS question truncated",
-            )?);
+            let query_type = HickoryRecordType::from(Self::parse_u16_at_decode(dns_data, cursor)?);
             cursor += 2;
-            let _query_class = Self::parse_u16_at(dns_data, cursor, "DNS question truncated")?;
+            let _query_class = Self::parse_u16_at_decode(dns_data, cursor)?;
             cursor += 2;
 
             queries.push(DecodedDnsQuestion { name, query_type });
@@ -347,11 +393,11 @@ impl DnsProcessor {
 
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DecodeErrorKind> {
         let mut decoder = BinDecoder::new(dns_data);
-        let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
+        let header = Header::read(&mut decoder).map_err(|_| DecodeErrorKind::DnsDecodeError)?;
         let queries = Message::read_queries(&mut decoder, header.query_count() as usize)
-            .map_err(|_| "Failed to parse DNS questions")?;
+            .map_err(|_| DecodeErrorKind::DnsDecodeError)?;
 
         Ok((
             DecodedDnsHeader {
@@ -371,7 +417,7 @@ impl DnsProcessor {
     fn read_wire_domain_name(
         dns_data: &[u8],
         cursor: &mut usize,
-    ) -> Result<DnsNameBuf, &'static str> {
+    ) -> Result<DnsNameBuf, DecodeErrorKind> {
         let mut output = DnsNameBuf::default();
         let mut position = *cursor;
         let mut resume_position = None;
@@ -379,13 +425,15 @@ impl DnsProcessor {
         let mut jump_count = 0;
 
         loop {
-            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
+            let length = *dns_data.get(position).ok_or(DecodeErrorKind::DnsNameError(
+                DnsNameErrorKind::NameTruncated,
+            ))?;
 
             match length {
                 0 => {
                     position += 1;
                     if !wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
+                        return Err(DecodeErrorKind::DnsNameError(DnsNameErrorKind::NameTooLong));
                     }
 
                     *cursor = resume_position.unwrap_or(position);
@@ -394,12 +442,16 @@ impl DnsProcessor {
                 _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
                     let next = *dns_data
                         .get(position + 1)
-                        .ok_or("DNS compression pointer truncated")?;
+                        .ok_or(DecodeErrorKind::DnsNameError(
+                            DnsNameErrorKind::CompressionPointerTruncated,
+                        ))?;
                     let offset =
                         (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
 
                     if offset >= dns_data.len() {
-                        return Err("DNS compression pointer out of bounds");
+                        return Err(DecodeErrorKind::DnsNameError(
+                            DnsNameErrorKind::CompressionPointerOutOfBounds,
+                        ));
                     }
 
                     if resume_position.is_none() {
@@ -408,25 +460,29 @@ impl DnsProcessor {
 
                     jump_count += 1;
                     if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err("DNS compression pointer loop");
+                        return Err(DecodeErrorKind::DnsNameError(
+                            DnsNameErrorKind::CompressionPointerLoop,
+                        ));
                     }
 
                     position = offset;
                 }
                 _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err("Unsupported DNS label encoding");
+                    return Err(DecodeErrorKind::DnsNameError(
+                        DnsNameErrorKind::UnsupportedLabelEncoding,
+                    ));
                 }
                 _ => {
                     let label_len = usize::from(length);
-                    let label = dns_data
-                        .get(position + 1..position + 1 + label_len)
-                        .ok_or("DNS label truncated")?;
+                    let label = dns_data.get(position + 1..position + 1 + label_len).ok_or(
+                        DecodeErrorKind::DnsNameError(DnsNameErrorKind::LabelTruncated),
+                    )?;
 
                     if wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
+                        return Err(DecodeErrorKind::DnsNameError(DnsNameErrorKind::NameTooLong));
                     }
                     if !Self::write_label_ascii(label, &mut output) {
-                        return Err("DNS name too long");
+                        return Err(DecodeErrorKind::DnsNameError(DnsNameErrorKind::NameTooLong));
                     }
 
                     wrote_label = true;
@@ -439,6 +495,14 @@ impl DnsProcessor {
     #[inline]
     fn parse_u16(data: &[u8], offset: usize) -> Result<u16, &'static str> {
         Self::parse_u16_at(data, offset, "Failed to parse transport header")
+    }
+
+    #[inline]
+    fn parse_u16_at_decode(data: &[u8], offset: usize) -> Result<u16, DecodeErrorKind> {
+        let bytes = data
+            .get(offset..offset + 2)
+            .ok_or(DecodeErrorKind::DnsDecodeError)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     #[inline]
@@ -457,7 +521,7 @@ impl DnsProcessor {
         match ethertype {
             ETHER_TYPE_IPV4 => Self::extract_udp_dns_from_ipv4(payload, ETHERNET_HEADER_LEN),
             ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, ETHERNET_HEADER_LEN),
-            _ => Ok(None),
+            _ => Err("Unsupported Ethernet encapsulation"),
         }
     }
 
@@ -542,13 +606,6 @@ impl DnsProcessor {
         let dst_port = Self::parse_u16(data, 2)?;
         if !(src_port == DNS_PORT || dst_port == DNS_PORT) {
             return Ok(None);
-        }
-
-        let dns_data = data
-            .get(UDP_HEADER_LEN..)
-            .ok_or("Failed to parse UDP packet")?;
-        if dns_data.len() < DNS_HEADER_LEN {
-            return Err("DNS data too short");
         }
 
         let dns_offset = l4_offset

@@ -8,7 +8,7 @@
 use crate::config::{AppConfig, InputSource, OutputFormat, ReportFormat};
 use crate::dns_processor::{DnsProcessor, ProcessingCounters};
 use crate::error::{AppRunError, OutputError};
-use crate::output::OutputMessage;
+use crate::output::{OutputMessage, WriterShutdownSummary};
 use crate::packet_parser::{NonMonotonicTimestampSample, PacketParser};
 use crate::pipeio::BrokenPipeTolerantWriter;
 use crate::{output, runtime};
@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 use tracing::info;
+
+#[cfg(test)]
+use crate::dns_processor::DnsNameErrorCounters;
 
 fn processing_mode_info() {
     info!("Processing mode: forward sorting with response-query matching");
@@ -55,16 +58,17 @@ fn packets_per_second(packet_count: usize, processing_completed_seconds: f64) ->
 
 fn finalize_output_shutdown(
     shutdown_result: Result<(), crossbeam::channel::SendError<OutputMessage>>,
-    writer_result: Result<(), OutputError>,
-) -> Result<(), OutputError> {
+    writer_result: Result<WriterShutdownSummary, OutputError>,
+) -> Result<WriterShutdownSummary, OutputError> {
     if matches!(writer_result, Err(OutputError::DownstreamClosed)) {
-        return Ok(());
+        return Ok(WriterShutdownSummary::default());
     }
 
-    writer_result?;
+    let writer_summary = writer_result?;
     shutdown_result.map_err(|source| OutputError::OutputControlSend {
         source: Box::new(source),
-    })
+    })?;
+    Ok(writer_summary)
 }
 
 #[must_use]
@@ -195,6 +199,23 @@ struct RunWarningsSummary {
 #[derive(Serialize)]
 struct RunMetricsSummary {
     total_packets_processed: usize,
+    dropped_packets: usize,
+    routed_non_dns: usize,
+    unsupported_encapsulation: usize,
+    decode_errors: usize,
+    dns_decode_error: usize,
+    dns_name_error: usize,
+    dns_name_truncated: usize,
+    dns_name_too_long: usize,
+    dns_name_compression_pointer_truncated: usize,
+    dns_name_compression_pointer_out_of_bounds: usize,
+    dns_name_compression_pointer_loop: usize,
+    dns_name_unsupported_label_encoding: usize,
+    dns_name_label_truncated: usize,
+    dropped_on_shutdown: usize,
+    shutdown_record_losses: usize,
+    skipped_finalization_records_on_shutdown: usize,
+    discarded_output_tail_records_on_shutdown: usize,
     total_dns_queries_processed: usize,
     deduplicated_duplicate_queries: usize,
     total_dns_responses_processed: usize,
@@ -346,6 +367,31 @@ fn build_run_summary(
         },
         metrics: RunMetricsSummary {
             total_packets_processed: counters.total_packets_processed,
+            dropped_packets: counters.dropped_packets(),
+            routed_non_dns: counters.routed_non_dns,
+            unsupported_encapsulation: counters.unsupported_encapsulation,
+            decode_errors: counters.decode_errors(),
+            dns_decode_error: counters.dns_decode_error,
+            dns_name_error: counters.dns_name_error(),
+            dns_name_truncated: counters.dns_name_errors.name_truncated,
+            dns_name_too_long: counters.dns_name_errors.name_too_long,
+            dns_name_compression_pointer_truncated: counters
+                .dns_name_errors
+                .compression_pointer_truncated,
+            dns_name_compression_pointer_out_of_bounds: counters
+                .dns_name_errors
+                .compression_pointer_out_of_bounds,
+            dns_name_compression_pointer_loop: counters.dns_name_errors.compression_pointer_loop,
+            dns_name_unsupported_label_encoding: counters
+                .dns_name_errors
+                .unsupported_label_encoding,
+            dns_name_label_truncated: counters.dns_name_errors.label_truncated,
+            dropped_on_shutdown: counters.dropped_on_shutdown,
+            shutdown_record_losses: counters.shutdown_record_losses(),
+            skipped_finalization_records_on_shutdown: counters
+                .skipped_finalization_records_on_shutdown,
+            discarded_output_tail_records_on_shutdown: counters
+                .discarded_output_tail_records_on_shutdown,
             total_dns_queries_processed: counters.dns_query_count,
             deduplicated_duplicate_queries: counters.duplicated_query_count,
             total_dns_responses_processed: counters.dns_response_count,
@@ -375,6 +421,125 @@ fn display_text_summary(summary: &RunSummary) {
         summary
             .metrics
             .total_packets_processed
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Dropped packets (packet-level): {}",
+        summary
+            .metrics
+            .dropped_packets
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Routed non-DNS packets: {}",
+        summary
+            .metrics
+            .routed_non_dns
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Unsupported encapsulation drops: {}",
+        summary
+            .metrics
+            .unsupported_encapsulation
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Decode errors: {}",
+        summary
+            .metrics
+            .decode_errors
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS decode errors: {}",
+        summary
+            .metrics
+            .dns_decode_error
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS name errors: {}",
+        summary
+            .metrics
+            .dns_name_error
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS name truncated errors: {}",
+        summary
+            .metrics
+            .dns_name_truncated
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS name too long errors: {}",
+        summary
+            .metrics
+            .dns_name_too_long
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS compression pointer truncated errors: {}",
+        summary
+            .metrics
+            .dns_name_compression_pointer_truncated
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS compression pointer out of bounds errors: {}",
+        summary
+            .metrics
+            .dns_name_compression_pointer_out_of_bounds
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS compression pointer loop errors: {}",
+        summary
+            .metrics
+            .dns_name_compression_pointer_loop
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS unsupported label encoding errors: {}",
+        summary
+            .metrics
+            .dns_name_unsupported_label_encoding
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "DNS label truncated errors: {}",
+        summary
+            .metrics
+            .dns_name_label_truncated
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Dropped on shutdown: {}",
+        summary
+            .metrics
+            .dropped_on_shutdown
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Shutdown record losses: {}",
+        summary
+            .metrics
+            .shutdown_record_losses
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Skipped finalization records on shutdown: {}",
+        summary
+            .metrics
+            .skipped_finalization_records_on_shutdown
+            .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "Discarded output tail records on shutdown: {}",
+        summary
+            .metrics
+            .discarded_output_tail_records_on_shutdown
             .to_formatted_string(&Locale::en)
     );
     info!(
@@ -535,7 +700,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let mut packet_parser = PacketParser::new(&args.input_source, args.monotonic_capture)
         .map_err(|source| AppRunError::PacketParserInit { source })?;
 
-    let counters = DnsProcessor::dns_processing_loop(
+    let mut counters = DnsProcessor::dns_processing_loop(
         dns_processor,
         &mut packet_parser,
         &packet_count,
@@ -569,7 +734,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let writer_result = writer_thread
         .join()
         .map_err(|e| OutputError::WriterThreadPanic(format!("{:?}", e)))?;
-    finalize_output_shutdown(shutdown_result, writer_result)?;
+    let writer_summary = finalize_output_shutdown(shutdown_result, writer_result)?;
+    if termination.graceful_signal_shutdown() {
+        counters.discarded_output_tail_records_on_shutdown =
+            writer_summary.discarded_output_tail_records;
+    }
 
     if matches!(termination, RunTermination::DownstreamClosed) {
         return Ok(());
@@ -673,7 +842,8 @@ mod tests {
         drop(rx);
 
         let shutdown_result = tx.send(OutputMessage::Shutdown);
-        let result = finalize_output_shutdown(shutdown_result, Ok(()));
+        let result =
+            finalize_output_shutdown(shutdown_result, Ok(WriterShutdownSummary::default()));
 
         assert!(matches!(result, Err(OutputError::OutputControlSend { .. })));
     }
@@ -684,9 +854,10 @@ mod tests {
         drop(rx);
 
         let shutdown_result = tx.send(OutputMessage::Shutdown);
-        let result = finalize_output_shutdown(shutdown_result, Err(OutputError::DownstreamClosed));
+        let result = finalize_output_shutdown(shutdown_result, Err(OutputError::DownstreamClosed))
+            .expect("downstream closed is treated as success");
 
-        assert!(result.is_ok());
+        assert_eq!(result, WriterShutdownSummary::default());
     }
 
     #[test]
@@ -904,6 +1075,56 @@ mod tests {
         assert_eq!(summary.metrics.timed_out_queries, 2);
         assert!((summary.metrics.timed_out_query_ratio - 0.2).abs() < f64::EPSILON);
         assert_eq!(summary.metrics.average_matched_rtt_ms, Some(2.0));
+    }
+
+    #[test]
+    fn run_summary_reports_drop_counters_and_derived_aggregates() {
+        let config = test_config();
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters {
+                total_packets_processed: 10,
+                routed_non_dns: 3,
+                unsupported_encapsulation: 2,
+                dns_decode_error: 4,
+                dns_name_errors: DnsNameErrorCounters {
+                    compression_pointer_loop: 1,
+                    ..DnsNameErrorCounters::default()
+                },
+                dropped_on_shutdown: 5,
+                skipped_finalization_records_on_shutdown: 7,
+                discarded_output_tail_records_on_shutdown: 2,
+                ..ProcessingCounters::default()
+            },
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+
+        assert_eq!(summary.metrics.total_packets_processed, 10);
+        assert_eq!(summary.metrics.decode_errors, 5);
+        assert_eq!(summary.metrics.dropped_packets, 15);
+        assert_eq!(summary.metrics.routed_non_dns, 3);
+        assert_eq!(summary.metrics.unsupported_encapsulation, 2);
+        assert_eq!(summary.metrics.dns_decode_error, 4);
+        assert_eq!(summary.metrics.dns_name_error, 1);
+        assert_eq!(summary.metrics.dns_name_compression_pointer_loop, 1);
+        assert_eq!(summary.metrics.dns_name_truncated, 0);
+        assert_eq!(summary.metrics.dns_name_too_long, 0);
+        assert_eq!(summary.metrics.dns_name_compression_pointer_truncated, 0);
+        assert_eq!(
+            summary.metrics.dns_name_compression_pointer_out_of_bounds,
+            0
+        );
+        assert_eq!(summary.metrics.dns_name_unsupported_label_encoding, 0);
+        assert_eq!(summary.metrics.dns_name_label_truncated, 0);
+        assert_eq!(summary.metrics.dropped_on_shutdown, 5);
+        assert_eq!(summary.metrics.shutdown_record_losses, 9);
+        assert_eq!(summary.metrics.skipped_finalization_records_on_shutdown, 7);
+        assert_eq!(summary.metrics.discarded_output_tail_records_on_shutdown, 2);
     }
 
     struct BrokenPipeJsonSink {
