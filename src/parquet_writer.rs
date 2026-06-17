@@ -279,7 +279,7 @@ mod tests {
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -317,7 +317,7 @@ mod tests {
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         drop(tx);
 
@@ -360,7 +360,7 @@ mod tests {
         .expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -395,7 +395,7 @@ mod tests {
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Abort).expect("abort is sent");
 
@@ -437,7 +437,7 @@ mod tests {
         record.response_timestamp = None;
         record.response_code = None;
 
-        tx.send(OutputMessage::Record(record))
+        tx.send(OutputMessage::Records(vec![record]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 

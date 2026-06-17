@@ -20,8 +20,9 @@ use super::DnsProcessor;
 use super::parser::{CanonicalFlowKey, ParsedUdpDnsMeta};
 use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
-use crate::output::OutputMessage;
+use crate::output::{OutputMessage, OutputRecordBatches};
 use crate::packet_parser::{PacketBatch, PacketData, PacketParser, sort_packet_batch};
+use crate::record::DnsRecord;
 
 const BATCH_PREFETCH_DEPTH: usize = 2;
 const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
@@ -84,11 +85,11 @@ impl PipelineCounters {
             return false;
         }
 
-        for record in shard_result.output_records {
-            if !emit_record(tx, record, output_closed) {
-                self.output_channel_open = false;
-                return false;
-            }
+        if !shard_result.output_records.is_empty()
+            && !emit_record_batches(tx, shard_result.output_records, output_closed)
+        {
+            self.output_channel_open = false;
+            return false;
         }
 
         true
@@ -260,16 +261,28 @@ fn stop_requested(shutdown_requested: &AtomicBool, output_closed: &AtomicBool) -
     shutdown_requested.load(AtomicOrdering::SeqCst) || output_closed.load(AtomicOrdering::Relaxed)
 }
 
-fn emit_record(
+fn emit_record_batches(
     tx: &Sender<OutputMessage>,
-    record: crate::record::DnsRecord,
+    batches: OutputRecordBatches,
     output_closed: &AtomicBool,
 ) -> bool {
+    batches
+        .into_batch_iter()
+        .all(|batch| send_record_batch(tx, batch, output_closed))
+}
+
+fn send_record_batch(
+    tx: &Sender<OutputMessage>,
+    records: Vec<DnsRecord>,
+    output_closed: &AtomicBool,
+) -> bool {
+    debug_assert!(!records.is_empty());
+
     if output_closed.load(AtomicOrdering::Relaxed) {
         return false;
     }
 
-    if tx.send(OutputMessage::Record(record)).is_err() {
+    if tx.send(OutputMessage::Records(records)).is_err() {
         output_closed.store(true, AtomicOrdering::Relaxed);
         return false;
     }
@@ -331,7 +344,7 @@ fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardPr
     merged.timeout_query_count += shard_result.timeout_query_count;
     merged.matched_rtt_sum_micros += shard_result.matched_rtt_sum_micros;
     merged.out_of_order_combined_count += shard_result.out_of_order_combined_count;
-    merged.output_records.extend(shard_result.output_records);
+    merged.output_records.append(shard_result.output_records);
 }
 
 fn routed_shard_capacity_hint(packet_count: usize, shard_count: usize) -> usize {
@@ -882,7 +895,7 @@ impl DnsProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::InputSource;
+    use crate::config::{InputSource, OUTPUT_RECORD_BATCH_SIZE};
     use crate::packet_parser::PacketParser;
     use crate::test_support::{
         classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
@@ -1109,9 +1122,9 @@ mod tests {
 
         let output_records = output_rx
             .try_iter()
-            .filter_map(|message| match message {
-                OutputMessage::Record(record) => Some(record),
-                _ => None,
+            .flat_map(|message| match message {
+                OutputMessage::Records(records) => records,
+                _ => Vec::new(),
             })
             .collect::<Vec<_>>();
         assert_eq!(output_records.len(), 1);
@@ -1209,7 +1222,10 @@ mod tests {
         assert!(!counters.absorb(
             &output_tx,
             ShardProcessingResult {
-                output_records: vec![test_dns_record(), test_dns_record()],
+                output_records: OutputRecordBatches::from_records(vec![
+                    test_dns_record(),
+                    test_dns_record(),
+                ]),
                 dns_query_count: 1,
                 ..Default::default()
             },
@@ -1218,7 +1234,7 @@ mod tests {
         assert!(!counters.absorb(
             &output_tx,
             ShardProcessingResult {
-                output_records: vec![test_dns_record()],
+                output_records: OutputRecordBatches::from_records(vec![test_dns_record()]),
                 timeout_query_count: 2,
                 ..Default::default()
             },
@@ -1229,5 +1245,81 @@ mod tests {
         assert!(output_closed.load(AtomicOrdering::Relaxed));
         assert_eq!(counters.dns_query_count, 1);
         assert_eq!(counters.timeout_query_count, 2);
+    }
+
+    #[test]
+    fn output_record_batches_chunk_large_record_vectors() {
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let output_closed = AtomicBool::new(false);
+        let records = (0..=OUTPUT_RECORD_BATCH_SIZE)
+            .map(|idx| {
+                let mut record = test_dns_record();
+                record.id = idx as u16;
+                record
+            })
+            .collect::<Vec<_>>();
+        let output_records = OutputRecordBatches::from_records(records);
+
+        assert!(emit_record_batches(
+            &output_tx,
+            output_records,
+            &output_closed
+        ));
+        drop(output_tx);
+
+        let output_batches = output_rx
+            .try_iter()
+            .map(|message| match message {
+                OutputMessage::Records(records) => records,
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(output_batches.len(), 2);
+        assert_eq!(output_batches[0].len(), OUTPUT_RECORD_BATCH_SIZE);
+        assert_eq!(output_batches[1].len(), 1);
+        assert_eq!(output_batches[0][0].id, 0);
+        assert_eq!(
+            output_batches[0][OUTPUT_RECORD_BATCH_SIZE - 1].id,
+            (OUTPUT_RECORD_BATCH_SIZE - 1) as u16
+        );
+        assert_eq!(output_batches[1][0].id, OUTPUT_RECORD_BATCH_SIZE as u16);
+    }
+
+    #[test]
+    fn output_record_batches_pack_sparse_appends() {
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let output_closed = AtomicBool::new(false);
+        let mut output_records = OutputRecordBatches::default();
+
+        for idx in 0..8 {
+            let mut record = test_dns_record();
+            record.id = idx;
+            output_records.append(OutputRecordBatches::from_records(vec![record]));
+        }
+
+        assert!(emit_record_batches(
+            &output_tx,
+            output_records,
+            &output_closed
+        ));
+        drop(output_tx);
+
+        let output_batches = output_rx
+            .try_iter()
+            .map(|message| match message {
+                OutputMessage::Records(records) => records,
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(output_batches.len(), 1);
+        assert_eq!(
+            output_batches[0]
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
     }
 }

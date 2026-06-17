@@ -14,6 +14,7 @@ use super::types::{
     ResponseEventPayload, ResponseIdentityKey, ShardProcessingResult, Timeline, TimelineKey,
 };
 use crate::custom_types::{ProtoRecordType, ProtoResponseCode};
+use crate::output::OutputRecordBatches;
 use crate::record::DnsRecord;
 
 #[cfg(test)]
@@ -101,7 +102,7 @@ impl DnsProcessor {
         &self,
         record: &ProcessedDnsRecord,
         state: &mut MatcherShardState,
-        output_records: &mut Vec<DnsRecord>,
+        output_records: &mut OutputRecordBatches,
         dns_query_count: &mut usize,
         duplicated_query_count: &mut usize,
         matched_query_response_count: &mut usize,
@@ -148,7 +149,7 @@ impl DnsProcessor {
         &self,
         record: &ProcessedDnsRecord,
         state: &mut MatcherShardState,
-        output_records: &mut Vec<DnsRecord>,
+        output_records: &mut OutputRecordBatches,
         dns_response_count: &mut usize,
         matched_query_response_count: &mut usize,
         matched_rtt_sum_micros: &mut u64,
@@ -192,7 +193,7 @@ impl DnsProcessor {
     fn process_remaining_queries(
         &self,
         state: &mut MatcherShardState,
-        output_records: &mut Vec<DnsRecord>,
+        output_records: &mut OutputRecordBatches,
         matched_query_response_count: &mut usize,
         timeout_query_count: &mut usize,
         matched_rtt_sum_micros: &mut u64,
@@ -239,7 +240,7 @@ impl DnsProcessor {
         &self,
         state: &mut MatcherShardState,
         threshold_timestamp_micros: i64,
-        output_records: &mut Vec<DnsRecord>,
+        output_records: &mut OutputRecordBatches,
         timeout_query_count: &mut usize,
     ) {
         let query_map = &mut state.query_map;
@@ -272,7 +273,7 @@ impl DnsProcessor {
         &self,
         max_timestamp_micros: i64,
         state: &mut MatcherShardState,
-        output_records: &mut Vec<DnsRecord>,
+        output_records: &mut OutputRecordBatches,
         timeout_query_count: &mut usize,
     ) {
         let threshold_timestamp_micros =
@@ -429,7 +430,7 @@ impl DnsProcessor {
     ) -> ShardProcessingResult {
         let mut max_timestamp_micros = None;
         let mut result = ShardProcessingResult {
-            output_records: Vec::with_capacity(shard_records.len()),
+            output_records: OutputRecordBatches::with_capacity(shard_records.len()),
             ..ShardProcessingResult::default()
         };
 

@@ -32,8 +32,18 @@ pub(crate) const STAGED_PIPELINE_MIN_CPUS: usize = STAGED_PIPELINE_NON_WORKER_TH
 /// Threshold at which buffered output records are flushed to disk.
 pub(crate) const OUTPUT_FLUSH_THRESHOLD: usize = 65_536;
 
+/// Maximum number of DNS records carried by one output channel data message.
+pub(crate) const OUTPUT_RECORD_BATCH_SIZE: usize = 1_024;
+
+/// Default number of DNS records allowed to queue between processing and writers.
+pub(crate) const DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG: usize = OUTPUT_FLUSH_THRESHOLD * 2;
+
 /// Safe default capacity for the handoff channel between processing and writers.
-pub(crate) const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = OUTPUT_FLUSH_THRESHOLD * 2;
+///
+/// The channel carries batched record messages, so this is expressed in message slots. The
+/// corresponding record backlog remains `DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG`.
+pub(crate) const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize =
+    DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG / OUTPUT_RECORD_BATCH_SIZE;
 
 /// Stack size for Rayon worker threads in release builds.
 pub(crate) const WORKER_STACK_SIZE_MB: usize = 16;
@@ -227,9 +237,17 @@ impl AppConfig {
         self.anonymize.as_deref()
     }
 
-    pub(crate) fn output_channel_capacity(&self) -> usize {
+    pub(crate) fn output_channel_message_capacity(&self) -> usize {
         if self.bonded == 0 {
             DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        } else {
+            self.bonded.div_ceil(OUTPUT_RECORD_BATCH_SIZE).max(1)
+        }
+    }
+
+    pub(crate) fn output_channel_record_capacity(&self) -> usize {
+        if self.bonded == 0 {
+            DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG
         } else {
             self.bonded
         }
@@ -273,8 +291,12 @@ mod tests {
         let config = test_config();
 
         assert_eq!(
-            config.output_channel_capacity(),
+            config.output_channel_message_capacity(),
             DEFAULT_OUTPUT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            config.output_channel_record_capacity(),
+            DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG
         );
         assert!(config.uses_default_output_channel_capacity());
     }
@@ -284,7 +306,8 @@ mod tests {
         let mut config = test_config();
         config.bonded = 4096;
 
-        assert_eq!(config.output_channel_capacity(), 4096);
+        assert_eq!(config.output_channel_message_capacity(), 4);
+        assert_eq!(config.output_channel_record_capacity(), 4096);
         assert!(!config.uses_default_output_channel_capacity());
     }
 
