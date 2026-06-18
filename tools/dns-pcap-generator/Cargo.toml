@@ -2,13 +2,13 @@
 name = "dns-pcap-generator"
 version = "0.21.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.96.0"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 pcap-file = "3.0.0-rc1"
 seahash = "4.1.0"
 serde = { version = "1.0", features = ["derive"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 thiserror = "2.0"
-toml = "1.1.0"
+toml = "1.1.2"

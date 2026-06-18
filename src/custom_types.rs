@@ -5,8 +5,8 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 use arrayvec::ArrayString;
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
-use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
+use hickory_proto::op::ResponseCode as HickoryResponseCode;
+use hickory_proto::rr::RecordType as HickoryRecordType;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::fmt;

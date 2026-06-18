@@ -163,9 +163,14 @@ fi
 mkdir -p "$out_root"
 metrics_file="$out_root/metrics.csv"
 metadata_file="$out_root/metadata.txt"
+rustc_version="$(rustc -V 2>/dev/null || true)"
+rustc_verbose="$(rustc -Vv 2>/dev/null || true)"
+rustc_verbose="${rustc_verbose//$'\n'/; }"
 printf 'profile,format,threads,bonded,run,silent,metric_mode,git_sha,bin_path,wall_seconds,processing_speed_pps,final_write_seconds,exit_code,log_file,output_file\n' > "$metrics_file"
 cat > "$metadata_file" <<EOF
 git_sha=$git_sha
+rustc_version=${rustc_version:-unavailable}
+rustc_verbose=${rustc_verbose:-unavailable}
 pcap_path=$pcap_path
 profile=$profile
 bin_path=$bin_path

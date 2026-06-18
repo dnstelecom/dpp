@@ -6,8 +6,8 @@
  */
 
 use arrayvec::ArrayVec;
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
-use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
+use hickory_proto::op::ResponseCode as HickoryResponseCode;
+use hickory_proto::rr::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
 use std::mem;
 use std::net::IpAddr;

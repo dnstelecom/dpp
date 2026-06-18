@@ -28,6 +28,7 @@ This directory is the canonical location for repeatable performance measurements
 - whether the run used `--silent`
 - whether the row contains full metrics or wall-clock-only metrics
 - current git SHA and benchmarked binary path
+- `rustc` version and verbose compiler metadata in `metadata.txt`
 - total wall-clock time
 - processing speed parsed from application logs
 - final writer shutdown tail parsed from application logs

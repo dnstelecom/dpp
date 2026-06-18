@@ -24,6 +24,8 @@ Exactly one allocator feature must be enabled at build time.
 
 ## Build Matrix
 
+Requires Rust 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+
 Build each variant into a separate binary path.
 
 ```bash

@@ -2,7 +2,7 @@
 name = "dns-catalog-builder"
 version = "0.21.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.96.0"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

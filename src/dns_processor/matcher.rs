@@ -5,7 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
+use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use std::collections::BTreeMap;
 
 use super::DnsProcessor;

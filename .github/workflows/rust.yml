@@ -36,8 +36,8 @@ jobs:
       - name: Install PCAP lib (only on Linux)
         run: sudo apt-get install -y libpcap-dev
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust 1.96.0
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Get package version
         id: cargo-version

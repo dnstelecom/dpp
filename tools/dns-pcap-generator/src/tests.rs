@@ -5,7 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use crate::artifact::load_profile_dir as load_profile_dir_artifact;
+use crate::artifact::{load_profile_dir as load_profile_dir_artifact, sha256_hex};
 use crate::catalog::load_catalog;
 use crate::cli::{Cli, GeneratorConfig};
 use crate::error::Error;
@@ -54,7 +54,7 @@ fn temp_profile_dir(name: &str) -> PathBuf {
 fn write_profile_fixture(dir: &std::path::Path) {
     let catalog_bytes = b"10\texample.com\n8\twww.example.org\n";
     fs::write(dir.join("catalog_data.tsv"), catalog_bytes).expect("catalog fixture written");
-    let catalog_sha256 = format!("{:x}", Sha256::digest(catalog_bytes));
+    let catalog_sha256 = sha256_hex(Sha256::digest(catalog_bytes));
     fs::write(
         dir.join("fitted-generator.toml"),
         format!(
@@ -301,10 +301,7 @@ fn profile_dir_loader_applies_fitted_defaults() {
 fn profile_dir_loader_rejects_catalog_hash_mismatch() {
     let dir = temp_profile_dir("catalog-hash-mismatch");
     write_profile_fixture(&dir);
-    let catalog_sha256 = format!(
-        "{:x}",
-        Sha256::digest(b"10\texample.com\n8\twww.example.org\n")
-    );
+    let catalog_sha256 = sha256_hex(Sha256::digest(b"10\texample.com\n8\twww.example.org\n"));
 
     let fitted_path = dir.join("fitted-generator.toml");
     let fitted = fs::read_to_string(&fitted_path).expect("fitted profile read");

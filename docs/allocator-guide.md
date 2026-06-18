@@ -30,6 +30,8 @@ Invalid feature combinations fail the build explicitly.
 
 ## Build Commands
 
+Requires Rust 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+
 Default allocator build:
 
 ```bash
