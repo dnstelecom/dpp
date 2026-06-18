@@ -2,7 +2,7 @@
 
 [package]
 name = "dpp"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96.0"
 build = "build.rs"  # Custom build script to include version information from git
