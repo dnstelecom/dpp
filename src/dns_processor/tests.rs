@@ -53,6 +53,50 @@ fn expected_formatted_name(name: &Name) -> DnsNameBuf {
     DnsNameBuf::new(formatted).unwrap_or_default()
 }
 
+fn append_example_query(dns_payload: &mut Vec<u8>) {
+    dns_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+}
+
+fn append_a_resource_record(
+    dns_payload: &mut Vec<u8>,
+    owner_name: &[u8],
+    ttl: u32,
+    address: [u8; 4],
+) {
+    dns_payload.extend_from_slice(owner_name);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&ttl.to_be_bytes());
+    dns_payload.extend_from_slice(&4_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&address);
+}
+
+fn edns_extended_rcode_response_payload(extended_high: u8, low_rcode: u8) -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&(0x8180_u16 | u16::from(low_rcode & 0x0f)).to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&2_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 60, [1, 2, 3, 4]);
+    append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 30, [5, 6, 7, 8]);
+
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&41_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&[extended_high, 0, 0, 0]);
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+
+    dns_payload
+}
+
 fn test_shard_state() -> MatcherShardState {
     MatcherShardState::default()
 }
@@ -731,26 +775,71 @@ fn parser_decodes_multiple_wire_questions_including_compression() {
 
 #[test]
 fn parser_decodes_response_code_from_wire_header() {
-    let processor = test_processor_with_dns_wire_fast_path();
     let mut dns_payload = encode_dns_header(0xBEEF, 0x8183, 1);
-    dns_payload.extend_from_slice(&[
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
-    ]);
-    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
-    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    append_example_query(&mut dns_payload);
 
     let packet =
         make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload);
 
-    let records = processor
-        .process_packet_batch(&packet, 1_234_567)
-        .expect("packet parses");
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let records = processor
+            .process_packet_batch(&packet, 1_234_567)
+            .expect("packet parses");
 
-    assert_eq!(records.len(), 1);
-    assert!(!records[0].is_query);
-    assert_eq!(records[0].id, 0xBEEF);
-    assert_eq!(records[0].name.as_str(), "example.com");
-    assert_eq!(records[0].response_code, HickoryResponseCode::NXDomain);
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert!(!records[0].is_query, "fast_path={fast_path}");
+        assert_eq!(records[0].id, 0xBEEF, "fast_path={fast_path}");
+        assert_eq!(
+            records[0].name.as_str(),
+            "example.com",
+            "fast_path={fast_path}"
+        );
+        assert_eq!(
+            records[0].response_code,
+            HickoryResponseCode::NXDomain,
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_decodes_edns_extended_response_code_from_opt_rr() {
+    for (extended_high, low_rcode, expected_code) in [(1, 0, 16), (2, 3, 35)] {
+        let dns_payload = edns_extended_rcode_response_payload(extended_high, low_rcode);
+        let packet =
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload);
+
+        for (fast_path, processor) in [
+            (false, test_processor()),
+            (true, test_processor_with_dns_wire_fast_path()),
+        ] {
+            let records = processor
+                .process_packet_batch(&packet, 1_234_567)
+                .expect("packet parses");
+
+            assert_eq!(records.len(), 1, "fast_path={fast_path}");
+            assert!(!records[0].is_query, "fast_path={fast_path}");
+            assert_eq!(records[0].id, 0xBEEF, "fast_path={fast_path}");
+            assert_eq!(
+                records[0].name.as_str(),
+                "example.com",
+                "fast_path={fast_path}"
+            );
+            assert_eq!(
+                records[0].query_type,
+                HickoryRecordType::A,
+                "fast_path={fast_path}"
+            );
+            assert_eq!(
+                u16::from(records[0].response_code),
+                expected_code,
+                "fast_path={fast_path}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -32,6 +32,8 @@ const DNS_POINTER_MASK: u8 = 0b1100_0000;
 const DNS_POINTER_TAG: u8 = 0b1100_0000;
 const DNS_LABEL_LEN_MASK: u8 = 0b0011_1111;
 const DNS_COMPRESSION_JUMP_LIMIT: usize = 32;
+const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
+const DNS_OPT_RECORD_TYPE: u16 = 41;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalFlowKey {
@@ -94,6 +96,19 @@ struct DecodedDnsHeader {
 struct DecodedDnsQuestion {
     name: DnsNameBuf,
     query_type: HickoryRecordType,
+}
+
+#[derive(Clone, Copy)]
+struct DnsSectionCounts {
+    answers: usize,
+    authorities: usize,
+    additionals: usize,
+}
+
+struct DnsResourceRecordMeta {
+    owner_is_root: bool,
+    record_type: u16,
+    ttl: u32,
 }
 
 impl DnsProcessor {
@@ -238,7 +253,8 @@ impl DnsProcessor {
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
     ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let (header, queries) = self.decode_dns_questions(meta.dns_data(data)?)?;
+        let (header, queries) =
+            self.decode_dns_questions(meta.dns_data(data)?, meta.is_response)?;
 
         self.build_dns_records(
             &header,
@@ -298,17 +314,19 @@ impl DnsProcessor {
     fn decode_dns_questions(
         &self,
         dns_data: &[u8],
+        decode_extended_rcode: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
         if self.dns_wire_fast_path {
-            Self::decode_dns_questions_fast(dns_data)
-                .or_else(|_| Self::decode_dns_questions_hickory(dns_data))
+            Self::decode_dns_questions_fast(dns_data, decode_extended_rcode)
+                .or_else(|_| Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode))
         } else {
-            Self::decode_dns_questions_hickory(dns_data)
+            Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode)
         }
     }
 
     fn decode_dns_questions_fast(
         dns_data: &[u8],
+        decode_extended_rcode: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
         if dns_data.len() < DNS_HEADER_LEN {
             return Err("DNS data too short");
@@ -316,15 +334,12 @@ impl DnsProcessor {
 
         let id = Self::parse_u16_at(dns_data, 0, "Failed to parse DNS header")?;
         let flags = Self::parse_u16_at(dns_data, 2, "Failed to parse DNS header")?;
+        let low_response_code = (flags & 0x000f) as u8;
         let query_count = usize::from(Self::parse_u16_at(
             dns_data,
             4,
             "Failed to parse DNS question count",
         )?);
-        let header = DecodedDnsHeader {
-            id,
-            response_code: HickoryResponseCode::from(0, (flags & 0x000f) as u8),
-        };
 
         let mut cursor = DNS_HEADER_LEN;
         let mut queries = Vec::with_capacity(query_count);
@@ -341,22 +356,65 @@ impl DnsProcessor {
 
             queries.push(DecodedDnsQuestion { name, query_type });
         }
+        let mut response_code = HickoryResponseCode::from(0, low_response_code);
+        if decode_extended_rcode {
+            let additional_count = usize::from(Self::parse_u16_at(
+                dns_data,
+                10,
+                "Failed to parse DNS additional count",
+            )?);
+            if additional_count > 0 {
+                response_code = Self::decode_response_code_with_edns(
+                    dns_data,
+                    cursor,
+                    DnsSectionCounts {
+                        answers: usize::from(Self::parse_u16_at(
+                            dns_data,
+                            6,
+                            "Failed to parse DNS answer count",
+                        )?),
+                        authorities: usize::from(Self::parse_u16_at(
+                            dns_data,
+                            8,
+                            "Failed to parse DNS authority count",
+                        )?),
+                        additionals: additional_count,
+                    },
+                    low_response_code,
+                )?;
+            }
+        }
+        let header = DecodedDnsHeader { id, response_code };
 
         Ok((header, queries))
     }
 
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
+        decode_extended_rcode: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
         let mut decoder = BinDecoder::new(dns_data);
         let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
             .map_err(|_| "Failed to parse DNS questions")?;
+        let mut response_code = header.response_code;
+        if decode_extended_rcode && header.counts.additionals > 0 {
+            response_code = Self::decode_response_code_with_edns(
+                dns_data,
+                decoder.index(),
+                DnsSectionCounts {
+                    answers: header.counts.answers as usize,
+                    authorities: header.counts.authorities as usize,
+                    additionals: header.counts.additionals as usize,
+                },
+                header.response_code.low(),
+            )?;
+        }
 
         Ok((
             DecodedDnsHeader {
                 id: header.id,
-                response_code: header.response_code,
+                response_code,
             },
             queries
                 .into_iter()
@@ -366,6 +424,147 @@ impl DnsProcessor {
                 })
                 .collect(),
         ))
+    }
+
+    fn decode_response_code_with_edns(
+        dns_data: &[u8],
+        mut cursor: usize,
+        section_counts: DnsSectionCounts,
+        low_response_code: u8,
+    ) -> Result<HickoryResponseCode, &'static str> {
+        let response_code = HickoryResponseCode::from(0, low_response_code);
+
+        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.answers, true)?;
+        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.authorities, true)?;
+        match Self::read_edns_response_code_high(dns_data, &mut cursor, section_counts.additionals)?
+        {
+            Some(high_response_code) => Ok(HickoryResponseCode::from(
+                high_response_code,
+                low_response_code,
+            )),
+            None => Ok(response_code),
+        }
+    }
+
+    fn skip_dns_resource_records(
+        dns_data: &[u8],
+        cursor: &mut usize,
+        count: usize,
+        reject_opt: bool,
+    ) -> Result<(), &'static str> {
+        for _ in 0..count {
+            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
+            if reject_opt && meta.record_type == DNS_OPT_RECORD_TYPE {
+                return Err("OPT record outside additional section");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_edns_response_code_high(
+        dns_data: &[u8],
+        cursor: &mut usize,
+        additional_count: usize,
+    ) -> Result<Option<u8>, &'static str> {
+        let mut response_code_high = None;
+        for _ in 0..additional_count {
+            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
+            if meta.record_type != DNS_OPT_RECORD_TYPE {
+                continue;
+            }
+            if response_code_high.is_some() {
+                return Err("Multiple OPT records");
+            }
+            if !meta.owner_is_root {
+                return Err("OPT record owner must be root");
+            }
+
+            response_code_high = Some((meta.ttl >> 24) as u8);
+        }
+
+        Ok(response_code_high)
+    }
+
+    fn read_dns_resource_record_meta(
+        dns_data: &[u8],
+        cursor: &mut usize,
+    ) -> Result<DnsResourceRecordMeta, &'static str> {
+        let owner_is_root = Self::skip_wire_domain_name(dns_data, cursor)?;
+        let fixed_start = *cursor;
+        let fixed_end = fixed_start
+            .checked_add(DNS_RESOURCE_RECORD_FIXED_LEN)
+            .ok_or("DNS resource record truncated")?;
+        let fixed = dns_data
+            .get(fixed_start..fixed_end)
+            .ok_or("DNS resource record truncated")?;
+        let record_type = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let ttl = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+        let rdata_len = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let rdata_end = fixed_end
+            .checked_add(rdata_len)
+            .ok_or("DNS resource record truncated")?;
+        dns_data
+            .get(fixed_end..rdata_end)
+            .ok_or("DNS resource record truncated")?;
+        *cursor = rdata_end;
+
+        Ok(DnsResourceRecordMeta {
+            owner_is_root,
+            record_type,
+            ttl,
+        })
+    }
+
+    fn skip_wire_domain_name(dns_data: &[u8], cursor: &mut usize) -> Result<bool, &'static str> {
+        let start = *cursor;
+        let mut position = *cursor;
+        let mut resume_position = None;
+        let mut jump_count = 0;
+
+        loop {
+            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
+
+            match length {
+                0 => {
+                    position += 1;
+                    *cursor = resume_position.unwrap_or(position);
+                    return Ok(resume_position.is_none() && position == start + 1);
+                }
+                _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
+                    let next = *dns_data
+                        .get(position + 1)
+                        .ok_or("DNS compression pointer truncated")?;
+                    let offset =
+                        (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
+
+                    if offset >= dns_data.len() {
+                        return Err("DNS compression pointer out of bounds");
+                    }
+
+                    if resume_position.is_none() {
+                        resume_position = Some(position + 2);
+                    }
+
+                    jump_count += 1;
+                    if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
+                        return Err("DNS compression pointer loop");
+                    }
+
+                    position = offset;
+                }
+                _ if (length & DNS_POINTER_MASK) != 0 => {
+                    return Err("Unsupported DNS label encoding");
+                }
+                _ => {
+                    let label_len = usize::from(length);
+                    dns_data
+                        .get(position + 1..position + 1 + label_len)
+                        .ok_or("DNS label truncated")?;
+                    position += 1 + label_len;
+                }
+            }
+        }
     }
 
     fn read_wire_domain_name(
