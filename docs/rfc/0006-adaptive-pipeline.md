@@ -29,11 +29,13 @@ shard workers, DPP runs a **staged pipeline** with explicit thread roles:
   sequence number to preserve global ordering.
 - **Aggregator** (runs on the pipeline's parent thread) — collects results from all workers,
   reorders them by batch sequence number using a `PendingBatchBuffer`, and emits finalized
-  records to the output channel in deterministic order.
+  records to the output channel as bounded batched record messages in deterministic order.
 
 The staged pipeline uses bounded crossbeam channels between stages. Backpressure propagates
 naturally: if matcher workers fall behind, the parser blocks on send; if the output channel
-is full, the aggregator blocks.
+is full, the aggregator blocks. Output channel capacity is measured in batched record messages,
+derived from the configured queued-record backlog and the per-message record limit owned by
+runtime configuration.
 
 ### Phase-parallel pipeline (low-core hosts)
 

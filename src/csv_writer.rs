@@ -157,7 +157,7 @@ mod tests {
         let file = File::create(&filename).expect("creates csv file");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -184,7 +184,7 @@ mod tests {
         let mut record = test_dns_record();
         record.name = DnsNameBuf::new("exa,mple\"name\nwrapped\rline").expect("test name fits");
 
-        tx.send(OutputMessage::Record(record))
+        tx.send(OutputMessage::Records(vec![record]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -225,7 +225,7 @@ mod tests {
         record.response_timestamp = None;
         record.response_code = None;
 
-        tx.send(OutputMessage::Record(record))
+        tx.send(OutputMessage::Records(vec![record]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -252,7 +252,7 @@ mod tests {
         let file = File::create(&filename).expect("creates csv file");
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         drop(tx);
 
@@ -268,7 +268,7 @@ mod tests {
     fn writes_csv_to_an_in_memory_sink() {
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Shutdown).expect("shutdown is sent");
 
@@ -286,7 +286,7 @@ mod tests {
     fn drops_buffered_rows_on_abort() {
         let (tx, rx) = channel::unbounded();
 
-        tx.send(OutputMessage::Record(test_dns_record()))
+        tx.send(OutputMessage::Records(vec![test_dns_record()]))
             .expect("record is sent");
         tx.send(OutputMessage::Abort).expect("abort is sent");
 

@@ -83,7 +83,7 @@ ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/ar
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/)
+- [Rust](https://rustup.rs/) 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
 - Cargo
 - PCAP files for offline processing
 - `libpcap` development headers for fallback support on non-classic formats
@@ -196,7 +196,7 @@ Notes:
 | `--report-format <text\|json>`    | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -`    |
 | `--match-timeout-ms <MS>`         | Set the DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`            |
 | `--monotonic-capture`             | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
-| `-b, --bonded <N>`                | Set I/O channel capacity; `0` uses the safe default bounded capacity                                                |
+| `-b, --bonded <N>`                | Set I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the safe default bounded capacity |
 | `-z, --zstd`                      | Enable Zstd compression for Parquet output                                                                          |
 | `--v2`                            | Use Parquet Version 2                                                                                               |
 | `-a, --affinity`                  | Enable core affinity                                                                                                |
@@ -215,7 +215,7 @@ Notes:
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
 | `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                          |
 | `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected       |
-| `DPP_BONDED`             | I/O channel capacity; `0` uses the default bounded capacity                                                               |
+| `DPP_BONDED`             | I/O channel capacity in batched output messages; each message carries up to `1024` records; `0` uses the default bounded capacity |
 | `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
 | `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
 | `DPP_AFFINITY`           | Enable CPU affinity                                                                                                       |
@@ -352,7 +352,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.062  INFO Free memory (system reported): 2,857 MB
 04:15:01.062  INFO Starting to process PCAP file: /mnt/mirror/src/dpp/server1_jul_2024.pcap
 04:15:01.062  INFO Processing mode: forward sorting with response-query matching
-04:15:01.062  INFO IO channel: BOUNDED with 131,072 elements (default)
+04:15:01.062  INFO IO channel: BOUNDED with 128 batched messages / 131,072 records max (default)
 04:15:01.076  INFO Format is: CSV
 04:15:01.076  INFO Anonymization: False
 04:15:01.076  INFO DNS wire fast path: enabled (question-only decoder with hickory fallback)
@@ -476,7 +476,7 @@ Additional notes:
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
 - **Outer encapsulation layers:** The fast extraction path assumes Ethernet followed by IPv4 or IPv6. Captures containing VLAN, QinQ, MPLS, or similar outer encapsulation layers may require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.
-- **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks.
+- **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks because the output channel rounds the requested record backlog up to batched messages of up to `1024` records each.
 - **Monotonic-capture mode is explicit:** Batched timeout eviction is available only with `--monotonic-capture` because it depends on globally monotonic packet timestamps. If the capture is not monotonic, DPP aborts and recommends `reordercap`.
 - **Scaling ceilings on skewed workloads:** DPP auto-sizes from all available CPUs, but flow-affinity ceilings can still limit scaling before linear speedup.
 - **Duplicate query handling:** Duplicate in-flight DNS queries and responses are preserved and resolved through deterministic matcher tie-breakers derived from capture order. Duplicate-heavy workloads can still increase matcher memory usage, and Parquet output may vary byte-for-byte because writers remain asynchronous.

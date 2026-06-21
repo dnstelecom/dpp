@@ -22,6 +22,8 @@ The generator also models:
 
 ## Usage
 
+Requires Rust 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+
 Build the standalone binary:
 
 ```bash

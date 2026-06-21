@@ -6,7 +6,7 @@
  */
 
 use aes::Aes256;
-use aes::cipher::{Block, BlockEncrypt, KeyInit};
+use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use std::fs;

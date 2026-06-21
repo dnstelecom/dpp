@@ -8,9 +8,9 @@
 use hickory_proto::op::Header;
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
+use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
-use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
+use hickory_proto::rr::RecordType as HickoryRecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -350,13 +350,13 @@ impl DnsProcessor {
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
         let mut decoder = BinDecoder::new(dns_data);
         let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
-        let queries = Message::read_queries(&mut decoder, header.query_count() as usize)
+        let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
             .map_err(|_| "Failed to parse DNS questions")?;
 
         Ok((
             DecodedDnsHeader {
-                id: header.id(),
-                response_code: header.response_code(),
+                id: header.id,
+                response_code: header.response_code,
             },
             queries
                 .into_iter()

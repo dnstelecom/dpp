@@ -16,6 +16,7 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -600,15 +601,15 @@ fn validate_retry_steps(path: &Path, field: &str, steps: &[RawRetryStep]) -> Res
             step.range_us[0],
             step.range_us[1],
         )?;
-        if let Some(representative_us) = step.representative_us {
-            if representative_us < step.range_us[0] || representative_us > step.range_us[1] {
-                return Err(invalid_fitted_profile(
-                    path,
-                    format!(
-                        "{field}[{index}].representative_us must fall inside range_us, got {representative_us}"
-                    ),
-                ));
-            }
+        if let Some(representative_us) = step.representative_us
+            && (representative_us < step.range_us[0] || representative_us > step.range_us[1])
+        {
+            return Err(invalid_fitted_profile(
+                path,
+                format!(
+                    "{field}[{index}].representative_us must fall inside range_us, got {representative_us}"
+                ),
+            ));
         }
     }
     Ok(())
@@ -653,7 +654,16 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex(hasher.finalize()))
+}
+
+pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn map_query_type_weight(weight: RawQueryTypeWeight) -> TypeWeight {

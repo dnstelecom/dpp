@@ -30,16 +30,19 @@ fn processing_mode_info() {
 
 #[must_use]
 fn channel_info(args: &AppConfig) -> String {
-    let capacity = args.output_channel_capacity();
+    let message_capacity = args.output_channel_message_capacity();
+    let record_capacity = args.output_channel_record_capacity();
     if args.uses_default_output_channel_capacity() {
         format!(
-            "BOUNDED with {} elements (default)",
-            capacity.to_formatted_string(&Locale::en)
+            "BOUNDED with {} batched messages / {} records max (default)",
+            message_capacity.to_formatted_string(&Locale::en),
+            record_capacity.to_formatted_string(&Locale::en)
         )
     } else {
         format!(
-            "BONDED with {} elements",
-            capacity.to_formatted_string(&Locale::en)
+            "BOUNDED with {} batched messages / {} records max",
+            message_capacity.to_formatted_string(&Locale::en),
+            record_capacity.to_formatted_string(&Locale::en)
         )
     }
 }
@@ -164,6 +167,8 @@ struct RunConfigSummary {
     silent: bool,
     affinity: bool,
     output_channel_capacity: usize,
+    output_channel_message_capacity: usize,
+    output_record_batch_size: usize,
     uses_default_output_channel_capacity: bool,
 }
 
@@ -334,7 +339,9 @@ fn build_run_summary(
             v2: args.v2,
             silent: args.silent,
             affinity: args.affinity,
-            output_channel_capacity: args.output_channel_capacity(),
+            output_channel_capacity: args.output_channel_record_capacity(),
+            output_channel_message_capacity: args.output_channel_message_capacity(),
+            output_record_batch_size: crate::config::OUTPUT_RECORD_BATCH_SIZE,
             uses_default_output_channel_capacity: args.uses_default_output_channel_capacity(),
         },
         execution: RunExecutionSummary {
@@ -508,7 +515,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     processing_mode_info();
     display_channel_info(&args);
 
-    let (tx, rx) = channel::bounded(args.output_channel_capacity());
+    let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
 
     display_parquet_format_information(&args);
     display_anonymization(&args);
@@ -647,7 +654,56 @@ mod tests {
 
         assert_eq!(
             channel_info(&config),
-            "BOUNDED with 131,072 elements (default)"
+            "BOUNDED with 128 batched messages / 131,072 records max (default)"
+        );
+    }
+
+    #[test]
+    fn channel_info_uses_explicit_record_capacity() {
+        let mut config = test_config();
+        config.bonded = 4096;
+
+        assert_eq!(
+            channel_info(&config),
+            "BOUNDED with 4 batched messages / 4,096 records max"
+        );
+    }
+
+    #[test]
+    fn run_summary_serializes_output_channel_capacity_units() {
+        let config = test_config();
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters::default(),
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        let config = serialized
+            .get("config")
+            .and_then(serde_json::Value::as_object)
+            .expect("config object is present");
+
+        assert_eq!(
+            config.get("output_channel_capacity"),
+            Some(&serde_json::json!(
+                crate::config::DEFAULT_OUTPUT_CHANNEL_RECORD_BACKLOG
+            ))
+        );
+        assert_eq!(
+            config.get("output_channel_message_capacity"),
+            Some(&serde_json::json!(
+                crate::config::DEFAULT_OUTPUT_CHANNEL_CAPACITY
+            ))
+        );
+        assert_eq!(
+            config.get("output_record_batch_size"),
+            Some(&serde_json::json!(crate::config::OUTPUT_RECORD_BATCH_SIZE))
         );
     }
 

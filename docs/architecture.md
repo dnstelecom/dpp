@@ -121,9 +121,12 @@ repeating it for full DNS question decoding.
 
 - `src/output.rs`
   Writer lifecycle boundary. Owns output control messages and the writer-thread factory. The
-  handoff channel from processing to output is bounded by configuration and must not become
-  unbounded ambient state. Broken-pipe closure on stdout is treated as a downstream-close outcome;
-  regular file-write failures remain fatal.
+  handoff channel from processing to output carries batched `DnsRecord` messages and is bounded by
+  configuration. User-facing capacity remains a record backlog; internally it is rounded up to
+  batch-message slots. `src/config.rs` owns both the maximum records per output message and the
+  default queued-record backlog, so the
+  batched handoff must not become unbounded ambient state. Broken-pipe closure on stdout is treated
+  as a downstream-close outcome; regular file-write failures remain fatal.
 
 - `src/monitor_memory.rs`
   Optional RSS tracking helper with an explicit stop/join lifecycle. The monitor must not detach

@@ -6,8 +6,8 @@
  */
 
 use arrayvec::ArrayVec;
-use hickory_proto::op::response_code::ResponseCode as HickoryResponseCode;
-use hickory_proto::rr::record_type::RecordType as HickoryRecordType;
+use hickory_proto::op::ResponseCode as HickoryResponseCode;
+use hickory_proto::rr::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
 use std::mem;
 use std::net::IpAddr;
@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::mem::MaybeUninit;
 
 use crate::custom_types::DnsNameBuf;
-use crate::record::DnsRecord;
+use crate::output::OutputRecordBatches;
 
 const INLINE_TIMELINE_CAPACITY: usize = 1;
 
@@ -345,7 +345,7 @@ impl<T> Drop for EntryArena<T> {
 
 #[derive(Default)]
 pub(super) struct ShardProcessingResult {
-    pub(super) output_records: Vec<DnsRecord>,
+    pub(super) output_records: OutputRecordBatches,
     pub(super) dns_query_count: usize,
     pub(super) duplicated_query_count: usize,
     pub(super) dns_response_count: usize,

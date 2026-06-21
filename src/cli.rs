@@ -134,7 +134,7 @@ fn build_cli(version: &'static str) -> Command {
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
   DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
   DPP_MATCH_TIMEOUT_MS  DNS match timeout in milliseconds; allowed range is 1..=5000, default is 1200
-  DPP_BONDED=N          Set IO channel capacity to 'N'; 0 uses the safe default bounded capacity
+  DPP_BONDED=N          Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity
   DPP_FORMAT            Output format: csv, parquet, or pq (used if --format option is not specified)
   DPP_SILENT            Set to 'true' to suppress all info-level output messages (used if --silent is not specified)
   DPP_ZSTD              Set to 'true' to use Zstd compression (used if --zstd is not specified, only valid with parquet format)
@@ -206,7 +206,7 @@ LICENSE INFORMATION:
             Arg::new("bonded")
                 .long("bonded")
                 .short('b')
-                .help("Set IO channel capacity to 'N'; 0 uses the safe default bounded capacity")
+                .help("Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity")
                 .value_name("N")
                 .num_args(1),
         )
@@ -458,6 +458,16 @@ mod tests {
             .expect("time is valid")
             .as_nanos();
         std::env::temp_dir().join(format!("dpp-{name}-{unique}"))
+    }
+
+    #[test]
+    fn help_text_mentions_batched_output_channel_capacity() {
+        let mut command = build_cli("test");
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).expect("help renders");
+        let help = String::from_utf8(help).expect("help is utf-8");
+
+        assert!(help.contains("Set IO channel capacity in records"));
     }
 
     #[test]
