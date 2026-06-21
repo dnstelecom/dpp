@@ -340,23 +340,6 @@ impl DnsProcessor {
             4,
             "Failed to parse DNS question count",
         )?);
-        let section_counts = DnsSectionCounts {
-            answers: usize::from(Self::parse_u16_at(
-                dns_data,
-                6,
-                "Failed to parse DNS answer count",
-            )?),
-            authorities: usize::from(Self::parse_u16_at(
-                dns_data,
-                8,
-                "Failed to parse DNS authority count",
-            )?),
-            additionals: usize::from(Self::parse_u16_at(
-                dns_data,
-                10,
-                "Failed to parse DNS additional count",
-            )?),
-        };
 
         let mut cursor = DNS_HEADER_LEN;
         let mut queries = Vec::with_capacity(query_count);
@@ -373,13 +356,34 @@ impl DnsProcessor {
 
             queries.push(DecodedDnsQuestion { name, query_type });
         }
-        let response_code = Self::decode_response_code_with_edns(
-            dns_data,
-            cursor,
-            section_counts,
-            low_response_code,
-            decode_extended_rcode,
-        )?;
+        let mut response_code = HickoryResponseCode::from(0, low_response_code);
+        if decode_extended_rcode {
+            let additional_count = usize::from(Self::parse_u16_at(
+                dns_data,
+                10,
+                "Failed to parse DNS additional count",
+            )?);
+            if additional_count > 0 {
+                response_code = Self::decode_response_code_with_edns(
+                    dns_data,
+                    cursor,
+                    DnsSectionCounts {
+                        answers: usize::from(Self::parse_u16_at(
+                            dns_data,
+                            6,
+                            "Failed to parse DNS answer count",
+                        )?),
+                        authorities: usize::from(Self::parse_u16_at(
+                            dns_data,
+                            8,
+                            "Failed to parse DNS authority count",
+                        )?),
+                        additionals: additional_count,
+                    },
+                    low_response_code,
+                )?;
+            }
+        }
         let header = DecodedDnsHeader { id, response_code };
 
         Ok((header, queries))
@@ -393,17 +397,19 @@ impl DnsProcessor {
         let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
             .map_err(|_| "Failed to parse DNS questions")?;
-        let response_code = Self::decode_response_code_with_edns(
-            dns_data,
-            decoder.index(),
-            DnsSectionCounts {
-                answers: header.counts.answers as usize,
-                authorities: header.counts.authorities as usize,
-                additionals: header.counts.additionals as usize,
-            },
-            header.response_code.low(),
-            decode_extended_rcode,
-        )?;
+        let mut response_code = header.response_code;
+        if decode_extended_rcode && header.counts.additionals > 0 {
+            response_code = Self::decode_response_code_with_edns(
+                dns_data,
+                decoder.index(),
+                DnsSectionCounts {
+                    answers: header.counts.answers as usize,
+                    authorities: header.counts.authorities as usize,
+                    additionals: header.counts.additionals as usize,
+                },
+                header.response_code.low(),
+            )?;
+        }
 
         Ok((
             DecodedDnsHeader {
@@ -425,12 +431,8 @@ impl DnsProcessor {
         mut cursor: usize,
         section_counts: DnsSectionCounts,
         low_response_code: u8,
-        decode_extended_rcode: bool,
     ) -> Result<HickoryResponseCode, &'static str> {
         let response_code = HickoryResponseCode::from(0, low_response_code);
-        if !decode_extended_rcode || section_counts.additionals == 0 {
-            return Ok(response_code);
-        }
 
         Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.answers, true)?;
         Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.authorities, true)?;
