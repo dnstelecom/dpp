@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
 use super::types::ProcessedDnsRecord;
-use crate::custom_types::DnsNameBuf;
+use crate::custom_types::{DnsNameBuf, ProtoResponseCode};
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -34,6 +34,7 @@ const DNS_LABEL_LEN_MASK: u8 = 0b0011_1111;
 const DNS_COMPRESSION_JUMP_LIMIT: usize = 32;
 const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
+const DNS_TSIG_RECORD_TYPE: u16 = 250;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalFlowKey {
@@ -90,7 +91,7 @@ impl ParsedUdpDnsMeta {
 
 struct DecodedDnsHeader {
     id: u16,
-    response_code: HickoryResponseCode,
+    response_code: ProtoResponseCode,
 }
 
 struct DecodedDnsQuestion {
@@ -109,6 +110,14 @@ struct DnsResourceRecordMeta {
     owner_is_root: bool,
     record_type: u16,
     ttl: u32,
+    rdata_start: usize,
+    rdata_end: usize,
+}
+
+#[derive(Default)]
+struct AdditionalResponseCodeFields {
+    edns_response_code_high: Option<u8>,
+    tsig_error: Option<u16>,
 }
 
 impl DnsProcessor {
@@ -288,7 +297,7 @@ impl DnsProcessor {
                 let response_code = if is_answer {
                     header.response_code
                 } else {
-                    HickoryResponseCode::ServFail
+                    HickoryResponseCode::ServFail.into()
                 };
 
                 ProcessedDnsRecord {
@@ -356,7 +365,8 @@ impl DnsProcessor {
 
             queries.push(DecodedDnsQuestion { name, query_type });
         }
-        let mut response_code = HickoryResponseCode::from(0, low_response_code);
+        let mut response_code =
+            ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
         if decode_extended_rcode {
             let additional_count = usize::from(Self::parse_u16_at(
                 dns_data,
@@ -364,7 +374,7 @@ impl DnsProcessor {
                 "Failed to parse DNS additional count",
             )?);
             if additional_count > 0 {
-                response_code = Self::decode_response_code_with_edns(
+                response_code = Self::decode_response_code_with_additionals(
                     dns_data,
                     cursor,
                     DnsSectionCounts {
@@ -397,9 +407,9 @@ impl DnsProcessor {
         let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
             .map_err(|_| "Failed to parse DNS questions")?;
-        let mut response_code = header.response_code;
+        let mut response_code = ProtoResponseCode::from(header.response_code);
         if decode_extended_rcode && header.counts.additionals > 0 {
-            response_code = Self::decode_response_code_with_edns(
+            response_code = Self::decode_response_code_with_additionals(
                 dns_data,
                 decoder.index(),
                 DnsSectionCounts {
@@ -426,23 +436,36 @@ impl DnsProcessor {
         ))
     }
 
-    fn decode_response_code_with_edns(
+    fn decode_response_code_with_additionals(
         dns_data: &[u8],
         mut cursor: usize,
         section_counts: DnsSectionCounts,
         low_response_code: u8,
-    ) -> Result<HickoryResponseCode, &'static str> {
-        let response_code = HickoryResponseCode::from(0, low_response_code);
+    ) -> Result<ProtoResponseCode, &'static str> {
+        let response_code =
+            ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
 
         Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.answers, true)?;
         Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.authorities, true)?;
-        match Self::read_edns_response_code_high(dns_data, &mut cursor, section_counts.additionals)?
+        let additional_fields = Self::read_additional_response_code_fields(
+            dns_data,
+            &mut cursor,
+            section_counts.additionals,
+        )?;
+
+        if let Some(tsig_error) = additional_fields.tsig_error
+            && tsig_error != 0
         {
-            Some(high_response_code) => Ok(HickoryResponseCode::from(
+            return Ok(ProtoResponseCode::from_tsig_error(tsig_error));
+        }
+
+        if let Some(high_response_code) = additional_fields.edns_response_code_high {
+            Ok(ProtoResponseCode::from_edns(HickoryResponseCode::from(
                 high_response_code,
                 low_response_code,
-            )),
-            None => Ok(response_code),
+            )))
+        } else {
+            Ok(response_code)
         }
     }
 
@@ -462,28 +485,65 @@ impl DnsProcessor {
         Ok(())
     }
 
-    fn read_edns_response_code_high(
+    fn read_additional_response_code_fields(
         dns_data: &[u8],
         cursor: &mut usize,
         additional_count: usize,
-    ) -> Result<Option<u8>, &'static str> {
-        let mut response_code_high = None;
-        for _ in 0..additional_count {
+    ) -> Result<AdditionalResponseCodeFields, &'static str> {
+        let mut fields = AdditionalResponseCodeFields::default();
+        for index in 0..additional_count {
             let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
-            if meta.record_type != DNS_OPT_RECORD_TYPE {
-                continue;
-            }
-            if response_code_high.is_some() {
-                return Err("Multiple OPT records");
-            }
-            if !meta.owner_is_root {
-                return Err("OPT record owner must be root");
-            }
 
-            response_code_high = Some((meta.ttl >> 24) as u8);
+            match meta.record_type {
+                DNS_OPT_RECORD_TYPE => {
+                    if fields.edns_response_code_high.is_some() {
+                        return Err("Multiple OPT records");
+                    }
+                    if !meta.owner_is_root {
+                        return Err("OPT record owner must be root");
+                    }
+
+                    fields.edns_response_code_high = Some((meta.ttl >> 24) as u8);
+                }
+                DNS_TSIG_RECORD_TYPE => {
+                    if fields.tsig_error.is_some() {
+                        return Err("Multiple TSIG records");
+                    }
+                    if index + 1 != additional_count {
+                        return Err("TSIG record must be last additional");
+                    }
+
+                    fields.tsig_error = Some(Self::read_tsig_error(dns_data, &meta)?);
+                }
+                _ => {}
+            }
         }
 
-        Ok(response_code_high)
+        Ok(fields)
+    }
+
+    fn read_tsig_error(dns_data: &[u8], meta: &DnsResourceRecordMeta) -> Result<u16, &'static str> {
+        let mut cursor = meta.rdata_start;
+        let rdata_end = meta.rdata_end;
+
+        Self::skip_wire_domain_name_in_range(dns_data, &mut cursor, rdata_end)?;
+        Self::skip_bytes_in_range(&mut cursor, rdata_end, 6 + 2)?;
+        let mac_size = usize::from(Self::parse_u16_at(
+            dns_data,
+            cursor,
+            "TSIG record truncated",
+        )?);
+        cursor += 2;
+        Self::skip_bytes_in_range(&mut cursor, rdata_end, mac_size + 2)?;
+
+        let error = Self::parse_u16_at(dns_data, cursor, "TSIG record truncated")?;
+        cursor += 2;
+        Self::skip_bytes_in_range(&mut cursor, rdata_end, 2)?;
+        if cursor != rdata_end {
+            return Err("TSIG record has trailing data");
+        }
+
+        Ok(error)
     }
 
     fn read_dns_resource_record_meta(
@@ -513,7 +573,39 @@ impl DnsProcessor {
             owner_is_root,
             record_type,
             ttl,
+            rdata_start: fixed_end,
+            rdata_end,
         })
+    }
+
+    fn skip_wire_domain_name_in_range(
+        dns_data: &[u8],
+        cursor: &mut usize,
+        limit: usize,
+    ) -> Result<(), &'static str> {
+        if *cursor >= limit {
+            return Err("DNS name truncated");
+        }
+
+        Self::skip_wire_domain_name(dns_data, cursor)?;
+        if *cursor > limit {
+            return Err("DNS name truncated");
+        }
+
+        Ok(())
+    }
+
+    fn skip_bytes_in_range(
+        cursor: &mut usize,
+        limit: usize,
+        byte_count: usize,
+    ) -> Result<(), &'static str> {
+        *cursor = cursor
+            .checked_add(byte_count)
+            .filter(|next| *next <= limit)
+            .ok_or("TSIG record truncated")?;
+
+        Ok(())
     }
 
     fn skip_wire_domain_name(dns_data: &[u8], cursor: &mut usize) -> Result<bool, &'static str> {

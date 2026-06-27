@@ -144,8 +144,18 @@ impl fmt::Display for ProtoRecordType {
 /// Using `ProtoResponseCode` provides a consistent way to interact with response codes
 /// across the application, encapsulating the complexity of the internal representation
 /// and providing a clean interface for external use.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ProtoResponseCode(HickoryResponseCode);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ResponseCodeContext {
+    Header,
+    EdnsOpt,
+    Tsig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProtoResponseCode {
+    code: u16,
+    context: ResponseCodeContext,
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -156,27 +166,67 @@ enum ProtoResponseCodeRepr {
 
 impl From<HickoryResponseCode> for ProtoResponseCode {
     fn from(code: HickoryResponseCode) -> Self {
-        ProtoResponseCode(code)
+        ProtoResponseCode {
+            code: code.into(),
+            context: ResponseCodeContext::Header,
+        }
     }
 }
 
 impl From<ProtoResponseCode> for HickoryResponseCode {
     fn from(wrapped: ProtoResponseCode) -> Self {
-        wrapped.0
+        wrapped.code.into()
+    }
+}
+
+impl From<ProtoResponseCode> for u16 {
+    fn from(wrapped: ProtoResponseCode) -> Self {
+        wrapped.as_u16()
     }
 }
 
 impl ProtoResponseCode {
+    pub(crate) fn from_edns(code: HickoryResponseCode) -> Self {
+        Self {
+            code: code.into(),
+            context: ResponseCodeContext::EdnsOpt,
+        }
+    }
+
+    pub(crate) fn from_tsig_error(error_code: u16) -> Self {
+        Self {
+            code: error_code,
+            context: ResponseCodeContext::Tsig,
+        }
+    }
+
+    pub fn as_u16(self) -> u16 {
+        self.code
+    }
+
     pub fn as_str(&self) -> &'static str {
-        self.0.to_str()
+        match (self.context, self.as_u16()) {
+            (ResponseCodeContext::EdnsOpt, 16) => "EDNS_BADVERS",
+            _ => Into::<HickoryResponseCode>::into(*self).to_str(),
+        }
+    }
+}
+
+impl PartialEq<HickoryResponseCode> for ProtoResponseCode {
+    fn eq(&self, other: &HickoryResponseCode) -> bool {
+        self.code == u16::from(*other)
+    }
+}
+
+impl PartialEq<ProtoResponseCode> for HickoryResponseCode {
+    fn eq(&self, other: &ProtoResponseCode) -> bool {
+        u16::from(*self) == other.code
     }
 }
 
 impl Ord for ProtoResponseCode {
     fn cmp(&self, other: &Self) -> Ordering {
-        let self_value: u16 = self.0.into();
-        let other_value: u16 = other.0.into();
-        self_value.cmp(&other_value)
+        (self.as_u16(), self.context).cmp(&(other.as_u16(), other.context))
     }
 }
 
@@ -191,7 +241,7 @@ impl Serialize for ProtoResponseCode {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.0.to_str())
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -203,12 +253,13 @@ impl<'de> Deserialize<'de> for ProtoResponseCode {
         let code = ProtoResponseCodeRepr::deserialize(deserializer)?;
 
         match code {
-            ProtoResponseCodeRepr::Numeric(code) => Ok(ProtoResponseCode(code.into())),
-            ProtoResponseCodeRepr::Text(text) => parse_response_code_text(&text)
-                .map(ProtoResponseCode)
-                .ok_or_else(|| {
-                    serde::de::Error::custom(format!("unsupported response code '{text}'"))
-                }),
+            ProtoResponseCodeRepr::Numeric(code) => Ok(ProtoResponseCode {
+                code,
+                context: ResponseCodeContext::Header,
+            }),
+            ProtoResponseCodeRepr::Text(text) => parse_response_code_text(&text).ok_or_else(|| {
+                serde::de::Error::custom(format!("unsupported response code '{text}'"))
+            }),
         }
     }
 }
@@ -219,7 +270,7 @@ impl fmt::Display for ProtoResponseCode {
     }
 }
 
-fn parse_response_code_text(value: &str) -> Option<HickoryResponseCode> {
+fn parse_response_code_text(value: &str) -> Option<ProtoResponseCode> {
     let normalized = value
         .chars()
         .filter(|character| !matches!(character, ' ' | '-' | '_'))
@@ -227,31 +278,33 @@ fn parse_response_code_text(value: &str) -> Option<HickoryResponseCode> {
         .collect::<String>();
 
     match normalized.as_str() {
-        "noerror" => Some(HickoryResponseCode::NoError),
-        "formerror" | "formerr" => Some(HickoryResponseCode::FormErr),
-        "serverfailure" | "servfail" => Some(HickoryResponseCode::ServFail),
-        "nonexistentdomain" | "nxdomain" => Some(HickoryResponseCode::NXDomain),
-        "notimplemented" | "notimp" => Some(HickoryResponseCode::NotImp),
-        "queryrefused" | "refused" => Some(HickoryResponseCode::Refused),
-        "nameshouldnotexist" | "yxdomain" => Some(HickoryResponseCode::YXDomain),
-        "rrsetshouldnotexist" | "yxrrset" => Some(HickoryResponseCode::YXRRSet),
-        "rrsetdoesnotexist" | "nxrrset" => Some(HickoryResponseCode::NXRRSet),
-        "notauthorized" | "notauth" => Some(HickoryResponseCode::NotAuth),
-        "namenotinzone" | "notzone" => Some(HickoryResponseCode::NotZone),
-        "badoptionversions" | "badvers" | "badsig" | "tsigfailure" => {
-            Some(HickoryResponseCode::BADVERS)
+        "noerror" => Some(HickoryResponseCode::NoError.into()),
+        "formerror" | "formerr" => Some(HickoryResponseCode::FormErr.into()),
+        "serverfailure" | "servfail" => Some(HickoryResponseCode::ServFail.into()),
+        "nonexistentdomain" | "nxdomain" => Some(HickoryResponseCode::NXDomain.into()),
+        "notimplemented" | "notimp" => Some(HickoryResponseCode::NotImp.into()),
+        "queryrefused" | "refused" => Some(HickoryResponseCode::Refused.into()),
+        "nameshouldnotexist" | "yxdomain" => Some(HickoryResponseCode::YXDomain.into()),
+        "rrsetshouldnotexist" | "yxrrset" => Some(HickoryResponseCode::YXRRSet.into()),
+        "rrsetdoesnotexist" | "nxrrset" => Some(HickoryResponseCode::NXRRSet.into()),
+        "notauthorized" | "notauth" => Some(HickoryResponseCode::NotAuth.into()),
+        "namenotinzone" | "notzone" => Some(HickoryResponseCode::NotZone.into()),
+        "badoptionversions" | "ednsbadvers" | "badvers" => {
+            Some(ProtoResponseCode::from_edns(HickoryResponseCode::BADVERS))
         }
-        "keynotrecognized" | "badkey" => Some(HickoryResponseCode::BADKEY),
-        "signatureoutoftimewindow" | "badtime" => Some(HickoryResponseCode::BADTIME),
-        "badtkeymode" | "badmode" => Some(HickoryResponseCode::BADMODE),
-        "duplicatekeyname" | "badname" => Some(HickoryResponseCode::BADNAME),
-        "algorithmnotsupported" | "badalg" => Some(HickoryResponseCode::BADALG),
-        "badtruncation" | "badtrunc" => Some(HickoryResponseCode::BADTRUNC),
-        "badservercookie" | "badcookie" => Some(HickoryResponseCode::BADCOOKIE),
+        "badsig" | "tsigfailure" => Some(ProtoResponseCode::from_tsig_error(16)),
+        "keynotrecognized" | "badkey" => Some(HickoryResponseCode::BADKEY.into()),
+        "signatureoutoftimewindow" | "badtime" => Some(HickoryResponseCode::BADTIME.into()),
+        "badtkeymode" | "badmode" => Some(HickoryResponseCode::BADMODE.into()),
+        "duplicatekeyname" | "badname" => Some(HickoryResponseCode::BADNAME.into()),
+        "algorithmnotsupported" | "badalg" => Some(HickoryResponseCode::BADALG.into()),
+        "badtruncation" | "badtrunc" => Some(HickoryResponseCode::BADTRUNC.into()),
+        "badservercookie" | "badcookie" => Some(HickoryResponseCode::BADCOOKIE.into()),
         _ => normalized
             .parse::<u16>()
             .ok()
-            .map(Into::<HickoryResponseCode>::into),
+            .map(Into::<HickoryResponseCode>::into)
+            .map(Into::<ProtoResponseCode>::into),
     }
 }
 
@@ -512,6 +565,22 @@ mod tests {
         let parsed: HickoryResponseCode = parsed.into();
 
         assert_eq!(parsed, HickoryResponseCode::ServFail);
+    }
+
+    #[test]
+    fn proto_response_code_names_edns_badvers_without_tsig_context() {
+        let code = ProtoResponseCode::from_edns(HickoryResponseCode::BADVERS);
+
+        assert_eq!(code.as_u16(), 16);
+        assert_eq!(code.as_str(), "EDNS_BADVERS");
+    }
+
+    #[test]
+    fn proto_response_code_preserves_tsig_failure_name_for_tsig_error() {
+        let code = ProtoResponseCode::from_tsig_error(16);
+
+        assert_eq!(code.as_u16(), 16);
+        assert_eq!(code.as_str(), "TSIG Failure");
     }
 
     #[test]

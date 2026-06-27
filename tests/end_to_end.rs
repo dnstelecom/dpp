@@ -20,6 +20,22 @@ fn dpp_binary() -> &'static str {
     env!("CARGO_BIN_EXE_dpp")
 }
 
+fn append_example_a_query(dns_payload: &mut Vec<u8>) {
+    dns_payload.extend_from_slice(&[
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+    ]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+}
+
+fn append_opt_record(dns_payload: &mut Vec<u8>, extended_high: u8, edns_version: u8) {
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&41_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&[extended_high, edns_version, 0, 0]);
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+}
+
 #[test]
 fn matched_query_response_pair_round_trips_to_exact_csv_record() {
     let input_path = temp_test_path("matched-query-response", "pcap");
@@ -76,6 +92,58 @@ fn matched_query_response_pair_round_trips_to_exact_csv_record() {
             "1000000,1200000,10.0.0.1,53000,4660,example.com,A,No Error\n"
         )
     );
+
+    fs::remove_file(&input_path).expect("remove input pcap");
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn edns_badvers_round_trips_without_tsig_failure_report_label() {
+    let input_path = temp_test_path("edns-badvers-response", "pcap");
+    let output_path = temp_test_path("edns-badvers-response", "csv");
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    query_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut query_payload);
+    append_opt_record(&mut query_payload, 0, 255);
+
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut response_payload);
+    append_opt_record(&mut response_payload, 1, 0);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[(1, 0, &query_packet), (1, 200_000, &response_packet)]),
+    )
+    .expect("test pcap written");
+
+    let output = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let csv_output = fs::read_to_string(&output_path).expect("csv output readable");
+    assert!(csv_output.contains(",EDNS_BADVERS\n"));
+    assert!(!csv_output.contains("TSIG Failure"));
 
     fs::remove_file(&input_path).expect("remove input pcap");
     fs::remove_file(&output_path).expect("remove output csv");

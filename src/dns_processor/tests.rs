@@ -61,6 +61,14 @@ fn append_example_query(dns_payload: &mut Vec<u8>) {
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
 
+fn append_opt_resource_record(dns_payload: &mut Vec<u8>, extended_high: u8, edns_version: u8) {
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&41_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&[extended_high, edns_version, 0, 0]);
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+}
+
 fn append_a_resource_record(
     dns_payload: &mut Vec<u8>,
     owner_name: &[u8],
@@ -73,6 +81,34 @@ fn append_a_resource_record(
     dns_payload.extend_from_slice(&ttl.to_be_bytes());
     dns_payload.extend_from_slice(&4_u16.to_be_bytes());
     dns_payload.extend_from_slice(&address);
+}
+
+fn append_tsig_resource_record(dns_payload: &mut Vec<u8>, error: u16) {
+    let mut rdata = Vec::new();
+    rdata.extend_from_slice(&[
+        11, b'h', b'm', b'a', b'c', b'-', b's', b'h', b'a', b'2', b'5', b'6', 0,
+    ]);
+    rdata.extend_from_slice(&0_u16.to_be_bytes());
+    rdata.extend_from_slice(&1_u32.to_be_bytes());
+    rdata.extend_from_slice(&300_u16.to_be_bytes());
+    rdata.extend_from_slice(&0_u16.to_be_bytes());
+    rdata.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    rdata.extend_from_slice(&error.to_be_bytes());
+    rdata.extend_from_slice(&0_u16.to_be_bytes());
+
+    dns_payload.extend_from_slice(&[
+        8, b't', b'e', b's', b't', b'-', b'k', b'e', b'y', 7, b'e', b'x', b'a', b'm', b'p', b'l',
+        b'e', 0,
+    ]);
+    dns_payload.extend_from_slice(&250_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&255_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u32.to_be_bytes());
+    dns_payload.extend_from_slice(
+        &u16::try_from(rdata.len())
+            .expect("test TSIG RDATA fits")
+            .to_be_bytes(),
+    );
+    dns_payload.extend_from_slice(&rdata);
 }
 
 fn edns_extended_rcode_response_payload(extended_high: u8, low_rcode: u8) -> Vec<u8> {
@@ -88,13 +124,167 @@ fn edns_extended_rcode_response_payload(extended_high: u8, low_rcode: u8) -> Vec
     append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 60, [1, 2, 3, 4]);
     append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 30, [5, 6, 7, 8]);
 
-    dns_payload.push(0);
-    dns_payload.extend_from_slice(&41_u16.to_be_bytes());
-    dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
-    dns_payload.extend_from_slice(&[extended_high, 0, 0, 0]);
+    append_opt_resource_record(&mut dns_payload, extended_high, 0);
+
+    dns_payload
+}
+
+fn response_payload_with_opt_and_tsig(
+    extended_high: Option<u8>,
+    tsig_error: Option<u16>,
+) -> Vec<u8> {
+    let additional_count = u16::from(extended_high.is_some()) + u16::from(tsig_error.is_some());
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&additional_count.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    if let Some(extended_high) = extended_high {
+        append_opt_resource_record(&mut dns_payload, extended_high, 0);
+    }
+    if let Some(tsig_error) = tsig_error {
+        append_tsig_resource_record(&mut dns_payload, tsig_error);
+    }
+
+    dns_payload
+}
+
+fn malformed_tsig_response_payload() -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'k', b'e', b'y', 0]);
+    dns_payload.extend_from_slice(&250_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&255_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u32.to_be_bytes());
     dns_payload.extend_from_slice(&0_u16.to_be_bytes());
 
     dns_payload
+}
+
+fn duplicate_opt_response_payload() -> Vec<u8> {
+    let mut dns_payload = response_payload_with_opt_and_tsig(Some(1), None);
+    let additional_count_offset = 10;
+    dns_payload[additional_count_offset..additional_count_offset + 2]
+        .copy_from_slice(&2_u16.to_be_bytes());
+    append_opt_resource_record(&mut dns_payload, 1, 0);
+    dns_payload
+}
+
+fn non_root_opt_response_payload() -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'o', b'p', b't', 0]);
+    dns_payload.extend_from_slice(&41_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&[1, 0, 0, 0]);
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+
+    dns_payload
+}
+
+fn tsig_not_last_response_payload() -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&2_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    append_tsig_resource_record(&mut dns_payload, 16);
+    append_opt_resource_record(&mut dns_payload, 1, 0);
+
+    dns_payload
+}
+
+fn duplicate_tsig_response_payload() -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&2_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+    append_tsig_resource_record(&mut dns_payload, 16);
+    append_tsig_resource_record(&mut dns_payload, 17);
+
+    dns_payload
+}
+
+fn truncated_additional_response_payload() -> Vec<u8> {
+    let mut dns_payload = Vec::new();
+    dns_payload.extend_from_slice(&0xBEEF_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0x8180_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+    append_example_query(&mut dns_payload);
+
+    dns_payload
+}
+
+fn assert_response_code_from_payload(dns_payload: &[u8], expected_code: u16, expected_name: &str) {
+    let packet =
+        make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let records = processor
+            .process_packet_batch(&packet, 1_234_567)
+            .expect("packet parses");
+
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(
+            records[0].response_code.as_u16(),
+            expected_code,
+            "fast_path={fast_path}"
+        );
+        assert_eq!(
+            records[0].response_code.as_str(),
+            expected_name,
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+fn assert_response_payload_rejected(case: &str, dns_payload: &[u8]) {
+    let packet =
+        make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        assert!(
+            processor.process_packet_batch(&packet, 1_234_567).is_none(),
+            "case={case}, fast_path={fast_path}"
+        );
+    }
 }
 
 fn test_shard_state() -> MatcherShardState {
@@ -155,7 +345,7 @@ fn make_response_with_timestamp(
         timestamp_micros,
         packet_ordinal,
         record_ordinal,
-        response_code: HickoryResponseCode::NoError,
+        response_code: HickoryResponseCode::NoError.into(),
         query_type: HickoryRecordType::A,
     }
 }
@@ -221,7 +411,7 @@ fn make_query_record_with_timestamp(
         is_query: true,
         name: test_name(),
         query_type: HickoryRecordType::A,
-        response_code: HickoryResponseCode::ServFail,
+        response_code: HickoryResponseCode::ServFail.into(),
     }
 }
 
@@ -242,7 +432,7 @@ fn make_response_record_with_timestamp(
         is_query: false,
         name: test_name(),
         query_type: HickoryRecordType::A,
-        response_code: HickoryResponseCode::NoError,
+        response_code: HickoryResponseCode::NoError.into(),
     }
 }
 
@@ -838,7 +1028,65 @@ fn parser_decodes_edns_extended_response_code_from_opt_rr() {
                 expected_code,
                 "fast_path={fast_path}"
             );
+            if expected_code == 16 {
+                assert_eq!(
+                    records[0].response_code.as_str(),
+                    "EDNS_BADVERS",
+                    "fast_path={fast_path}"
+                );
+            } else {
+                assert_ne!(
+                    records[0].response_code.as_str(),
+                    "TSIG Failure",
+                    "fast_path={fast_path}"
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn parser_decodes_edns_badvers_without_tsig_failure_name() {
+    let dns_payload = response_payload_with_opt_and_tsig(Some(1), None);
+
+    assert_response_code_from_payload(&dns_payload, 16, "EDNS_BADVERS");
+}
+
+#[test]
+fn parser_decodes_tsig_error_when_tsig_rr_supplies_the_code() {
+    let dns_payload = response_payload_with_opt_and_tsig(None, Some(16));
+
+    assert_response_code_from_payload(&dns_payload, 16, "TSIG Failure");
+}
+
+#[test]
+fn parser_preserves_edns_context_when_tsig_error_is_zero() {
+    let dns_payload = response_payload_with_opt_and_tsig(Some(1), Some(0));
+
+    assert_response_code_from_payload(&dns_payload, 16, "EDNS_BADVERS");
+}
+
+#[test]
+fn parser_uses_nonzero_tsig_error_context_when_edns_is_also_present() {
+    let dns_payload = response_payload_with_opt_and_tsig(Some(1), Some(16));
+
+    assert_response_code_from_payload(&dns_payload, 16, "TSIG Failure");
+}
+
+#[test]
+fn parser_rejects_malformed_response_code_additionals() {
+    for (case, dns_payload) in [
+        ("duplicate OPT", duplicate_opt_response_payload()),
+        ("non-root OPT", non_root_opt_response_payload()),
+        ("TSIG not last", tsig_not_last_response_payload()),
+        ("duplicate TSIG", duplicate_tsig_response_payload()),
+        ("malformed TSIG", malformed_tsig_response_payload()),
+        (
+            "truncated additional",
+            truncated_additional_response_payload(),
+        ),
+    ] {
+        assert_response_payload_rejected(case, &dns_payload);
     }
 }
 
