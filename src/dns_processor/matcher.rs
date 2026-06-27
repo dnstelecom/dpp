@@ -5,7 +5,6 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
-use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use std::collections::BTreeMap;
 
 use super::DnsProcessor;
@@ -50,7 +49,7 @@ impl DnsProcessor {
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
         response_timestamp_micros: i64,
-        response_code: HickoryResponseCode,
+        response_code: ProtoResponseCode,
     ) -> DnsRecord {
         let &(id, name, src_ip, src_port, query_type) = query_identity;
         DnsRecord {
@@ -61,7 +60,7 @@ impl DnsProcessor {
             id,
             name,
             query_type: ProtoRecordType::from(query_type),
-            response_code: Some(ProtoResponseCode::from(response_code)),
+            response_code: Some(response_code),
         }
     }
 
@@ -313,7 +312,7 @@ impl DnsProcessor {
         state: &mut MatcherShardState,
         identity: ResponseIdentityKey,
         timeline_key: TimelineKey,
-        response_code: HickoryResponseCode,
+        response_code: ProtoResponseCode,
     ) {
         let payload = ResponseEventPayload { response_code };
 

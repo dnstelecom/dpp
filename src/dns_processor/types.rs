@@ -6,7 +6,6 @@
  */
 
 use arrayvec::ArrayVec;
-use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
 use std::mem;
@@ -15,7 +14,7 @@ use std::net::IpAddr;
 #[cfg(test)]
 use std::mem::MaybeUninit;
 
-use crate::custom_types::DnsNameBuf;
+use crate::custom_types::{DnsNameBuf, ProtoResponseCode};
 use crate::output::OutputRecordBatches;
 
 const INLINE_TIMELINE_CAPACITY: usize = 1;
@@ -61,7 +60,7 @@ pub(super) struct QueryEventPayload;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResponseEventPayload {
-    pub(super) response_code: HickoryResponseCode,
+    pub(super) response_code: ProtoResponseCode,
 }
 
 pub(super) enum Timeline<Record> {
@@ -368,7 +367,7 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) is_query: bool,
     pub(super) name: DnsNameBuf,
     pub(super) query_type: HickoryRecordType,
-    pub(super) response_code: HickoryResponseCode,
+    pub(super) response_code: ProtoResponseCode,
 }
 
 #[cfg(test)]
@@ -394,7 +393,7 @@ pub(super) struct DnsResponse {
     pub(super) timestamp_micros: i64,
     pub(super) packet_ordinal: u64,
     pub(super) record_ordinal: u32,
-    pub(super) response_code: HickoryResponseCode,
+    pub(super) response_code: ProtoResponseCode,
     pub(super) query_type: HickoryRecordType,
 }
 

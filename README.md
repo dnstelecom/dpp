@@ -261,6 +261,10 @@ This means "no matching response was observed inside the configured timeout wind
 mean the upstream server actually returned `ServFail`. Downstream timeout detection should key off
 the absent `response_timestamp`; `response_code` is absent because no DNS response exists.
 
+`response_code` preserves DNS extended-RCODE provenance when DPP can observe it. EDNS OPT
+extended RCODE `16` is exported as `EDNS_BADVERS`; `TSIG Failure` is used for code `16` only when a
+TSIG RR error field supplies that status.
+
 With `--report-format json` or `DPP_REPORT_FORMAT=json`, DPP suppresses routine `info`/`warn`
 reporting and emits one final JSON summary object to `stdout`. This keeps CSV or Parquet output in
 its own file while making the end-of-run report easy to capture and parse.
