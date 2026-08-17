@@ -46,16 +46,17 @@ impl DnsProcessor {
     }
 
     fn create_matched_record_from_query_parts(
+        &self,
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
         response_timestamp_micros: i64,
         response_code: ProtoResponseCode,
     ) -> DnsRecord {
-        let &(id, name, src_ip, src_port, query_type) = query_identity;
+        let &(id, name, client_ip, src_port, query_type) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: Some(response_timestamp_micros),
-            source_ip: src_ip,
+            source_ip: self.anonymize_ip(&client_ip),
             source_port: src_port,
             id,
             name,
@@ -65,14 +66,15 @@ impl DnsProcessor {
     }
 
     fn create_timeout_record_from_query_parts(
+        &self,
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
     ) -> DnsRecord {
-        let &(id, name, src_ip, src_port, query_type) = query_identity;
+        let &(id, name, client_ip, src_port, query_type) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: None,
-            source_ip: src_ip,
+            source_ip: self.anonymize_ip(&client_ip),
             source_port: src_port,
             id,
             name,
@@ -128,7 +130,7 @@ impl DnsProcessor {
             let response_payload = self
                 .remove_response_entry(state, &query_identity, response_handle)
                 .expect("matched response handle must remain valid until removal");
-            output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+            output_records.push(self.create_matched_record_from_query_parts(
                 &query_identity,
                 query_key,
                 response_handle.timestamp_micros,
@@ -168,7 +170,7 @@ impl DnsProcessor {
         ) {
             self.remove_query_entry(state, &response_identity, query_handle)
                 .expect("matched query handle must remain valid until removal");
-            output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+            output_records.push(self.create_matched_record_from_query_parts(
                 &response_identity,
                 query_handle,
                 response_key.timestamp_micros,
@@ -212,7 +214,7 @@ impl DnsProcessor {
                     let response_payload = self
                         .remove_response_entry(state, &query_identity, response_handle)
                         .expect("matched response handle must remain valid until removal");
-                    output_records.push(DnsProcessor::create_matched_record_from_query_parts(
+                    output_records.push(self.create_matched_record_from_query_parts(
                         &query_identity,
                         query_handle,
                         response_handle.timestamp_micros,
@@ -225,10 +227,9 @@ impl DnsProcessor {
                         .max(0) as u64;
                     *out_of_order_combined_count += 1;
                 } else {
-                    output_records.push(DnsProcessor::create_timeout_record_from_query_parts(
-                        &query_identity,
-                        query_handle,
-                    ));
+                    output_records.push(
+                        self.create_timeout_record_from_query_parts(&query_identity, query_handle),
+                    );
                     *timeout_query_count += 1;
                 }
             });
@@ -246,9 +247,7 @@ impl DnsProcessor {
 
         query_map.retain(|identity, timeline| {
             timeline.drain_before(threshold_timestamp_micros, |key, _| {
-                output_records.push(DnsProcessor::create_timeout_record_from_query_parts(
-                    identity, key,
-                ));
+                output_records.push(self.create_timeout_record_from_query_parts(identity, key));
                 *timeout_query_count += 1;
             });
             !timeline.is_empty()
@@ -384,9 +383,9 @@ impl DnsProcessor {
 
     fn query_identity_from_record(&self, record: &ProcessedDnsRecord) -> QueryIdentityKey {
         let (src_ip, src_port) = if record.is_query {
-            (self.anonymize_ip(&record.src_ip), record.src_port)
+            (record.src_ip, record.src_port)
         } else {
-            (self.anonymize_ip(&record.dst_ip), record.dst_port)
+            (record.dst_ip, record.dst_port)
         };
 
         (record.id, record.name, src_ip, src_port, record.query_type)
@@ -394,9 +393,9 @@ impl DnsProcessor {
 
     fn response_identity_from_record(&self, record: &ProcessedDnsRecord) -> ResponseIdentityKey {
         let (dst_ip, dst_port) = if record.is_query {
-            (self.anonymize_ip(&record.src_ip), record.src_port)
+            (record.src_ip, record.src_port)
         } else {
-            (self.anonymize_ip(&record.dst_ip), record.dst_port)
+            (record.dst_ip, record.dst_port)
         };
 
         (record.id, record.name, dst_ip, dst_port, record.query_type)

@@ -8,17 +8,26 @@
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::RecordType as HickoryRecordType;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
 use super::types::{MatcherShardState, ProcessedDnsRecord};
 use crate::custom_types::DnsNameBuf;
 use crate::test_support::{
-    encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload,
+    encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload, temp_test_path,
 };
 
 fn test_processor() -> DnsProcessor {
     DnsProcessor::new(None).expect("processor initializes")
+}
+
+fn test_processor_with_anonymization_key(passphrase: &str) -> DnsProcessor {
+    let key_path = temp_test_path("anonymization", "key");
+    fs::write(&key_path, passphrase).expect("writes anonymization key");
+    let processor = DnsProcessor::new(Some(key_path.as_path())).expect("processor initializes");
+    fs::remove_file(key_path).expect("removes anonymization key");
+    processor
 }
 
 fn test_processor_with_dns_wire_fast_path() -> DnsProcessor {
@@ -543,6 +552,60 @@ fn duplicate_query_identity_requires_same_source_port() {
     assert_eq!(batch_result.dns_query_count, 2);
     assert_eq!(batch_result.duplicated_query_count, 0);
     assert_eq!(pending_query_count(&state), 2);
+}
+
+#[test]
+fn anonymization_collision_does_not_merge_client_identities() {
+    let processor = test_processor_with_anonymization_key("secret\n");
+
+    let query_client = IpAddr::V4(Ipv4Addr::new(0, 0, 56, 87));
+    let other_client = IpAddr::V4(Ipv4Addr::new(0, 0, 201, 251));
+    let pseudonymized_client = processor.anonymize_ip(&query_client);
+    assert_eq!(
+        pseudonymized_client,
+        processor.anonymize_ip(&other_client),
+        "fixture must retain its known IPv4 pseudonym collision"
+    );
+
+    let mut query = make_query_record_with_timestamp(1_000, 1, 0);
+    query.src_ip = query_client;
+    let mut other_response = make_response_record_with_timestamp(1_100, 2, 0);
+    other_response.dst_ip = other_client;
+    let mut matching_response = make_response_record_with_timestamp(1_200, 3, 0);
+    matching_response.dst_ip = query_client;
+
+    let mut state = test_shard_state();
+    let result = processor.process_shard_records_with_batch_watermark(
+        vec![query, other_response, matching_response],
+        &mut state,
+        None,
+    );
+
+    assert_eq!(result.matched_query_response_count, 1);
+    assert_eq!(result.output_records.len(), 1);
+    assert_eq!(result.output_records[0].response_timestamp, Some(1_200));
+    assert_eq!(result.output_records[0].source_ip, pseudonymized_client);
+    assert_ne!(result.output_records[0].source_ip, query_client);
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 1);
+}
+
+#[test]
+fn timeout_output_anonymizes_client_ip() {
+    let processor = test_processor_with_anonymization_key("secret\n");
+    let query = make_query_record(1, 0);
+    let raw_client_ip = query.src_ip;
+    let expected_source_ip = processor.anonymize_ip(&raw_client_ip);
+    let mut state = test_shard_state();
+
+    let result =
+        processor.process_shard_records_with_batch_watermark(vec![query], &mut state, None);
+    assert!(result.output_records.is_empty());
+
+    let finalization = processor.finalize_shard(&mut state);
+    assert_eq!(finalization.output_records.len(), 1);
+    assert_eq!(finalization.output_records[0].source_ip, expected_source_ip);
+    assert_ne!(finalization.output_records[0].source_ip, raw_client_ip);
 }
 
 #[test]

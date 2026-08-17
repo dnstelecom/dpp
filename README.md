@@ -176,6 +176,8 @@ Notes:
 - Keep the key file private. Anyone with the same file can reproduce the same pseudonymized output.
 - The key file must contain valid UTF-8 text because DPP reads it as a text passphrase.
 - Rotating the key changes the resulting pseudonymized IP addresses for the same input capture.
+- Matching and deduplication use the original client IP. Pseudonymization is applied only to the
+  `source_ip` field of finalized output records, so pseudonym collisions cannot merge clients.
 - DPP intentionally uses a fixed PBKDF2 salt for deterministic pseudonymization. The passphrase is
   still the operator-controlled secret; changing it rotates the derived pseudonyms.
 - If `--anonymize` or `DPP_ANONYMIZE` is configured and the key file is missing, unreadable, or
