@@ -194,7 +194,7 @@ repeating it for full DNS question decoding.
   Canonical architecture decision records. `README.md` is the directory index. Current RFCs
   cover ownership boundaries (0001), CLI/runtime split (0002), allocator selection (0003),
   forward-only matcher determinism (0004), dual-path PCAP parsing (0005), and adaptive
-  pipeline execution (0006).
+  pipeline execution (0006), and packet-storage allocation experiments (0007).
 
 - `docs/encapsulation-playbook.md`
   Operational and engineering guidance for captures that contain VLAN, QinQ, MPLS, or other outer
