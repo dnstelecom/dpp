@@ -354,11 +354,42 @@ fn worker_shard_ranges(shard_count: usize, worker_count: usize) -> Vec<Range<usi
         .collect()
 }
 
-fn worker_for_shard(shard_idx: usize, worker_ranges: &[Range<usize>]) -> usize {
-    worker_ranges
-        .iter()
-        .position(|range| range.contains(&shard_idx))
-        .expect("worker ranges must cover every shard index")
+struct ShardRoutingPlan {
+    worker_ranges: Vec<Range<usize>>,
+    shard_to_worker: Vec<usize>,
+}
+
+impl ShardRoutingPlan {
+    fn new(shard_count: usize, worker_count: usize) -> Self {
+        debug_assert!(shard_count > 0);
+        debug_assert!(worker_count > 0);
+        debug_assert!(worker_count <= shard_count);
+
+        let worker_ranges = worker_shard_ranges(shard_count, worker_count);
+        let mut shard_to_worker = vec![usize::MAX; shard_count];
+        for (worker_idx, shard_range) in worker_ranges.iter().enumerate() {
+            shard_to_worker[shard_range.clone()].fill(worker_idx);
+        }
+        debug_assert!(
+            shard_to_worker
+                .iter()
+                .all(|worker_idx| *worker_idx < worker_count),
+            "worker ranges must cover every shard index"
+        );
+
+        Self {
+            worker_ranges,
+            shard_to_worker,
+        }
+    }
+
+    fn shard_count(&self) -> usize {
+        self.shard_to_worker.len()
+    }
+
+    fn worker_for_shard(&self, shard_idx: usize) -> usize {
+        self.shard_to_worker[shard_idx]
+    }
 }
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
@@ -396,14 +427,15 @@ fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
 
 fn route_batch_to_worker_batches(
     mut packet_batch: PacketBatch,
-    shard_count: usize,
-    worker_ranges: &[Range<usize>],
+    routing_plan: &ShardRoutingPlan,
 ) -> RoutedWorkerBatches {
+    let shard_count = routing_plan.shard_count();
     debug_assert!(shard_count > 0);
     sort_packet_batch(packet_batch.as_mut_slice());
     let batch_max_timestamp_micros = packet_batch.last().map(|packet| packet.timestamp_micros);
 
-    let mut worker_batches: Vec<Vec<RoutedDnsPackets>> = worker_ranges
+    let mut worker_batches: Vec<Vec<RoutedDnsPackets>> = routing_plan
+        .worker_ranges
         .iter()
         .map(|range| {
             (0..range.len())
@@ -424,8 +456,8 @@ fn route_batch_to_worker_batches(
         };
 
         let shard_idx = shard_map_index(udp_dns_meta.flow_key, shard_count);
-        let worker_idx = worker_for_shard(shard_idx, worker_ranges);
-        let local_shard_idx = shard_idx - worker_ranges[worker_idx].start;
+        let worker_idx = routing_plan.worker_for_shard(shard_idx);
+        let local_shard_idx = shard_idx - routing_plan.worker_ranges[worker_idx].start;
         worker_batches[worker_idx][local_shard_idx].push(packet_data, udp_dns_meta);
     }
 
@@ -486,6 +518,7 @@ fn run_phase_processing_worker(
     } else {
         vec![MatcherShardState::default()]
     };
+    let routing_plan = ShardRoutingPlan::new(shard_count, shard_count);
 
     let mut counters = PipelineCounters::default();
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -496,11 +529,7 @@ fn run_phase_processing_worker(
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches: shard_batches,
-        } = route_batch_to_worker_batches(
-            packet_batch,
-            shard_count,
-            &worker_shard_ranges(shard_count, shard_count),
-        );
+        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
 
         let mut shard_results: Vec<(usize, ShardProcessingResult)> = shard_batches
             .into_par_iter()
@@ -552,10 +581,9 @@ fn run_phase_processing_worker(
 fn run_parser_stage(
     batch_rx: Receiver<PacketBatch>,
     worker_txs: Vec<Sender<MatcherBatchWork>>,
-    shard_count: usize,
+    routing_plan: ShardRoutingPlan,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let worker_ranges = worker_shard_ranges(shard_count, worker_txs.len());
     let mut batch_seq = 0_u64;
 
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -566,7 +594,7 @@ fn run_parser_stage(
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(packet_batch, shard_count, &worker_ranges);
+        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
 
         for (worker_idx, shard_packets) in worker_batches.into_iter().enumerate() {
             worker_txs[worker_idx]
@@ -755,14 +783,14 @@ fn run_staged_processing_pipeline(
     intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
-    let worker_ranges = worker_shard_ranges(shard_count, worker_count);
+    let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
     let (result_tx, result_rx) =
         crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH * worker_count.max(1));
 
     let mut worker_txs = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
 
-    for (worker_idx, shard_range) in worker_ranges.iter().cloned().enumerate() {
+    for (worker_idx, shard_range) in routing_plan.worker_ranges.iter().cloned().enumerate() {
         let (worker_tx, worker_rx) = crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH);
         worker_txs.push(worker_tx);
 
@@ -807,7 +835,7 @@ fn run_staged_processing_pipeline(
                     staged_parser_affinity_slot(worker_count),
                     "staged parser",
                 );
-                run_parser_stage(batch_rx, worker_txs, shard_count, output_closed)
+                run_parser_stage(batch_rx, worker_txs, routing_plan, output_closed)
             }
         })?;
 
@@ -1201,14 +1229,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_for_shard_handles_uneven_ranges() {
-        let ranges = vec![0..1, 1..4, 4..7];
+    fn shard_routing_plan_covers_even_and_uneven_worker_ranges() {
+        for (shard_count, worker_count) in [(1, 1), (7, 3), (8, 8), (64, 14)] {
+            let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
 
-        assert_eq!(worker_for_shard(0, &ranges), 0);
-        assert_eq!(worker_for_shard(1, &ranges), 1);
-        assert_eq!(worker_for_shard(3, &ranges), 1);
-        assert_eq!(worker_for_shard(4, &ranges), 2);
-        assert_eq!(worker_for_shard(6, &ranges), 2);
+            assert_eq!(routing_plan.shard_to_worker.len(), shard_count);
+            for shard_idx in 0..shard_count {
+                let worker_idx = routing_plan.worker_for_shard(shard_idx);
+                assert!(worker_idx < worker_count);
+                assert!(routing_plan.worker_ranges[worker_idx].contains(&shard_idx));
+            }
+        }
+
+        let uneven = ShardRoutingPlan::new(7, 3);
+        assert_eq!(uneven.worker_ranges, vec![0..2, 2..4, 4..7]);
+        assert_eq!(uneven.shard_to_worker, vec![0, 0, 1, 1, 2, 2, 2]);
     }
 
     #[test]
@@ -1436,10 +1471,7 @@ mod tests {
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = {
-            let whole_batch = 0..4;
-            route_batch_to_worker_batches(batch, 4, std::slice::from_ref(&whole_batch))
-        };
+        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1));
 
         let ordered_packets = worker_batches[0]
             .iter()
@@ -1572,8 +1604,7 @@ mod tests {
             mut worker_batches,
         } = route_batch_to_worker_batches(
             oversized_qname_batch("matcher-worker-oversized-qname"),
-            1,
-            std::slice::from_ref(&worker_range),
+            &ShardRoutingPlan::new(1, 1),
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1622,8 +1653,7 @@ mod tests {
             mut worker_batches,
         } = route_batch_to_worker_batches(
             unresolved_query_batch("matcher-worker-signal-shutdown"),
-            1,
-            std::slice::from_ref(&worker_range),
+            &ShardRoutingPlan::new(1, 1),
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
