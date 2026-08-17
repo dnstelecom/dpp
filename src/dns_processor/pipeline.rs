@@ -23,11 +23,24 @@ use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::{OutputMessage, OutputRecordBatches};
 use crate::packet_parser::{PacketBatch, PacketData, PacketParser, sort_packet_batch};
 use crate::record::DnsRecord;
+use crate::runtime::AffinityPlan;
 
 const BATCH_PREFETCH_DEPTH: usize = 2;
 const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
+
+fn staged_matcher_affinity_slot(worker_idx: usize) -> usize {
+    worker_idx
+}
+
+fn staged_parser_affinity_slot(worker_count: usize) -> usize {
+    worker_count
+}
+
+fn staged_aggregator_affinity_slot(worker_count: usize) -> usize {
+    worker_count + 1
+}
 
 struct PipelineCounters {
     oversized_qname_message_count: usize,
@@ -737,6 +750,7 @@ fn run_staged_processing_pipeline(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     worker_count: usize,
+    affinity_plan: AffinityPlan,
     shutdown_requested: Arc<AtomicBool>,
     intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
@@ -761,7 +775,12 @@ fn run_staged_processing_pipeline(
                     let shutdown_requested = Arc::clone(&shutdown_requested);
                     let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
+                    let affinity_plan = affinity_plan.clone();
                     move || {
+                        affinity_plan.apply_to_current_thread(
+                            staged_matcher_affinity_slot(worker_idx),
+                            "staged matcher worker",
+                        );
                         run_matcher_worker(
                             dns_processor,
                             worker_idx,
@@ -782,9 +801,20 @@ fn run_staged_processing_pipeline(
         .name("DPP_Parser".to_string())
         .spawn({
             let output_closed = Arc::clone(&output_closed);
-            move || run_parser_stage(batch_rx, worker_txs, shard_count, output_closed)
+            let affinity_plan = affinity_plan.clone();
+            move || {
+                affinity_plan.apply_to_current_thread(
+                    staged_parser_affinity_slot(worker_count),
+                    "staged parser",
+                );
+                run_parser_stage(batch_rx, worker_txs, shard_count, output_closed)
+            }
         })?;
 
+    affinity_plan.apply_to_current_thread(
+        staged_aggregator_affinity_slot(worker_count),
+        "staged aggregator",
+    );
     let aggregator_result = run_aggregator(result_rx, tx, worker_count, output_closed);
 
     let parser_result = join_thread(parser_handle, "Parser stage");
@@ -808,6 +838,7 @@ impl DnsProcessor {
         packet_count: &Arc<AtomicUsize>,
         tx: &Sender<OutputMessage>,
         execution_budget: ExecutionBudget,
+        affinity_plan: AffinityPlan,
         shard_parallelism_enabled: bool,
         shutdown_requested: Arc<AtomicBool>,
         output_closed: Arc<AtomicBool>,
@@ -852,6 +883,7 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             worker_count,
+                            affinity_plan,
                             shutdown_requested,
                             intake_failed,
                             output_closed,
@@ -958,6 +990,7 @@ mod tests {
         make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
     };
     use std::fs;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn shard_result(token: usize) -> ShardProcessingResult {
@@ -1109,6 +1142,58 @@ mod tests {
     }
 
     #[test]
+    fn staged_pipeline_applies_affinity_to_every_processing_role() {
+        let path = temp_test_path("pipeline-staged-affinity", "pcap");
+        fs::write(&path, classic_pcap_bytes(&[])).expect("empty pcap written");
+
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let affinity_plan = AffinityPlan::for_test(vec![2, 5, 9, 12, 17], {
+            let applied = Arc::clone(&applied);
+            move |core_id| {
+                let thread_name = thread::current().name().unwrap_or("unnamed").to_string();
+                applied
+                    .lock()
+                    .expect("affinity record lock")
+                    .push((thread_name, core_id));
+                true
+            }
+        })
+        .expect("test affinity plan resolves");
+
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let packet_count = Arc::new(AtomicUsize::new(0));
+        let (output_tx, _output_rx) = crossbeam::channel::unbounded();
+
+        DnsProcessor::dns_processing_loop(
+            Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+            &mut parser,
+            &packet_count,
+            &output_tx,
+            ExecutionBudget::from_available_cpus(5),
+            affinity_plan,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("staged pipeline completes");
+        fs::remove_file(path).expect("empty pcap removed");
+
+        let mut applied = applied.lock().expect("affinity record lock").clone();
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec![
+                ("DPP_Matcher_0".to_string(), 2),
+                ("DPP_Matcher_1".to_string(), 5),
+                ("DPP_Matcher_2".to_string(), 9),
+                ("DPP_Parser".to_string(), 12),
+                ("DPP_Staged_Pipeline".to_string(), 17),
+            ]
+        );
+    }
+
+    #[test]
     fn non_parallel_mode_collapses_to_single_worker() {
         let staged_budget = ExecutionBudget::from_available_cpus(16);
 
@@ -1221,6 +1306,7 @@ mod tests {
                 &packet_count,
                 &output_tx,
                 ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
                 true,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
@@ -1266,6 +1352,7 @@ mod tests {
                 &packet_count,
                 &output_tx,
                 ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
                 true,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),

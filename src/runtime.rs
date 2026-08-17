@@ -10,6 +10,7 @@ use crate::config::{AppConfig, InputSource, ReportFormat, WORKER_STACK_SIZE_MB};
 use crate::error::RuntimeError;
 use crate::monitor_memory;
 use crate::pipeio::BrokenPipeTolerantMakeWriter;
+use core_affinity::CoreId;
 use num_format::{Locale, ToFormattedString};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -21,13 +22,105 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 use sysinfo::System;
 use tracing::Level;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_log::LogTracer;
 use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
 fn rayon_thread_name(index: usize) -> String {
     format!("DPP_Rayon_{index}")
+}
+
+type PinCurrentThread = dyn Fn(CoreId) -> bool + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct AffinityPlan {
+    core_ids: Option<Arc<[CoreId]>>,
+    pin_current_thread: Arc<PinCurrentThread>,
+}
+
+impl AffinityPlan {
+    pub(crate) fn resolve(enabled: bool) -> Result<Self, RuntimeError> {
+        Self::resolve_with(
+            enabled,
+            core_affinity::get_core_ids,
+            core_affinity::set_for_current,
+        )
+    }
+
+    fn resolve_with<GetCoreIds, PinCurrent>(
+        enabled: bool,
+        get_core_ids: GetCoreIds,
+        pin_current_thread: PinCurrent,
+    ) -> Result<Self, RuntimeError>
+    where
+        GetCoreIds: FnOnce() -> Option<Vec<CoreId>>,
+        PinCurrent: Fn(CoreId) -> bool + Send + Sync + 'static,
+    {
+        let core_ids = if enabled {
+            let core_ids = get_core_ids()
+                .filter(|core_ids| !core_ids.is_empty())
+                .ok_or(RuntimeError::CoreIdsUnavailable)?;
+            Some(Arc::<[CoreId]>::from(core_ids))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            core_ids,
+            pin_current_thread: Arc::new(pin_current_thread),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self::resolve(false).expect("disabled affinity does not query the operating system")
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.core_ids.is_some()
+    }
+
+    fn core_id_for_slot(&self, slot: usize) -> Option<CoreId> {
+        self.core_ids
+            .as_ref()
+            .map(|core_ids| core_ids[slot % core_ids.len()])
+    }
+
+    pub(crate) fn apply_to_current_thread(&self, slot: usize, role: &str) -> bool {
+        let Some(core_id) = self.core_id_for_slot(slot) else {
+            return true;
+        };
+
+        if (self.pin_current_thread)(core_id) {
+            debug!(
+                "Applied CPU affinity to {role} using OS affinity ID {}",
+                core_id.id
+            );
+            true
+        } else {
+            warn!(
+                "Unable to apply CPU affinity to {role} using OS affinity ID {}",
+                core_id.id
+            );
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test<PinCurrent>(
+        core_ids: Vec<usize>,
+        pin_current_thread: PinCurrent,
+    ) -> Result<Self, RuntimeError>
+    where
+        PinCurrent: Fn(usize) -> bool + Send + Sync + 'static,
+    {
+        Self::resolve_with(
+            true,
+            || Some(core_ids.into_iter().map(|id| CoreId { id }).collect()),
+            move |core_id| pin_current_thread(core_id.id),
+        )
+    }
 }
 
 fn pipe_tolerant_stderr() -> BrokenPipeTolerantMakeWriter<fn() -> io::Stderr> {
@@ -52,23 +145,18 @@ pub(crate) fn maybe_start_memory_monitoring(
     }
 }
 
-pub(crate) fn create_thread_pool(num_threads: usize, affinity: bool) -> Result<(), RuntimeError> {
-    let core_ids = if affinity {
-        Some(core_affinity::get_core_ids().ok_or(RuntimeError::CoreIdsUnavailable)?)
-    } else {
-        None
-    };
-
+pub(crate) fn create_thread_pool(
+    num_threads: usize,
+    affinity_plan: AffinityPlan,
+) -> Result<(), RuntimeError> {
     let mut builder = ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .thread_name(rayon_thread_name)
         .stack_size(WORKER_STACK_SIZE_MB * 1024 * 1024);
 
-    if let Some(core_ids) = core_ids {
+    if affinity_plan.is_enabled() {
         builder = builder.start_handler(move |index| {
-            let core_id = core_ids[index % core_ids.len()];
-            core_affinity::set_for_current(core_id);
-            debug!("Thread {} is assigned to core {:?}", index, core_id.id);
+            affinity_plan.apply_to_current_thread(index, "Rayon worker");
         });
     }
 
@@ -126,7 +214,7 @@ pub(crate) fn log_system_info(args: &AppConfig) -> Result<(), RuntimeError> {
 
     info!("OS: {}, ARCH: {}", formatted_os, std::env::consts::ARCH);
     info!(
-        "Available parallelism: {}, execution budget: auto (all available CPUs), Affinity: {}",
+        "Available parallelism: {}, execution budget: auto (all available CPUs), affinity requested: {}",
         args.num_cpus, args.affinity,
     );
     info!(
@@ -298,8 +386,71 @@ fn format_os_name(os: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, format_os_name, rayon_thread_name};
+    use super::{
+        AffinityPlan, CoreId, RuntimeError, format_duration, format_os_name, rayon_thread_name,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn disabled_affinity_plan_does_not_query_or_pin_cores() {
+        let getter_called = Arc::new(AtomicBool::new(false));
+        let setter_called = Arc::new(AtomicBool::new(false));
+        let plan = AffinityPlan::resolve_with(
+            false,
+            {
+                let getter_called = Arc::clone(&getter_called);
+                move || {
+                    getter_called.store(true, Ordering::Relaxed);
+                    Some(vec![CoreId { id: 2 }])
+                }
+            },
+            {
+                let setter_called = Arc::clone(&setter_called);
+                move |_| {
+                    setter_called.store(true, Ordering::Relaxed);
+                    true
+                }
+            },
+        )
+        .expect("disabled plan resolves");
+
+        assert!(plan.apply_to_current_thread(0, "test worker"));
+        assert!(!getter_called.load(Ordering::Relaxed));
+        assert!(!setter_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn affinity_plan_rejects_missing_or_empty_core_ids() {
+        for core_ids in [None, Some(Vec::new())] {
+            let result = AffinityPlan::resolve_with(true, move || core_ids, |_| true);
+            assert!(matches!(result, Err(RuntimeError::CoreIdsUnavailable)));
+        }
+    }
+
+    #[test]
+    fn affinity_plan_preserves_sparse_ids_and_wraps_slots() {
+        let applied_core = Arc::new(std::sync::Mutex::new(None));
+        let plan = AffinityPlan::resolve_with(
+            true,
+            || Some(vec![CoreId { id: 2 }, CoreId { id: 5 }, CoreId { id: 9 }]),
+            {
+                let applied_core = Arc::clone(&applied_core);
+                move |core_id| {
+                    *applied_core.lock().expect("applied core lock") = Some(core_id.id);
+                    false
+                }
+            },
+        )
+        .expect("affinity plan resolves");
+
+        assert_eq!(plan.core_id_for_slot(0).map(|core_id| core_id.id), Some(2));
+        assert_eq!(plan.core_id_for_slot(1).map(|core_id| core_id.id), Some(5));
+        assert_eq!(plan.core_id_for_slot(3).map(|core_id| core_id.id), Some(2));
+        assert!(!plan.apply_to_current_thread(4, "test worker"));
+        assert_eq!(*applied_core.lock().expect("applied core lock"), Some(5));
+    }
 
     #[test]
     fn format_duration_supports_more_than_twenty_four_hours() {

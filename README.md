@@ -202,7 +202,7 @@ Notes:
 | `-b, --bonded <N>`                | Set I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the safe default bounded capacity |
 | `-z, --zstd`                      | Enable Zstd compression for Parquet output                                                                          |
 | `--v2`                            | Use Parquet Version 2                                                                                               |
-| `-a, --affinity`                  | Enable core affinity                                                                                                |
+| `-a, --affinity`                  | Apply CPU affinity to processing threads                                                                            |
 | `--dns-wire-fast-path`            | Enable the optional question-only DNS wire fast path with `hickory` fallback                                        |
 | `--anonymize <path>`              | Path to the pseudonymization key file                                                                               |
 | `-h, --help`                      | Print help                                                                                                          |
@@ -221,7 +221,7 @@ Notes:
 | `DPP_BONDED`             | I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the default bounded capacity |
 | `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
 | `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
-| `DPP_AFFINITY`           | Enable CPU affinity                                                                                                       |
+| `DPP_AFFINITY`           | Apply CPU affinity to processing threads                                                                                  |
 | `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                                    |
 | `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                            |
 | `DPP_SILENT`             | Suppress info-level log output                                                                                            |
@@ -365,7 +365,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.046  INFO > Commercial licensing options: carrier-support@dnstele.com
 04:15:01.046  INFO > Nameto Oy (c) 2026. All rights reserved.
 04:15:01.062  INFO OS: Linux, ARCH: x86_64
-04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), Affinity: false
+04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), affinity requested: false
 04:15:01.062  INFO Free memory (system reported): 2,857 MB
 04:15:01.062  INFO Starting to process PCAP file: /mnt/mirror/src/dpp/server1_jul_2024.pcap
 04:15:01.062  INFO Processing mode: forward sorting with response-query matching

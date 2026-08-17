@@ -523,8 +523,9 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let shutdown_requested = runtime::install_shutdown_signal_handler()?;
     let output_closed = Arc::new(AtomicBool::new(false));
     let execution_budget = args.execution_budget();
+    let affinity_plan = runtime::AffinityPlan::resolve(args.affinity)?;
     if let Some(rayon_threads) = execution_budget.rayon_threads {
-        runtime::create_thread_pool(rayon_threads, args.affinity)?;
+        runtime::create_thread_pool(rayon_threads, affinity_plan.clone())?;
     }
 
     let packet_count = Arc::new(AtomicUsize::new(0));
@@ -575,6 +576,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         &packet_count,
         &tx,
         execution_budget,
+        affinity_plan,
         true,
         Arc::clone(&shutdown_requested),
         Arc::clone(&output_closed),

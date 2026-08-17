@@ -123,7 +123,7 @@ fn build_cli(version: &'static str) -> Command {
   DPP_OUTPUT_FILENAME   Name of the output file (use '-' to write CSV records to stdout; used if [output_filename] argument is not provided)
   DPP_ANONYMIZE         Path to the key file
   DPP_FILENAME          Path to the input PCAP file, or '-' to read the capture from stdin (used if [filename] argument is not provided)
-  DPP_AFFINITY          Set to 'true' to use cpu affinity
+  DPP_AFFINITY          Set to 'true' to apply CPU affinity to processing threads
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
   DPP_MONOTONIC_CAPTURE
@@ -224,7 +224,7 @@ LICENSE INFORMATION:
             Arg::new("affinity")
                 .long("affinity")
                 .short('a')
-                .help("Use core affinity")
+                .help("Apply CPU affinity to processing threads")
                 .action(ArgAction::SetTrue),
         )
         .arg(
