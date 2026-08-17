@@ -84,14 +84,27 @@ fn format_information(args: &AppConfig) -> &'static str {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTermination {
     Completed,
+    ProcessingFailed,
     DownstreamClosed,
     InterruptedBySignal,
 }
 
 impl RunTermination {
+    fn classify(processing_failed: bool, shutdown_requested: bool, output_closed: bool) -> Self {
+        if processing_failed {
+            Self::ProcessingFailed
+        } else if shutdown_requested {
+            Self::InterruptedBySignal
+        } else if output_closed {
+            Self::DownstreamClosed
+        } else {
+            Self::Completed
+        }
+    }
+
     fn output_shutdown_message(self) -> OutputMessage {
         match self {
-            RunTermination::Completed => OutputMessage::Shutdown,
+            RunTermination::Completed | RunTermination::ProcessingFailed => OutputMessage::Shutdown,
             RunTermination::DownstreamClosed | RunTermination::InterruptedBySignal => {
                 OutputMessage::Abort
             }
@@ -530,20 +543,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     processing_mode_info();
     display_channel_info(&args);
 
-    let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
-
     display_parquet_format_information(&args);
     display_anonymization(&args);
     display_parser_mode(&args);
     display_match_timeout(&args);
     display_monotonic_capture_mode(&args);
-
-    let (max_memory_usage, memory_thread) = runtime::maybe_start_memory_monitoring(args.silent)?;
-    let writer_thread = output::create_writer_thread(&args, rx)?;
-    info!(
-        "Results will be written to: {}",
-        canonical_path_string(&args.output_filename)
-    );
 
     let dns_processor = Arc::new(
         DnsProcessor::new_with_runtime_options(
@@ -557,7 +561,15 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let mut packet_parser = PacketParser::new(&args.input_source, args.monotonic_capture)
         .map_err(|source| AppRunError::PacketParserInit { source })?;
 
-    let counters = DnsProcessor::dns_processing_loop(
+    let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
+    let (max_memory_usage, memory_thread) = runtime::maybe_start_memory_monitoring(args.silent)?;
+    let writer_thread = output::create_writer_thread(&args, rx)?;
+    info!(
+        "Results will be written to: {}",
+        canonical_path_string(&args.output_filename)
+    );
+
+    let processing_result = DnsProcessor::dns_processing_loop(
         dns_processor,
         &mut packet_parser,
         &packet_count,
@@ -567,31 +579,50 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         Arc::clone(&shutdown_requested),
         Arc::clone(&output_closed),
     )
-    .map_err(|source| AppRunError::Processing { source })?;
+    .map_err(|source| AppRunError::Processing { source });
     let processing_seconds = start_time.elapsed().as_secs_f64();
 
     let io_flush_start = Instant::now();
-    let termination = if shutdown_requested.load(AtomicOrdering::SeqCst) {
-        RunTermination::InterruptedBySignal
-    } else if output_closed.load(AtomicOrdering::Relaxed) {
-        RunTermination::DownstreamClosed
-    } else {
-        RunTermination::Completed
-    };
+    let termination = RunTermination::classify(
+        processing_result.is_err(),
+        shutdown_requested.load(AtomicOrdering::SeqCst),
+        output_closed.load(AtomicOrdering::Relaxed),
+    );
     let shutdown_result = tx.send(termination.output_shutdown_message());
     drop(tx);
 
-    if let Some(memory_thread) = memory_thread {
+    let memory_shutdown_result = if let Some(memory_thread) = memory_thread {
         memory_thread.stop();
-        memory_thread
-            .join()
-            .map_err(|source| AppRunError::MemoryMonitorShutdown { source })?;
-    }
+        memory_thread.join()
+    } else {
+        Ok(())
+    };
 
-    let writer_result = writer_thread
-        .join()
-        .map_err(|e| OutputError::WriterThreadPanic(format!("{:?}", e)))?;
-    finalize_output_shutdown(shutdown_result, writer_result)?;
+    let writer_result = match writer_thread.join() {
+        Ok(result) => result,
+        Err(error) => Err(OutputError::WriterThreadPanic(format!("{:?}", error))),
+    };
+    let output_shutdown_result = finalize_output_shutdown(shutdown_result, writer_result);
+
+    let counters = match processing_result {
+        Ok(counters) => {
+            output_shutdown_result?;
+            memory_shutdown_result
+                .map_err(|source| AppRunError::MemoryMonitorShutdown { source })?;
+            counters
+        }
+        Err(processing_error) => {
+            if let Err(error) = memory_shutdown_result {
+                tracing::error!(
+                    "Memory monitor teardown also failed after processing error: {error}"
+                );
+            }
+            if let Err(error) = output_shutdown_result {
+                tracing::error!("Output teardown also failed after processing error: {error}");
+            }
+            return Err(processing_error);
+        }
+    };
 
     if matches!(termination, RunTermination::DownstreamClosed) {
         return Ok(());
@@ -1086,6 +1117,22 @@ mod tests {
             RunTermination::Completed.output_shutdown_message(),
             OutputMessage::Shutdown
         ));
+    }
+
+    #[test]
+    fn processing_failure_flushes_partial_output_on_shutdown() {
+        assert!(matches!(
+            RunTermination::ProcessingFailed.output_shutdown_message(),
+            OutputMessage::Shutdown
+        ));
+    }
+
+    #[test]
+    fn processing_failure_takes_precedence_over_concurrent_shutdown() {
+        assert_eq!(
+            RunTermination::classify(true, true, true),
+            RunTermination::ProcessingFailed
+        );
     }
 
     #[test]

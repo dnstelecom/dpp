@@ -165,7 +165,9 @@ repeating it for full DNS question decoding.
 
 - `src/app.rs`
   Top-level orchestration layer. Owns the ordered run sequence, process reporting, and shutdown
-  coordination without taking ownership of canonical configuration or writer internals. The final
+  coordination without taking ownership of canonical configuration or writer internals. Capture
+  read failures drain and join complete accepted batches, skip unmatched-query finalization, flush
+  conclusive records as valid partial output, and only then return the processing error. The final
   run summary is also where aggregate matching-quality metrics such as timeout ratio and average
   matched RTT are derived from authoritative processing counters. Parser rejections caused by an
   oversized decompressed QNAME are exposed as

@@ -463,6 +463,7 @@ fn run_phase_processing_worker(
     shard_count: usize,
     shard_parallelism_enabled: bool,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
@@ -514,7 +515,9 @@ fn run_phase_processing_worker(
         }
     }
 
-    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref())
+        && !intake_failed.load(AtomicOrdering::SeqCst)
+    {
         let mut finalization_results: Vec<(usize, ShardProcessingResult)> = shard_states
             .par_iter_mut()
             .enumerate()
@@ -588,6 +591,7 @@ fn run_matcher_worker(
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
@@ -636,7 +640,9 @@ fn run_matcher_worker(
     }
 
     let mut finalization = ShardProcessingResult::default();
-    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref())
+        && !intake_failed.load(AtomicOrdering::SeqCst)
+    {
         for state in &mut shard_states {
             merge_shard_results(&mut finalization, dns_processor.finalize_shard(state));
         }
@@ -732,6 +738,7 @@ fn run_staged_processing_pipeline(
     shard_count: usize,
     worker_count: usize,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let worker_ranges = worker_shard_ranges(shard_count, worker_count);
@@ -752,6 +759,7 @@ fn run_staged_processing_pipeline(
                     let dns_processor = Arc::clone(&dns_processor);
                     let result_tx = result_tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_matcher_worker(
@@ -761,6 +769,7 @@ fn run_staged_processing_pipeline(
                             worker_rx,
                             result_tx,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -808,6 +817,7 @@ impl DnsProcessor {
         let worker_count =
             matcher_worker_count(execution_budget, shard_parallelism_enabled, shard_count);
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(BATCH_PREFETCH_DEPTH);
+        let intake_failed = Arc::new(AtomicBool::new(false));
 
         if execution_budget.uses_staged_pipeline() {
             tracing::info!(
@@ -833,6 +843,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_staged_processing_pipeline(
@@ -842,6 +853,7 @@ impl DnsProcessor {
                             shard_count,
                             worker_count,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -853,6 +865,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_phase_processing_worker(
@@ -862,6 +875,7 @@ impl DnsProcessor {
                             shard_count,
                             shard_parallelism_enabled,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -869,35 +883,43 @@ impl DnsProcessor {
         };
 
         let mut processed_packet_count = 0usize;
-        while !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
-            let Some(packet_batch) = packet_parser.next_batch(PACKET_BATCH_SIZE)? else {
-                break;
-            };
+        let intake_result = (|| -> anyhow::Result<()> {
+            while !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                let Some(packet_batch) = packet_parser.next_batch(PACKET_BATCH_SIZE)? else {
+                    break;
+                };
 
-            if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
-                break;
+                if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                    break;
+                }
+
+                let packet_batch_len = packet_batch.len();
+                batch_tx
+                    .send(packet_batch)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "Failed to hand off packet batch to processing pipeline: {}",
+                            err
+                        )
+                    })
+                    .or_else(|error| {
+                        if output_closed.load(AtomicOrdering::Relaxed) {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })?;
+                if output_closed.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                processed_packet_count += packet_batch_len;
             }
 
-            let packet_batch_len = packet_batch.len();
-            batch_tx
-                .send(packet_batch)
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "Failed to hand off packet batch to processing pipeline: {}",
-                        err
-                    )
-                })
-                .or_else(|error| {
-                    if output_closed.load(AtomicOrdering::Relaxed) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })?;
-            if output_closed.load(AtomicOrdering::Relaxed) {
-                break;
-            }
-            processed_packet_count += packet_batch_len;
+            Ok(())
+        })();
+
+        if intake_result.is_err() {
+            intake_failed.store(true, AtomicOrdering::SeqCst);
         }
 
         if shutdown_requested.load(AtomicOrdering::SeqCst) {
@@ -908,8 +930,19 @@ impl DnsProcessor {
 
         drop(batch_tx);
 
-        let counters = join_thread(pipeline_handle, "Processing pipeline")?;
+        let pipeline_result = join_thread(pipeline_handle, "Processing pipeline");
         packet_count.store(processed_packet_count, AtomicOrdering::Relaxed);
+
+        if let Err(intake_error) = intake_result {
+            if let Err(pipeline_error) = pipeline_result {
+                tracing::error!(
+                    "Processing pipeline teardown also failed after intake error: {pipeline_error:#}"
+                );
+            }
+            return Err(intake_error);
+        }
+
+        let counters = pipeline_result?;
 
         Ok(counters.finalize(processed_packet_count))
     }
@@ -925,7 +958,7 @@ mod tests {
         make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
     };
     use std::fs;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn shard_result(token: usize) -> ShardProcessingResult {
         ShardProcessingResult {
@@ -987,6 +1020,52 @@ mod tests {
         fs::remove_file(&path).expect("test pcap removed");
 
         batch
+    }
+
+    fn capture_with_complete_batch_then_truncated_record(test_name: &str) -> std::path::PathBuf {
+        let path = temp_test_path(test_name, "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let query_packet = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response_packet = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let non_dns_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE);
+        packets.push((1, 0, query_packet.as_slice()));
+        packets.push((1, 200_000, response_packet.as_slice()));
+        packets.push((2, 0, query_packet.as_slice()));
+        packets.extend(std::iter::repeat_n(
+            (3, 0, non_dns_packet.as_slice()),
+            PACKET_BATCH_SIZE - packets.len(),
+        ));
+
+        let mut capture = classic_pcap_bytes(&packets);
+        capture.extend_from_slice(&4_u32.to_le_bytes());
+        capture.extend_from_slice(&0_u32.to_le_bytes());
+        capture.extend_from_slice(&64_u32.to_le_bytes());
+        capture.extend_from_slice(&64_u32.to_le_bytes());
+        capture.extend_from_slice(&[0_u8; 3]);
+        fs::write(&path, capture).expect("truncated test pcap written");
+        path
     }
 
     #[test]
@@ -1097,6 +1176,49 @@ mod tests {
     }
 
     #[test]
+    fn intake_error_joins_both_pipeline_models_without_timeout_finalization() {
+        let path = capture_with_complete_batch_then_truncated_record("pipeline-intake-error");
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+            let result = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+
+            assert!(result.is_err(), "available_cpus={available_cpus}");
+            assert_eq!(
+                packet_count.load(AtomicOrdering::Relaxed),
+                PACKET_BATCH_SIZE,
+                "available_cpus={available_cpus}"
+            );
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    message => panic!("unexpected output message: {message:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
@@ -1169,6 +1291,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
@@ -1206,6 +1329,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
@@ -1233,6 +1357,7 @@ mod tests {
             1,
             false,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
@@ -1273,6 +1398,7 @@ mod tests {
             worker_range,
             batch_rx,
             result_tx,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1323,6 +1449,7 @@ mod tests {
             batch_rx,
             result_tx,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
         .expect("matcher worker completes");

@@ -491,6 +491,8 @@ Additional notes:
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
 - DPP does not reassemble IPv4 fragments, so fragmented IPv4 datagrams are skipped.
+- If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
+  from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
 - **Outer encapsulation layers:** The fast extraction path assumes Ethernet followed by IPv4 or IPv6. Captures containing VLAN, QinQ, MPLS, or similar outer encapsulation layers may require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.

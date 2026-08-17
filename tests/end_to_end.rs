@@ -236,6 +236,93 @@ fn input_file_is_preserved_when_output_path_is_the_same_file() {
 }
 
 #[test]
+fn midstream_capture_error_flushes_complete_partial_output() {
+    let input_path = temp_test_path("midstream-error-input", "pcap");
+    let output_path = temp_test_path("midstream-error-output", "csv");
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut query_payload);
+    let mut response_payload = query_payload.clone();
+    response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let non_dns_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123, &[0_u8; 12]);
+
+    // The fixture fills the current ingest batch before the following malformed record is read.
+    let mut packets = Vec::with_capacity(65_536);
+    packets.push((1, 0, query_packet.as_slice()));
+    packets.push((1, 200_000, response_packet.as_slice()));
+    packets.push((2, 0, query_packet.as_slice()));
+    packets.extend(std::iter::repeat_n(
+        (3, 0, non_dns_packet.as_slice()),
+        65_536 - packets.len(),
+    ));
+
+    let mut capture = classic_pcap_bytes(&packets);
+    capture.extend_from_slice(&4_u32.to_le_bytes());
+    capture.extend_from_slice(&0_u32.to_le_bytes());
+    capture.extend_from_slice(&64_u32.to_le_bytes());
+    capture.extend_from_slice(&64_u32.to_le_bytes());
+    capture.extend_from_slice(&[0_u8; 3]);
+    fs::write(&input_path, capture).expect("truncated pcap written");
+
+    let output = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(!output.status.success(), "truncated capture must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("DNS processing failed"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("partial CSV is readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200000,10.0.0.1,53000,4660,example.com,A,No Error\n"
+        )
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(output_path).expect("remove output csv");
+}
+
+#[test]
+fn invalid_capture_header_does_not_create_output() {
+    let input_path = temp_test_path("invalid-header-input", "pcap");
+    let output_path = temp_test_path("invalid-header-output", "csv");
+    fs::write(&input_path, [0_u8; 3]).expect("invalid pcap written");
+
+    let output = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(!output.status.success(), "invalid capture must fail");
+    assert!(
+        !output_path.exists(),
+        "output must not be created before capture initialization succeeds"
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+}
+
+#[test]
 fn edns_badvers_round_trips_without_tsig_failure_report_label() {
     let input_path = temp_test_path("edns-badvers-response", "pcap");
     let output_path = temp_test_path("edns-badvers-response", "csv");
