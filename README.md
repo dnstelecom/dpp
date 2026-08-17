@@ -494,7 +494,7 @@ Additional notes:
 - If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
   from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
-- **Outer encapsulation layers:** The fast extraction path assumes Ethernet followed by IPv4 or IPv6. Captures containing VLAN, QinQ, MPLS, or similar outer encapsulation layers may require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
+- **Ethernet linktype only:** DPP rejects captures or packets declared with non-Ethernet linktypes instead of interpreting them as Ethernet. Ethernet frames containing VLAN, QinQ, MPLS, or similar outer encapsulation layers require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.
 - **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks because the output channel rounds the requested record backlog up to batched messages of up to `1024` records each.
 - **Monotonic-capture mode is explicit:** Batched timeout eviction is available only with `--monotonic-capture` because it depends on globally monotonic packet timestamps. If the capture is not monotonic, DPP aborts and recommends `reordercap`.

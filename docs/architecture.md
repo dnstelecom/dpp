@@ -58,8 +58,8 @@ flowchart LR
 The processing pipeline has four logical stages:
 
 1. Packet ingestion and ordering
-   Reads packets from an offline PCAP file and establishes deterministic packet order inside each
-   batch.
+   Reads packets from an offline PCAP file, rejects captures or packets declared with non-Ethernet
+   linktypes, and establishes deterministic packet order inside each batch.
 
 2. DNS extraction
    Parses Ethernet/IP/UDP payloads and builds DNS query/response candidates.
