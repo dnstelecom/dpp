@@ -686,6 +686,7 @@ dependencies = [
  "pcap-file",
  "pnet_packet",
  "rayon",
+ "same-file",
  "seahash",
  "serde",
  "serde_json",

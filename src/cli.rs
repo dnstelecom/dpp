@@ -87,6 +87,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
 
     let output_target = output_target_for_path(&output_filename);
     validate_output_path(&output_filename)?;
+    validate_distinct_input_output(&input_source, &output_filename)?;
     validate_output_mode(output_target, format, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
@@ -342,6 +343,29 @@ fn validate_output_path(output_path: &Path) -> Result<()> {
 
     if output_path.is_dir() {
         bail!("Error: The output file path is a directory, not a file.");
+    }
+
+    Ok(())
+}
+
+fn validate_distinct_input_output(input_source: &InputSource, output_path: &Path) -> Result<()> {
+    let InputSource::File(input_path) = input_source else {
+        return Ok(());
+    };
+
+    if matches!(output_target_for_path(output_path), OutputTarget::Stdout) || !output_path.exists()
+    {
+        return Ok(());
+    }
+
+    let paths_refer_to_same_file = same_file::is_same_file(input_path, output_path)
+        .context("Failed to compare input and output file identities")?;
+    if paths_refer_to_same_file {
+        bail!(
+            "Error: Input PCAP '{}' and output path '{}' refer to the same file; refusing to overwrite the input capture.",
+            input_path.display(),
+            output_path.display()
+        );
     }
 
     Ok(())
@@ -612,6 +636,66 @@ mod tests {
     #[test]
     fn stdout_output_sentinel_is_accepted() {
         validate_output_path(Path::new("-")).expect("stdout sentinel is accepted");
+    }
+
+    #[test]
+    fn hard_link_to_input_is_rejected_as_output() {
+        let input_path = unique_temp_path("same-file-input.pcap");
+        let output_path = unique_temp_path("same-file-output.csv");
+        fs::write(&input_path, b"pcap bytes").expect("writes input file");
+        fs::hard_link(&input_path, &output_path).expect("creates hard link to input");
+
+        let error = validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect_err("hard link to input must be rejected as output");
+
+        assert!(error.to_string().contains("refer to the same file"));
+        assert_eq!(
+            fs::read(&input_path).expect("reads preserved input"),
+            b"pcap bytes"
+        );
+
+        fs::remove_file(output_path).expect("removes hard link");
+        fs::remove_file(input_path).expect("removes input file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_output_is_rejected_as_input() {
+        use std::os::unix::fs::symlink;
+
+        let output_path = unique_temp_path("same-file-output.csv");
+        let input_path = unique_temp_path("same-file-input.pcap");
+        fs::write(&output_path, b"pcap bytes").expect("writes target file");
+        symlink(&output_path, &input_path).expect("creates input symlink");
+
+        let error = validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect_err("input symlink to output must be rejected");
+
+        assert!(error.to_string().contains("refer to the same file"));
+
+        fs::remove_file(input_path).expect("removes input symlink");
+        fs::remove_file(output_path).expect("removes target file");
+    }
+
+    #[test]
+    fn distinct_nonexistent_output_is_accepted() {
+        let input_path = unique_temp_path("distinct-input.pcap");
+        let output_path = unique_temp_path("distinct-output.csv");
+        fs::write(&input_path, b"pcap bytes").expect("writes input file");
+
+        validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect("distinct output path is accepted");
+
+        fs::remove_file(input_path).expect("removes input file");
     }
 
     #[test]

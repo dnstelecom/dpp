@@ -51,6 +51,7 @@ pnet_packet = "0.35"             # Packet parsing library for network packets
 rayon = "1.12"                    # Parallelism library for multithreaded processing
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] } # DNS protocol parsing library
 csv = "1.4"                       # CSV serialization and deserialization
+same-file = "1.0"                 # Cross-platform input/output file identity checks
 crossbeam = "0.8"                 # Concurrency support with channels and data structures
 anyhow = "1.0"                    # Error handling library
 num-format = "0.4"                # Number formatting for logging and output

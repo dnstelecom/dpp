@@ -98,6 +98,33 @@ fn matched_query_response_pair_round_trips_to_exact_csv_record() {
 }
 
 #[test]
+fn input_file_is_preserved_when_output_path_is_the_same_file() {
+    let input_path = temp_test_path("same-input-output", "pcap");
+    let input_bytes = classic_pcap_bytes(&[]);
+    fs::write(&input_path, &input_bytes).expect("test pcap written");
+
+    let output = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&input_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(!output.status.success(), "same input and output must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refer to the same file"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&input_path).expect("input pcap remains readable"),
+        input_bytes
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+}
+
+#[test]
 fn edns_badvers_round_trips_without_tsig_failure_report_label() {
     let input_path = temp_test_path("edns-badvers-response", "pcap");
     let output_path = temp_test_path("edns-badvers-response", "csv");

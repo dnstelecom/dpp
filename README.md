@@ -150,7 +150,8 @@ dpp --report-format json input.pcap output.csv > dpp-summary.json
 
 If `output_filename` is omitted, DPP chooses the default file name from the resolved output format:
 `dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or `pq`. Use `-` only when you
-want CSV records on stdout.
+want CSV records on stdout. DPP refuses to start when the input and output paths refer to the same
+file, including hard-link aliases, so the input capture cannot be overwritten.
 
 ### Create an anonymization key
 
