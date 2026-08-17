@@ -141,7 +141,10 @@ repeating it for full DNS question decoding.
   interrupted runs must not synthesize timeout tail records from incomplete matcher state. The
   staged pipeline may reuse parser-produced UDP/DNS metadata between routing and
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
-  parsing does not gain a second source of truth for IP/port extraction. The optional runtime flag
+  parsing does not gain a second source of truth for IP/port extraction. That metadata owns the
+  exact DNS byte range validated against IPv4 Total Length or IPv6 Payload Length and then UDP
+  Length; capture padding and trailing IP payload cannot extend the DNS slice. Fragmented IPv4
+  datagrams are skipped because this boundary has no IP reassembly stage. The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Both paths accept
   decompressed wire QNAMEs up to the RFC 1035 limit of 255 octets, including label-length octets and

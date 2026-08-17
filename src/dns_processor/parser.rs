@@ -27,6 +27,8 @@ const DNS_HEADER_LEN: usize = 12;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
 const IP_PROTOCOL_UDP: u8 = 17;
+const IPV4_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const DNS_PORT: u16 = 53;
 const DNS_POINTER_MASK: u8 = 0b1100_0000;
 const DNS_POINTER_TAG: u8 = 0b1100_0000;
@@ -47,6 +49,7 @@ pub(super) struct CanonicalFlowKey {
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
     pub(super) dns_offset: u16,
+    pub(super) dns_len: u16,
     pub(super) is_response: bool,
 }
 
@@ -84,8 +87,11 @@ impl ParsedUdpDnsMeta {
     }
 
     fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
-        data.get(usize::from(self.dns_offset)..)
-            .ok_or("Failed to parse UDP packet")
+        let start = usize::from(self.dns_offset);
+        let end = start
+            .checked_add(usize::from(self.dns_len))
+            .ok_or("Failed to parse UDP packet")?;
+        data.get(start..end).ok_or("Failed to parse UDP packet")
     }
 }
 
@@ -816,6 +822,25 @@ impl DnsProcessor {
             return Err("Failed to parse IPv4 packet");
         }
 
+        let total_length = usize::from(Self::parse_u16_at(
+            header,
+            2,
+            "Failed to parse IPv4 packet",
+        )?);
+        if total_length < header_len {
+            return Err("Failed to parse IPv4 packet");
+        }
+        let datagram = data
+            .get(..total_length)
+            .ok_or("Failed to parse IPv4 packet")?;
+
+        let flags_and_fragment_offset =
+            Self::parse_u16_at(header, 6, "Failed to parse IPv4 packet")?;
+        if flags_and_fragment_offset & (IPV4_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
+            // DNS extraction has no IPv4 fragment reassembly stage.
+            return Ok(None);
+        }
+
         if header[9] != IP_PROTOCOL_UDP {
             return Ok(None);
         }
@@ -828,7 +853,7 @@ impl DnsProcessor {
         ));
 
         Self::extract_udp_dns_from_transport(
-            &data[header_len..],
+            &datagram[header_len..],
             src_ip,
             dst_ip,
             l3_offset + header_len,
@@ -847,6 +872,18 @@ impl DnsProcessor {
             return Err("Failed to parse IPv6 packet");
         }
 
+        let payload_length = usize::from(Self::parse_u16_at(
+            header,
+            4,
+            "Failed to parse IPv6 packet",
+        )?);
+        let packet_length = IPV6_HEADER_LEN
+            .checked_add(payload_length)
+            .ok_or("Failed to parse IPv6 packet")?;
+        let payload = data
+            .get(IPV6_HEADER_LEN..packet_length)
+            .ok_or("Failed to parse IPv6 packet")?;
+
         if header[6] != IP_PROTOCOL_UDP {
             return Ok(None);
         }
@@ -858,12 +895,7 @@ impl DnsProcessor {
             <[u8; 16]>::try_from(&header[24..40]).unwrap(),
         ));
 
-        Self::extract_udp_dns_from_transport(
-            &data[IPV6_HEADER_LEN..],
-            src_ip,
-            dst_ip,
-            l3_offset + IPV6_HEADER_LEN,
-        )
+        Self::extract_udp_dns_from_transport(payload, src_ip, dst_ip, l3_offset + IPV6_HEADER_LEN)
     }
 
     fn extract_udp_dns_from_transport(
@@ -882,7 +914,12 @@ impl DnsProcessor {
             return Ok(None);
         }
 
-        let dns_data = data
+        let udp_length = usize::from(Self::parse_u16(data, 4)?);
+        if udp_length < UDP_HEADER_LEN {
+            return Err("Failed to parse UDP packet");
+        }
+        let datagram = data.get(..udp_length).ok_or("Failed to parse UDP packet")?;
+        let dns_data = datagram
             .get(UDP_HEADER_LEN..)
             .ok_or("Failed to parse UDP packet")?;
         if dns_data.len() < DNS_HEADER_LEN {
@@ -897,6 +934,8 @@ impl DnsProcessor {
             flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port),
             dns_offset: u16::try_from(dns_offset)
                 .map_err(|_| "UDP DNS offset exceeds supported range")?,
+            dns_len: u16::try_from(dns_data.len())
+                .map_err(|_| "UDP DNS payload exceeds supported range")?,
             is_response: src_port == DNS_PORT,
         }))
     }

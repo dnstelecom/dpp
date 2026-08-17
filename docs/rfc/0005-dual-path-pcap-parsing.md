@@ -52,6 +52,16 @@ The detection is a simple 4-byte magic check (`0xa1b2c3d4` or `0xd4c3b2a1` for c
 `0xa1b23c4d` or `0x4d3cb2a1` for nanosecond-resolution classic, `0x0a0d0d0a` for PCAPNG). For
 regular files, everything else goes to `libpcap`. For stdin streams, everything else is rejected.
 
+### IP and UDP boundaries
+
+The routing stage and shard-local DNS decoder share one `ParsedUdpDnsMeta` value containing the
+validated DNS offset and length. IPv4 Total Length or IPv6 Payload Length first bounds the IP
+payload; UDP Length then bounds the DNS payload. Bytes outside either declared boundary, including
+Ethernet padding and trailing capture bytes, never reach a DNS decoder.
+
+DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or a non-zero fragment
+offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
+
 ### DNS QNAME boundary
 
 The standard `hickory` DNS question decoder and the optional custom DNS wire fast path enforce the

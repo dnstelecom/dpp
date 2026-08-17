@@ -71,6 +71,48 @@ fn append_example_query(dns_payload: &mut Vec<u8>) {
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
 
+fn example_dns_query_packet() -> Vec<u8> {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_query(&mut dns_payload);
+    make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload)
+}
+
+fn make_ipv6_udp_dns_packet_with_payload(dns_payload: &[u8]) -> Vec<u8> {
+    let udp_length = 8 + dns_payload.len();
+    let mut packet = Vec::with_capacity(14 + 40 + udp_length);
+    packet.extend_from_slice(&[0, 1, 2, 3, 4, 5]);
+    packet.extend_from_slice(&[6, 7, 8, 9, 10, 11]);
+    packet.extend_from_slice(&0x86dd_u16.to_be_bytes());
+
+    packet.extend_from_slice(&[0x60, 0, 0, 0]);
+    packet.extend_from_slice(
+        &u16::try_from(udp_length)
+            .expect("test UDP length fits")
+            .to_be_bytes(),
+    );
+    packet.push(17);
+    packet.push(64);
+    packet.extend_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    packet.extend_from_slice(&[
+        0x20, 1, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]);
+
+    packet.extend_from_slice(&53_000_u16.to_be_bytes());
+    packet.extend_from_slice(&53_u16.to_be_bytes());
+    packet.extend_from_slice(
+        &u16::try_from(udp_length)
+            .expect("test UDP length fits")
+            .to_be_bytes(),
+    );
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+    packet.extend_from_slice(dns_payload);
+    packet
+}
+
+fn overwrite_u16(packet: &mut [u8], offset: usize, value: u16) {
+    packet[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
 fn append_repeated_byte_question(
     dns_payload: &mut Vec<u8>,
     labels: &[(usize, u8)],
@@ -530,6 +572,132 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
         assert_eq!(standard.query_type, assisted.query_type);
         assert_eq!(standard.response_code, assisted.response_code);
     }
+}
+
+#[test]
+fn parser_rejects_dns_beyond_ipv4_total_length() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 2, 20 + 8);
+
+    assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+    for processor in [test_processor(), test_processor_with_dns_wire_fast_path()] {
+        assert!(processor.process_packet_batch(&packet, 1_234_567).is_none());
+    }
+}
+
+#[test]
+fn parser_bounds_dns_decode_to_udp_length() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 20 + 4, 8 + 12);
+    let routing_meta =
+        DnsProcessor::packet_routing_meta(&packet).expect("bounded DNS header is routable");
+
+    assert_eq!(routing_meta.dns_len, 12);
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_invalid_ipv4_and_udp_lengths() {
+    let valid_packet = example_dns_query_packet();
+    let captured_ipv4_length =
+        u16::try_from(valid_packet.len() - 14).expect("test IPv4 length fits");
+    let declared_udp_length =
+        u16::from_be_bytes([valid_packet[14 + 20 + 4], valid_packet[14 + 20 + 5]]);
+
+    for (case, offset, value) in [
+        ("IPv4 total length below IHL", 14 + 2, 19),
+        (
+            "IPv4 total length beyond capture",
+            14 + 2,
+            captured_ipv4_length + 1,
+        ),
+        ("UDP length below header", 14 + 20 + 4, 7),
+        (
+            "UDP length beyond IPv4 payload",
+            14 + 20 + 4,
+            declared_udp_length + 1,
+        ),
+    ] {
+        let mut packet = valid_packet.clone();
+        overwrite_u16(&mut packet, offset, value);
+
+        assert!(
+            DnsProcessor::packet_routing_meta(&packet).is_none(),
+            "case={case}"
+        );
+        assert!(
+            test_processor()
+                .process_packet_batch(&packet, 1_234_567)
+                .is_none(),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn parser_skips_ipv4_fragments_without_reassembly() {
+    let valid_packet = example_dns_query_packet();
+
+    for (case, flags_and_offset) in [("more fragments", 0x2000), ("non-zero offset", 0x0001)] {
+        let mut packet = valid_packet.clone();
+        overwrite_u16(&mut packet, 14 + 6, flags_and_offset);
+
+        assert!(
+            DnsProcessor::packet_routing_meta(&packet).is_none(),
+            "case={case}"
+        );
+        assert!(
+            test_processor()
+                .process_packet_batch(&packet, 1_234_567)
+                .expect("unsupported fragment is skipped")
+                .is_empty(),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn parser_accepts_unfragmented_ipv4_with_df_and_frame_padding() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 6, 0x4000);
+    packet.extend_from_slice(&[0xaa; 32]);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let records = processor
+            .process_packet_batch(&packet, 1_234_567)
+            .expect("complete datagram parses");
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(records[0].name.as_str(), "example.com");
+    }
+}
+
+#[test]
+fn parser_rejects_udp_payload_beyond_ipv6_payload_length() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_query(&mut dns_payload);
+    let mut packet = make_ipv6_udp_dns_packet_with_payload(&dns_payload);
+    overwrite_u16(&mut packet, 14 + 4, 8);
+
+    assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+    assert!(
+        test_processor()
+            .process_packet_batch(&packet, 1_234_567)
+            .is_none()
+    );
 }
 
 #[test]
