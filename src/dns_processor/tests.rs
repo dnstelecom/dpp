@@ -330,6 +330,7 @@ fn make_query_with_timestamp(
         name: test_name(),
         src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         src_port: 53000,
+        resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         timestamp_micros,
         packet_ordinal,
         record_ordinal,
@@ -351,6 +352,7 @@ fn make_response_with_timestamp(
         name: test_name(),
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         dst_port: 53000,
+        resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         timestamp_micros,
         packet_ordinal,
         record_ordinal,
@@ -370,6 +372,7 @@ fn insert_query(
         query.src_ip,
         query.src_port,
         query.query_type,
+        query.resolver_ip,
     );
     let key = super::types::TimelineKey::new(
         query.timestamp_micros,
@@ -390,6 +393,7 @@ fn insert_response(
         response.dst_ip,
         response.dst_port,
         response.query_type,
+        response.resolver_ip,
     );
     let key = super::types::TimelineKey::new(
         response.timestamp_micros,
@@ -552,6 +556,41 @@ fn duplicate_query_identity_requires_same_source_port() {
     assert_eq!(batch_result.dns_query_count, 2);
     assert_eq!(batch_result.duplicated_query_count, 0);
     assert_eq!(pending_query_count(&state), 2);
+}
+
+#[test]
+fn resolver_flows_in_the_same_shard_match_independently() {
+    let processor = test_processor();
+    let resolver_a = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 4));
+    let resolver_b = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 11));
+
+    let mut query_a = make_query_record_with_timestamp(1_000, 1, 0);
+    query_a.dst_ip = resolver_a;
+    let mut query_b = make_query_record_with_timestamp(1_050, 2, 0);
+    query_b.dst_ip = resolver_b;
+    let mut response_b = make_response_record_with_timestamp(1_100, 3, 0);
+    response_b.src_ip = resolver_b;
+    let mut response_a = make_response_record_with_timestamp(1_200, 4, 0);
+    response_a.src_ip = resolver_a;
+
+    // One state models distinct resolver flows whose routing hashes land in the same shard.
+    let mut state = test_shard_state();
+    let result = processor.process_shard_records_with_batch_watermark(
+        vec![query_a, query_b, response_b, response_a],
+        &mut state,
+        None,
+    );
+
+    assert_eq!(result.dns_query_count, 2);
+    assert_eq!(result.duplicated_query_count, 0);
+    assert_eq!(result.matched_query_response_count, 2);
+    assert_eq!(result.output_records.len(), 2);
+    assert_eq!(result.output_records[0].request_timestamp, 1_050);
+    assert_eq!(result.output_records[0].response_timestamp, Some(1_100));
+    assert_eq!(result.output_records[1].request_timestamp, 1_000);
+    assert_eq!(result.output_records[1].response_timestamp, Some(1_200));
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 0);
 }
 
 #[test]
@@ -803,6 +842,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("b.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_500,
             packet_ordinal: 3,
             record_ordinal: 0,
@@ -817,6 +857,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("a.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 2_000,
             packet_ordinal: 2,
             record_ordinal: 0,
@@ -831,6 +872,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("a.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_000,
             packet_ordinal: 1,
             record_ordinal: 0,
@@ -869,6 +911,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_300,
             packet_ordinal: 4,
             record_ordinal: 0,
@@ -883,6 +926,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_100,
             packet_ordinal: 2,
             record_ordinal: 0,
@@ -897,6 +941,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_400,
             packet_ordinal: 5,
             record_ordinal: 0,
@@ -911,6 +956,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_200,
             packet_ordinal: 3,
             record_ordinal: 0,
@@ -925,6 +971,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_000,
             packet_ordinal: 1,
             record_ordinal: 0,

@@ -52,7 +52,7 @@ impl DnsProcessor {
         response_timestamp_micros: i64,
         response_code: ProtoResponseCode,
     ) -> DnsRecord {
-        let &(id, name, client_ip, src_port, query_type) = query_identity;
+        let &(id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: Some(response_timestamp_micros),
@@ -70,7 +70,7 @@ impl DnsProcessor {
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
     ) -> DnsRecord {
-        let &(id, name, client_ip, src_port, query_type) = query_identity;
+        let &(id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: None,
@@ -382,23 +382,37 @@ impl DnsProcessor {
     }
 
     fn query_identity_from_record(&self, record: &ProcessedDnsRecord) -> QueryIdentityKey {
-        let (src_ip, src_port) = if record.is_query {
-            (record.src_ip, record.src_port)
+        let (client_ip, client_port, resolver_ip) = if record.is_query {
+            (record.src_ip, record.src_port, record.dst_ip)
         } else {
-            (record.dst_ip, record.dst_port)
+            (record.dst_ip, record.dst_port, record.src_ip)
         };
 
-        (record.id, record.name, src_ip, src_port, record.query_type)
+        (
+            record.id,
+            record.name,
+            client_ip,
+            client_port,
+            record.query_type,
+            resolver_ip,
+        )
     }
 
     fn response_identity_from_record(&self, record: &ProcessedDnsRecord) -> ResponseIdentityKey {
-        let (dst_ip, dst_port) = if record.is_query {
-            (record.src_ip, record.src_port)
+        let (client_ip, client_port, resolver_ip) = if record.is_query {
+            (record.src_ip, record.src_port, record.dst_ip)
         } else {
-            (record.dst_ip, record.dst_port)
+            (record.dst_ip, record.dst_port, record.src_ip)
         };
 
-        (record.id, record.name, dst_ip, dst_port, record.query_type)
+        (
+            record.id,
+            record.name,
+            client_ip,
+            client_port,
+            record.query_type,
+            resolver_ip,
+        )
     }
 
     #[cfg(test)]
@@ -409,6 +423,7 @@ impl DnsProcessor {
             query.src_ip,
             query.src_port,
             query.query_type,
+            query.resolver_ip,
         )
     }
 

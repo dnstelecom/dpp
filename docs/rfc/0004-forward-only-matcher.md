@@ -34,6 +34,9 @@ order within each shard and never backtracks. The key design choices:
    but doesn't create a second in-flight entry. One query → one terminal outcome (matched or
    timeout), always.
 
+   Match identity includes the DNS ID, observed name, client IP and port, resolver IP, and query
+   type. Resolver identity remains internal and is not added to the exported `DnsRecord` schema.
+
    The current Community Edition identity key preserves the observed presentation-form QNAME bytes
    and does not lowercase them before matching. This is a deliberate Community Edition trade-off,
    not a protocol guarantee. RFC 4343 defines ASCII label comparison as case-insensitive, and a

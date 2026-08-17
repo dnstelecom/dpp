@@ -267,8 +267,9 @@ The DNS matcher must preserve these invariants:
 
 - Each observed DNS query or response candidate has a stable in-flight identity until it is matched
   or discarded.
-- Routing and in-flight matching use the original observed IP addresses. Deterministic
-  pseudonymization is applied exactly once when the matcher constructs a finalized `DnsRecord`.
+- Routing and in-flight matching use the original observed client IP, client port, and resolver IP.
+  The resolver remains internal; deterministic client-IP pseudonymization is applied exactly once
+  when the matcher constructs a finalized `DnsRecord`.
 - Repeated pending queries with the same match identity inside the configured timeout window
   (`1200ms` by default) are deduplicated to the earliest canonical query. Later duplicates are
   counted separately and must not create extra matched or timeout records.

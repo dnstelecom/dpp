@@ -242,9 +242,9 @@ Unsupported non-PCAP/non-PCAPNG stream magic on `stdin` is rejected explicitly i
 hidden temp-file or second ingest path.
 
 Repeated pending queries that share the same match identity (`id`, `name`, client IP, client port,
-and `query_type`) inside the configured match window (`1200ms` by default) are deduplicated to the earliest canonical
-query. Deduplicated retries increment a separate counter and do not emit extra timeout or matched
-records.
+resolver IP, and `query_type`) inside the configured match window (`1200ms` by default) are
+deduplicated to the earliest canonical query. Deduplicated retries increment a separate counter and
+do not emit extra timeout or matched records.
 
 For QNAME matching, DPP preserves the observed presentation-form name bytes and does not lowercase
 them before building matcher identity keys. This is a deliberate Community Edition trade-off, not
