@@ -11,6 +11,7 @@ use crate::config::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::{env, fs, thread};
@@ -33,9 +34,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_threads = env::var("DPP_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
-    let env_bonded = env::var("DPP_BONDED")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    let env_bonded = env::var_os("DPP_BONDED");
 
     let matches = build_cli(version).get_matches();
 
@@ -73,11 +72,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .and_then(|value| value.parse::<usize>().ok())
         .or(env_threads);
 
-    let bonded = matches
-        .get_one::<String>("bonded")
-        .and_then(|value| value.parse::<usize>().ok())
-        .or(env_bonded)
-        .unwrap_or(0);
+    let bonded = resolve_bonded(&matches, env_bonded.as_deref())?;
 
     let output_filename = matches
         .get_one::<String>("output_filename")
@@ -209,7 +204,8 @@ LICENSE INFORMATION:
                 .short('b')
                 .help("Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity")
                 .value_name("N")
-                .num_args(1),
+                .num_args(1)
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("zstd")
@@ -286,6 +282,21 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
     {
         Some(value) => parse_match_timeout_ms(value),
         None => Ok(DEFAULT_MATCH_TIMEOUT_MS),
+    }
+}
+
+fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usize> {
+    if let Some(value) = matches.get_one::<usize>("bonded") {
+        return Ok(*value);
+    }
+
+    match env_value {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_BONDED must contain valid UTF-8"))?
+            .parse::<usize>()
+            .with_context(|| format!("Failed to parse DPP_BONDED from '{}'", value.display())),
+        None => Ok(0),
     }
 }
 
@@ -492,6 +503,54 @@ mod tests {
         let help = String::from_utf8(help).expect("help is utf-8");
 
         assert!(help.contains("Set IO channel capacity in records"));
+    }
+
+    #[test]
+    fn invalid_cli_bonded_is_rejected() {
+        let error = build_cli("test")
+            .try_get_matches_from(["dpp", "--bonded", "invalid", "input.pcap"])
+            .expect_err("invalid --bonded must be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn invalid_env_bonded_is_rejected_when_cli_is_absent() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+
+        let error = resolve_bonded(&matches, Some(OsStr::new("invalid")))
+            .expect_err("invalid DPP_BONDED must be rejected");
+
+        assert!(error.to_string().contains("Failed to parse DPP_BONDED"));
+    }
+
+    #[test]
+    fn cli_bonded_overrides_invalid_env_value() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--bonded", "2048", "input.pcap"])
+            .expect("cli parses");
+
+        assert_eq!(
+            resolve_bonded(&matches, Some(OsStr::new("invalid"))).expect("CLI value wins"),
+            2_048
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_bonded_is_rejected_when_cli_is_absent() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+
+        let error = resolve_bonded(&matches, Some(OsStr::from_bytes(&[0xff])))
+            .expect_err("non-UTF-8 DPP_BONDED must be rejected");
+
+        assert!(error.to_string().contains("must contain valid UTF-8"));
     }
 
     #[test]

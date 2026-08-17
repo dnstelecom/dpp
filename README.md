@@ -174,7 +174,7 @@ dpp --anonymize /tmp/anon.key input.pcap output.csv
 Notes:
 
 - Keep the key file private. Anyone with the same file can reproduce the same pseudonymized output.
-- The key file must contain valid UTF-8 text because DPP reads it as a text passphrase.
+- The key file must contain a non-empty UTF-8 passphrase. Leading and trailing whitespace is ignored.
 - Rotating the key changes the resulting pseudonymized IP addresses for the same input capture.
 - Matching and deduplication use the original client IP. Pseudonymization is applied only to the
   `source_ip` field of finalized output records, so pseudonym collisions cannot merge clients.
@@ -218,7 +218,7 @@ Notes:
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
 | `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                          |
 | `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected       |
-| `DPP_BONDED`             | I/O channel capacity in batched output messages; each message carries up to `1024` records; `0` uses the default bounded capacity |
+| `DPP_BONDED`             | I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the default bounded capacity |
 | `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
 | `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
 | `DPP_AFFINITY`           | Enable CPU affinity                                                                                                       |

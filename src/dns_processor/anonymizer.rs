@@ -54,7 +54,15 @@ impl Anonymizer {
         let mut file = fs::File::open(path)?;
         let mut passphrase = String::new();
         file.read_to_string(&mut passphrase)?;
-        Ok(passphrase.trim().into())
+        let passphrase = passphrase.trim();
+        if passphrase.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anonymization key file must contain a non-empty passphrase",
+            ));
+        }
+
+        Ok(passphrase.into())
     }
 
     fn derive_cipher(passphrase: &str) -> Result<Aes256, io::Error> {
@@ -151,5 +159,23 @@ mod tests {
             .expect("missing key file must fail");
 
         assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn empty_or_whitespace_only_key_is_an_error() {
+        for contents in ["", " \t\r\n"] {
+            let key_path = temp_key_file(contents);
+            let error = Anonymizer::new(Some(key_path.as_path()))
+                .err()
+                .expect("empty anonymization key must fail");
+
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "anonymization key file must contain a non-empty passphrase"
+            );
+
+            fs::remove_file(key_path).expect("removes temp key file");
+        }
     }
 }
