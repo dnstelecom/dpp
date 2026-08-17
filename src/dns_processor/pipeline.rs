@@ -1068,6 +1068,36 @@ mod tests {
         path
     }
 
+    fn capture_with_retry_regression_across_batch_boundary(test_name: &str) -> std::path::PathBuf {
+        let path = temp_test_path(test_name, "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let query_packet = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let non_dns_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE + 1);
+        packets.extend(std::iter::repeat_n(
+            (1, 0, non_dns_packet.as_slice()),
+            PACKET_BATCH_SIZE - 1,
+        ));
+        packets.push((2, 0, query_packet.as_slice()));
+        packets.push((1, 500_000, query_packet.as_slice()));
+
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+        path
+    }
+
     #[test]
     fn matcher_worker_budget_respects_staged_execution_plan() {
         let low_core_budget = ExecutionBudget::from_available_cpus(4);
@@ -1213,6 +1243,85 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
             assert_eq!(records[0].response_timestamp, Some(1_200_000));
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
+    fn retry_deduplication_survives_timestamp_regression_between_batches() {
+        let path = capture_with_retry_regression_across_batch_boundary(
+            "pipeline-cross-batch-retry-regression",
+        );
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+
+            assert_eq!(
+                counters.total_packets_processed,
+                PACKET_BATCH_SIZE + 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_query_count, 2,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.duplicated_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_response_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.matched_query_response_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.timeout_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(parser.non_monotonic_timestamp_count(), 1);
+
+            let regression = parser
+                .first_non_monotonic_timestamp()
+                .expect("timestamp regression is recorded");
+            assert_eq!(
+                regression.previous_packet_ordinal,
+                (PACKET_BATCH_SIZE - 1) as u64
+            );
+            assert_eq!(regression.previous_timestamp_micros, 2_000_000);
+            assert_eq!(regression.current_packet_ordinal, PACKET_BATCH_SIZE as u64);
+            assert_eq!(regression.current_timestamp_micros, 1_500_000);
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    message => panic!("unexpected output message: {message:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].request_timestamp, 1_500_000);
+            assert_eq!(records[0].response_timestamp, None);
+            assert_eq!(records[0].response_code, None);
         }
 
         fs::remove_file(path).expect("test pcap removed");

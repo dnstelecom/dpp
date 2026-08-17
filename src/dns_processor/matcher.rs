@@ -83,20 +83,20 @@ impl DnsProcessor {
         }
     }
 
-    fn has_pending_query_before(
+    fn pending_query_within_timeout(
         &self,
         state: &MatcherShardState,
         identity: &QueryIdentityKey,
         timestamp_micros: i64,
-    ) -> bool {
-        let Some(timeline) = state.query_map.get(identity) else {
-            return false;
-        };
+    ) -> Option<TimelineKey> {
+        let timeline = state.query_map.get(identity)?;
 
-        timeline.contains_timestamp_range(
-            timestamp_micros.saturating_sub(self.match_timeout_micros),
-            timestamp_micros,
-        )
+        timeline
+            .first_entry_in_range(
+                timestamp_micros.saturating_sub(self.match_timeout_micros),
+                timestamp_micros.saturating_add(self.match_timeout_micros),
+            )
+            .map(|(key, _)| key)
     }
 
     fn process_query(
@@ -113,9 +113,16 @@ impl DnsProcessor {
         let query_key = self.timeline_key_from_record(record);
         *dns_query_count += 1;
 
-        if self.has_pending_query_before(state, &query_identity, query_key.timestamp_micros) {
+        if let Some(pending_key) =
+            self.pending_query_within_timeout(state, &query_identity, query_key.timestamp_micros)
+        {
             *duplicated_query_count += 1;
-            return;
+            if pending_key <= query_key {
+                return;
+            }
+
+            self.remove_query_entry(state, &query_identity, pending_key)
+                .expect("pending retry handle must remain valid until replacement");
         }
 
         if let Some((_, response_handle)) = self.find_closest_response(

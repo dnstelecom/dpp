@@ -100,15 +100,6 @@ impl<Record> Timeline<Record> {
         }
     }
 
-    pub(super) fn contains_timestamp_range(
-        &self,
-        lower_timestamp_micros: i64,
-        upper_timestamp_micros: i64,
-    ) -> bool {
-        self.first_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)
-            .is_some()
-    }
-
     pub(super) fn first_entry_in_range(
         &self,
         lower_timestamp_micros: i64,

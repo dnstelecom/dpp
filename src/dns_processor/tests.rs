@@ -725,6 +725,36 @@ fn deduplicates_later_pending_queries_inside_timeout_window() {
 }
 
 #[test]
+fn timestamp_regression_keeps_earliest_pending_query_canonical() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+
+    let first_batch = processor.process_shard_records_with_batch_watermark(
+        vec![make_query_record_with_timestamp(1_300, 1, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(first_batch.dns_query_count, 1);
+    assert_eq!(first_batch.duplicated_query_count, 0);
+    assert_eq!(pending_query_count(&state), 1);
+
+    let regressed_batch = processor.process_shard_records_with_batch_watermark(
+        vec![make_query_record_with_timestamp(1_000, 2, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(regressed_batch.dns_query_count, 1);
+    assert_eq!(regressed_batch.duplicated_query_count, 1);
+    assert_eq!(pending_query_count(&state), 1);
+
+    let final_result = processor.finalize_shard(&mut state);
+    assert_eq!(final_result.timeout_query_count, 1);
+    assert_eq!(final_result.output_records.len(), 1);
+    assert_eq!(final_result.output_records[0].request_timestamp, 1_000);
+    assert_eq!(pending_query_count(&state), 0);
+}
+
+#[test]
 fn duplicate_query_identity_requires_same_source_port() {
     let processor = test_processor();
     let mut state = test_shard_state();
