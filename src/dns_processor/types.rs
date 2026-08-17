@@ -346,6 +346,8 @@ impl<T> Drop for EntryArena<T> {
 #[derive(Default)]
 pub(super) struct ShardProcessingResult {
     pub(super) output_records: OutputRecordBatches,
+    /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
+    pub(super) oversized_qname_message_count: usize,
     pub(super) dns_query_count: usize,
     pub(super) duplicated_query_count: usize,
     pub(super) dns_response_count: usize,

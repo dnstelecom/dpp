@@ -143,7 +143,13 @@ repeating it for full DNS question decoding.
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
   parsing does not gain a second source of truth for IP/port extraction. The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
-  the semantic fallback for rare DNS messages that the fast path does not accept. The optional
+  the semantic fallback for rare DNS messages that the fast path does not accept. Both paths accept
+  decompressed wire QNAMEs up to the RFC 1035 limit of 255 octets, including label-length octets and
+  the terminating root octet. A valid name can expand to 1003 bytes in escaped presentation form
+  and must remain distinct through matching and export. If any QNAME exceeds the wire limit, the
+  parser rejects the whole DNS message before the matcher and increments
+  `oversized_qname_message_count` once. This counter's unit is rejected DNS messages, not questions;
+  partial questions from such a message must never reach matcher state or output. The optional
   `--monotonic-capture` contract enables batched timeout eviction inside shard-local matcher state,
   but only under a strict globally monotonic timestamp assumption. When that contract is active,
   the eviction watermark comes from the routed batch maximum timestamp, not from each shard's local
@@ -158,7 +164,9 @@ repeating it for full DNS question decoding.
   Top-level orchestration layer. Owns the ordered run sequence, process reporting, and shutdown
   coordination without taking ownership of canonical configuration or writer internals. The final
   run summary is also where aggregate matching-quality metrics such as timeout ratio and average
-  matched RTT are derived from authoritative processing counters.
+  matched RTT are derived from authoritative processing counters. Parser rejections caused by an
+  oversized decompressed QNAME are exposed as
+  `metrics.dns_messages_rejected_oversized_qname` without changing their DNS-message unit.
 
 - `src/error.rs`
   Canonical top-level error taxonomy for the application, runtime bootstrap, and output lifecycle.

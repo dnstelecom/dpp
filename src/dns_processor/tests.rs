@@ -12,6 +12,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
+use super::parser::PacketProcessingOutcome;
 use super::types::{MatcherShardState, ProcessedDnsRecord};
 use crate::custom_types::DnsNameBuf;
 use crate::test_support::{
@@ -59,7 +60,7 @@ fn expected_formatted_name(name: &Name) -> DnsNameBuf {
         .filter(|stripped| !stripped.is_empty())
         .unwrap_or(ascii.as_str());
 
-    DnsNameBuf::new(formatted).unwrap_or_default()
+    DnsNameBuf::new(formatted).expect("RFC-valid name presentation fits")
 }
 
 fn append_example_query(dns_payload: &mut Vec<u8>) {
@@ -67,6 +68,20 @@ fn append_example_query(dns_payload: &mut Vec<u8>) {
         7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ]);
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+}
+
+fn append_repeated_byte_question(
+    dns_payload: &mut Vec<u8>,
+    labels: &[(usize, u8)],
+    query_type: u16,
+) {
+    for &(label_len, byte) in labels {
+        dns_payload.push(u8::try_from(label_len).expect("test label length fits into u8"));
+        dns_payload.extend(std::iter::repeat_n(byte, label_len));
+    }
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&query_type.to_be_bytes());
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
 
@@ -486,9 +501,11 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
         .process_packet_batch(&packet, 1_234_567)
         .expect("standard parser succeeds");
     let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
-    let meta_records = processor
-        .process_packet_batch_with_meta(&packet, 1_234_567, routing_meta)
-        .expect("metadata-assisted parser succeeds");
+    let meta_records =
+        match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+            PacketProcessingOutcome::Records(records) => records,
+            outcome => panic!("metadata-assisted parser failed: {outcome:?}"),
+        };
 
     assert_eq!(
         routing_meta.flow_key.client_ip,
@@ -1025,22 +1042,236 @@ fn parser_domain_formatter_matches_hickory_ascii_path() {
 
     for name in cases {
         assert_eq!(
-            DnsProcessor::format_domain_name(&name),
+            DnsProcessor::format_domain_name(&name).expect("name presentation fits"),
             expected_formatted_name(&name)
         );
     }
 }
 
 #[test]
-fn parser_domain_formatter_preserves_overflow_fallback() {
-    let labels = [vec![1u8; 63], vec![1u8; 63], vec![1u8; 63], vec![1u8; 58]];
+fn parser_domain_formatter_supports_maximum_escaped_presentation() {
+    let labels = [vec![1u8; 63], vec![1u8; 63], vec![1u8; 63], vec![1u8; 61]];
     let name = Name::from_labels(labels.iter().map(Vec::as_slice)).expect("valid long raw name");
+    let formatted = DnsProcessor::format_domain_name(&name).expect("name presentation fits");
+    let other_labels = [vec![2u8; 63], vec![2u8; 63], vec![2u8; 63], vec![2u8; 61]];
+    let other_name = Name::from_labels(other_labels.iter().map(Vec::as_slice))
+        .expect("second valid long raw name");
+    let other_formatted =
+        DnsProcessor::format_domain_name(&other_name).expect("second name presentation fits");
 
-    assert_eq!(expected_formatted_name(&name), DnsNameBuf::default());
-    assert_eq!(
-        DnsProcessor::format_domain_name(&name),
-        DnsNameBuf::default()
+    assert_eq!(formatted.as_bytes().len(), 1003);
+    assert_eq!(formatted, expected_formatted_name(&name));
+    assert_eq!(other_formatted.as_bytes().len(), 1003);
+    assert_ne!(formatted, other_formatted);
+}
+
+#[test]
+fn parser_exports_maximum_wire_qname_in_both_decoder_modes() {
+    let labels = [(63, 1), (63, 1), (63, 1), (61, 1)];
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut dns_payload, &labels, 1);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let other_labels = [(63, 2), (63, 2), (63, 2), (61, 2)];
+    let mut other_dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut other_dns_payload, &other_labels, 1);
+    let other_packet = make_udp_dns_packet_with_payload(
+        [10, 0, 0, 1],
+        [8, 8, 8, 8],
+        53_000,
+        53,
+        &other_dns_payload,
     );
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+        let records =
+            match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+                PacketProcessingOutcome::Records(records) => records,
+                outcome => panic!("fast_path={fast_path}, unexpected outcome: {outcome:?}"),
+            };
+
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(
+            records[0].name.as_bytes().len(),
+            1003,
+            "fast_path={fast_path}"
+        );
+        assert!(
+            records[0].name.as_str().starts_with("\\001\\001"),
+            "fast_path={fast_path}"
+        );
+        assert_ne!(
+            records[0].name,
+            DnsNameBuf::default(),
+            "fast_path={fast_path}"
+        );
+
+        let other_routing_meta =
+            DnsProcessor::packet_routing_meta(&other_packet).expect("second DNS routing metadata");
+        let other_records = match processor.process_packet_batch_with_meta(
+            &other_packet,
+            1_234_567,
+            other_routing_meta,
+        ) {
+            PacketProcessingOutcome::Records(records) => records,
+            outcome => panic!("fast_path={fast_path}, unexpected second outcome: {outcome:?}"),
+        };
+        assert_eq!(other_records[0].name.as_bytes().len(), 1003);
+        assert_ne!(
+            records[0].name, other_records[0].name,
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_oversized_wire_qname_in_both_decoder_modes() {
+    let labels = [(63, b'a'), (63, b'a'), (63, b'a'), (62, b'a')];
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut dns_payload, &labels, 1);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::RejectedOversizedQname
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_oversized_compressed_qname_by_expanded_wire_length() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_repeated_byte_question(
+        &mut dns_payload,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (61, b'a')],
+        1,
+    );
+    dns_payload.extend_from_slice(&[1, b'x', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::RejectedOversizedQname
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_accepts_compressed_qname_at_exact_expanded_wire_limit() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_repeated_byte_question(
+        &mut dns_payload,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (59, b'a')],
+        1,
+    );
+    dns_payload.extend_from_slice(&[1, b'x', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+        let records =
+            match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+                PacketProcessingOutcome::Records(records) => records,
+                outcome => panic!("fast_path={fast_path}, unexpected outcome: {outcome:?}"),
+            };
+
+        assert_eq!(records.len(), 2, "fast_path={fast_path}");
+        assert!(
+            records[1].name.as_str().starts_with("x."),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_keeps_malformed_qname_separate_from_oversized_rejection() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    dns_payload.extend_from_slice(&[3, b'a']);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_does_not_count_malformed_forward_pointer_as_oversized_qname() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0xC0, 0x12]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    for label_len in [63, 63, 63, 62] {
+        dns_payload.push(label_len);
+        dns_payload.extend(std::iter::repeat_n(b'a', usize::from(label_len)));
+    }
+    dns_payload.push(0);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
 }
 
 #[test]

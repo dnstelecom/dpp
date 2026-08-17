@@ -200,6 +200,7 @@ struct RunWarningsSummary {
 #[derive(Serialize)]
 struct RunMetricsSummary {
     total_packets_processed: usize,
+    dns_messages_rejected_oversized_qname: usize,
     total_dns_queries_processed: usize,
     deduplicated_duplicate_queries: usize,
     total_dns_responses_processed: usize,
@@ -353,6 +354,7 @@ fn build_run_summary(
         },
         metrics: RunMetricsSummary {
             total_packets_processed: counters.total_packets_processed,
+            dns_messages_rejected_oversized_qname: counters.oversized_qname_message_count,
             total_dns_queries_processed: counters.dns_query_count,
             deduplicated_duplicate_queries: counters.duplicated_query_count,
             total_dns_responses_processed: counters.dns_response_count,
@@ -374,6 +376,13 @@ fn build_run_summary(
         },
         warnings,
     }
+}
+
+fn oversized_qname_rejection_summary_line(count: usize) -> String {
+    format!(
+        "DNS messages rejected for oversized QNAME: {}",
+        count.to_formatted_string(&Locale::en)
+    )
 }
 
 fn display_text_summary(summary: &RunSummary) {
@@ -404,6 +413,12 @@ fn display_text_summary(summary: &RunSummary) {
             .metrics
             .total_dns_responses_processed
             .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "{}",
+        oversized_qname_rejection_summary_line(
+            summary.metrics.dns_messages_rejected_oversized_qname
+        )
     );
     info!(
         "Total matched Query-Response pairs: {}",
@@ -960,6 +975,42 @@ mod tests {
         assert_eq!(summary.metrics.timed_out_queries, 2);
         assert!((summary.metrics.timed_out_query_ratio - 0.2).abs() < f64::EPSILON);
         assert_eq!(summary.metrics.average_matched_rtt_ms, Some(2.0));
+    }
+
+    #[test]
+    fn run_summary_reports_dns_messages_rejected_for_oversized_qname() {
+        let config = test_config();
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters {
+                oversized_qname_message_count: 3,
+                ..ProcessingCounters::default()
+            },
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+
+        assert_eq!(summary.metrics.dns_messages_rejected_oversized_qname, 3);
+        assert_eq!(
+            oversized_qname_rejection_summary_line(
+                summary.metrics.dns_messages_rejected_oversized_qname
+            ),
+            "DNS messages rejected for oversized QNAME: 3"
+        );
+
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        let metrics = serialized
+            .get("metrics")
+            .and_then(serde_json::Value::as_object)
+            .expect("metrics object is present");
+        assert_eq!(
+            metrics.get("dns_messages_rejected_oversized_qname"),
+            Some(&serde_json::json!(3))
+        );
     }
 
     struct BrokenPipeJsonSink {

@@ -255,6 +255,15 @@ because that better matches the real behavior we target on offline caching-resol
 a result, a query and response that differ only by case may fail to match even on otherwise valid
 DNS traffic.
 
+DPP accepts QNAMEs up to the RFC 1035 limit of 255 octets in decompressed wire form, including
+label-length octets and the terminating root octet. Escaping arbitrary label bytes can expand that
+valid wire name to as many as 1003 bytes in DPP's presentation form; those expanded names remain
+distinct and are matched and exported without substituting an empty name. If any decompressed QNAME
+in a DNS message exceeds 255 octets, DPP rejects the entire message before matching or export. The
+text report includes `DNS messages rejected for oversized QNAME`; JSON exposes the count as
+`metrics.dns_messages_rejected_oversized_qname`. The unit is DNS messages, not individual questions,
+and no questions from a rejected message contribute DNS query or response records.
+
 Timeout records leave response fields empty:
 
 - `response_timestamp = NULL` in Parquet and an empty field in CSV
@@ -277,8 +286,9 @@ accepted work, skips synthetic timeout finalization for pending unmatched querie
 still-buffered output tail, and then exits. This applies to CSV and Parquet outputs alike. The
 final JSON summary reports this through the `warnings.graceful_signal_shutdown` field.
 
-The final report now also includes basic matching-quality metrics:
+The final report now also includes basic processing and matching-quality metrics:
 
+- `metrics.dns_messages_rejected_oversized_qname`
 - `metrics.timed_out_queries`
 - `metrics.timed_out_query_ratio`
 - `metrics.average_matched_rtt_ms`

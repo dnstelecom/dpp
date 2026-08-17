@@ -28,6 +28,20 @@ fn append_example_a_query(dns_payload: &mut Vec<u8>) {
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
 
+fn append_repeated_byte_question(
+    dns_payload: &mut Vec<u8>,
+    labels: &[(usize, u8)],
+    query_type: u16,
+) {
+    for &(label_len, byte) in labels {
+        dns_payload.push(u8::try_from(label_len).expect("test label length fits into u8"));
+        dns_payload.extend(std::iter::repeat_n(byte, label_len));
+    }
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&query_type.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+}
+
 fn append_opt_record(dns_payload: &mut Vec<u8>, extended_high: u8, edns_version: u8) {
     dns_payload.push(0);
     dns_payload.extend_from_slice(&41_u16.to_be_bytes());
@@ -92,6 +106,103 @@ fn matched_query_response_pair_round_trips_to_exact_csv_record() {
             "1000000,1200000,10.0.0.1,53000,4660,example.com,A,No Error\n"
         )
     );
+
+    fs::remove_file(&input_path).expect("remove input pcap");
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn maximum_wire_qname_round_trips_with_full_escaped_presentation() {
+    let input_path = temp_test_path("maximum-wire-qname", "pcap");
+    let output_path = temp_test_path("maximum-wire-qname", "csv");
+    let labels = [(63, 1), (63, 1), (63, 1), (61, 1)];
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut query_payload, &labels, 1);
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    append_repeated_byte_question(&mut response_payload, &labels, 1);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[(1, 0, &query_packet), (1, 200_000, &response_packet)]),
+    )
+    .expect("test pcap written");
+
+    let output = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_name = [63_usize, 63, 63, 61]
+        .map(|label_len| "\\001".repeat(label_len))
+        .join(".");
+    let csv_output = fs::read_to_string(&output_path).expect("csv output readable");
+    let record = csv_output
+        .lines()
+        .nth(1)
+        .expect("matched record is exported");
+    assert!(record.contains(&expected_name));
+    assert_eq!(expected_name.len(), 1003);
+    assert_eq!(csv_output.lines().count(), 2);
+
+    fs::remove_file(&input_path).expect("remove input pcap");
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn oversized_wire_qname_is_rejected_and_reported() {
+    let input_path = temp_test_path("oversized-wire-qname", "pcap");
+    let output_path = temp_test_path("oversized-wire-qname", "csv");
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(
+        &mut dns_payload,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (62, b'a')],
+        1,
+    );
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    fs::write(&input_path, classic_pcap_bytes(&[(1, 0, &packet)])).expect("test pcap written");
+
+    let output = Command::new(dpp_binary())
+        .args(["--report-format", "json"])
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON report parses");
+    assert_eq!(
+        report["metrics"]["dns_messages_rejected_oversized_qname"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        report["metrics"]["total_dns_queries_processed"],
+        serde_json::json!(0)
+    );
+    let csv_output = fs::read_to_string(&output_path).expect("csv output readable");
+    assert_eq!(csv_output.lines().count(), 1);
 
     fs::remove_file(&input_path).expect("remove input pcap");
     fs::remove_file(&output_path).expect("remove output csv");

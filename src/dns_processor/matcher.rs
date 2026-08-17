@@ -52,15 +52,15 @@ impl DnsProcessor {
         response_timestamp_micros: i64,
         response_code: ProtoResponseCode,
     ) -> DnsRecord {
-        let &(id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
+        let (id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: Some(response_timestamp_micros),
-            source_ip: self.anonymize_ip(&client_ip),
-            source_port: src_port,
-            id,
-            name,
-            query_type: ProtoRecordType::from(query_type),
+            source_ip: self.anonymize_ip(client_ip),
+            source_port: *src_port,
+            id: *id,
+            name: name.clone(),
+            query_type: ProtoRecordType::from(*query_type),
             response_code: Some(response_code),
         }
     }
@@ -70,15 +70,15 @@ impl DnsProcessor {
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
     ) -> DnsRecord {
-        let &(id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
+        let (id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: None,
-            source_ip: self.anonymize_ip(&client_ip),
-            source_port: src_port,
-            id,
-            name,
-            query_type: ProtoRecordType::from(query_type),
+            source_ip: self.anonymize_ip(client_ip),
+            source_port: *src_port,
+            id: *id,
+            name: name.clone(),
+            query_type: ProtoRecordType::from(*query_type),
             response_code: None,
         }
     }
@@ -390,7 +390,7 @@ impl DnsProcessor {
 
         (
             record.id,
-            record.name,
+            record.name.clone(),
             client_ip,
             client_port,
             record.query_type,
@@ -407,7 +407,7 @@ impl DnsProcessor {
 
         (
             record.id,
-            record.name,
+            record.name.clone(),
             client_ip,
             client_port,
             record.query_type,
@@ -419,7 +419,7 @@ impl DnsProcessor {
     pub(super) fn response_identity_from_query(&self, query: &DnsQuery) -> ResponseIdentityKey {
         (
             query.id,
-            query.name,
+            query.name.clone(),
             query.src_ip,
             query.src_port,
             query.query_type,

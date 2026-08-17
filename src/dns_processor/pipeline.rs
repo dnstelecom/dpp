@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use super::DnsProcessor;
-use super::parser::{CanonicalFlowKey, ParsedUdpDnsMeta};
+use super::parser::{CanonicalFlowKey, PacketProcessingOutcome, ParsedUdpDnsMeta};
 use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::{OutputMessage, OutputRecordBatches};
@@ -30,6 +30,7 @@ const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
 
 struct PipelineCounters {
+    oversized_qname_message_count: usize,
     dns_query_count: usize,
     duplicated_query_count: usize,
     dns_response_count: usize,
@@ -43,6 +44,7 @@ struct PipelineCounters {
 impl Default for PipelineCounters {
     fn default() -> Self {
         Self {
+            oversized_qname_message_count: 0,
             dns_query_count: 0,
             duplicated_query_count: 0,
             dns_response_count: 0,
@@ -58,6 +60,8 @@ impl Default for PipelineCounters {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProcessingCounters {
     pub(crate) total_packets_processed: usize,
+    /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
+    pub(crate) oversized_qname_message_count: usize,
     pub(crate) dns_query_count: usize,
     pub(crate) duplicated_query_count: usize,
     pub(crate) dns_response_count: usize,
@@ -73,6 +77,7 @@ impl PipelineCounters {
         shard_result: ShardProcessingResult,
         output_closed: &AtomicBool,
     ) -> bool {
+        self.oversized_qname_message_count += shard_result.oversized_qname_message_count;
         self.dns_query_count += shard_result.dns_query_count;
         self.duplicated_query_count += shard_result.duplicated_query_count;
         self.dns_response_count += shard_result.dns_response_count;
@@ -98,6 +103,7 @@ impl PipelineCounters {
     fn finalize(self, total_packets_processed: usize) -> ProcessingCounters {
         ProcessingCounters {
             total_packets_processed,
+            oversized_qname_message_count: self.oversized_qname_message_count,
             dns_query_count: self.dns_query_count,
             duplicated_query_count: self.duplicated_query_count,
             dns_response_count: self.dns_response_count,
@@ -123,6 +129,12 @@ struct RoutedWorkerBatches {
 struct RoutedDnsPackets {
     packets: Vec<PacketData>,
     metas: Vec<ParsedUdpDnsMeta>,
+}
+
+#[derive(Default)]
+struct ParsedShardRecords {
+    records: Vec<ProcessedDnsRecord>,
+    oversized_qname_message_count: usize,
 }
 
 impl RoutedDnsPackets {
@@ -337,6 +349,7 @@ fn worker_for_shard(shard_idx: usize, worker_ranges: &[Range<usize>]) -> usize {
 }
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
+    merged.oversized_qname_message_count += shard_result.oversized_qname_message_count;
     merged.dns_query_count += shard_result.dns_query_count;
     merged.duplicated_query_count += shard_result.duplicated_query_count;
     merged.dns_response_count += shard_result.dns_response_count;
@@ -412,27 +425,35 @@ fn route_batch_to_worker_batches(
 fn parse_shard_packets(
     dns_processor: &DnsProcessor,
     shard_packets: RoutedDnsPackets,
-) -> Vec<ProcessedDnsRecord> {
+) -> ParsedShardRecords {
     debug_assert_eq!(shard_packets.packets.len(), shard_packets.metas.len());
-    let mut shard_records = Vec::with_capacity(shard_packets.packets.len());
+    let mut parsed = ParsedShardRecords {
+        records: Vec::with_capacity(shard_packets.packets.len()),
+        ..ParsedShardRecords::default()
+    };
 
     for (packet, udp_dns_meta) in shard_packets.packets.into_iter().zip(shard_packets.metas) {
-        let Some(records) = dns_processor.process_packet_batch_with_meta(
+        let records = match dns_processor.process_packet_batch_with_meta(
             &packet.data,
             packet.timestamp_micros,
             udp_dns_meta,
-        ) else {
-            continue;
+        ) {
+            PacketProcessingOutcome::Records(records) => records,
+            PacketProcessingOutcome::RejectedOversizedQname => {
+                parsed.oversized_qname_message_count += 1;
+                continue;
+            }
+            PacketProcessingOutcome::Invalid => continue,
         };
 
         for (record_ordinal, mut record) in records.into_iter().enumerate() {
             record.packet_ordinal = packet.packet_ordinal;
             record.record_ordinal = record_ordinal as u32;
-            shard_records.push(record);
+            parsed.records.push(record);
         }
     }
 
-    shard_records
+    parsed
 }
 
 fn run_phase_processing_worker(
@@ -473,11 +494,13 @@ fn run_phase_processing_worker(
             .zip(shard_states.par_iter_mut())
             .enumerate()
             .map(|(map_idx, (shard_records, state))| {
-                let shard_result = dns_processor.process_shard_records_with_batch_watermark(
-                    parse_shard_packets(&dns_processor, shard_records),
+                let parsed = parse_shard_packets(&dns_processor, shard_records);
+                let mut shard_result = dns_processor.process_shard_records_with_batch_watermark(
+                    parsed.records,
                     state,
                     batch_max_timestamp_micros,
                 );
+                shard_result.oversized_qname_message_count += parsed.oversized_qname_message_count;
                 (map_idx, shard_result)
             })
             .collect();
@@ -580,14 +603,14 @@ fn run_matcher_worker(
         let mut merged = ShardProcessingResult::default();
 
         for (shard_packets, state) in work.shard_packets.into_iter().zip(shard_states.iter_mut()) {
-            merge_shard_results(
-                &mut merged,
-                dns_processor.process_shard_records_with_batch_watermark(
-                    parse_shard_packets(&dns_processor, shard_packets),
-                    state,
-                    work.batch_max_timestamp_micros,
-                ),
+            let parsed = parse_shard_packets(&dns_processor, shard_packets);
+            let mut shard_result = dns_processor.process_shard_records_with_batch_watermark(
+                parsed.records,
+                state,
+                work.batch_max_timestamp_micros,
             );
+            shard_result.oversized_qname_message_count += parsed.oversized_qname_message_count;
+            merge_shard_results(&mut merged, shard_result);
         }
 
         result_tx
@@ -934,6 +957,38 @@ mod tests {
         batch
     }
 
+    fn oversized_qname_batch(test_name: &str) -> PacketBatch {
+        let path = temp_test_path(test_name, "pcap");
+        let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+        dns_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        for label_len in [63_usize, 63, 63, 62] {
+            dns_payload.push(label_len as u8);
+            dns_payload.resize(dns_payload.len() + label_len, b'a');
+        }
+        dns_payload.push(0);
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let packet =
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+        fs::write(&path, classic_pcap_bytes(&[(1, 0, &packet)])).expect("test pcap written");
+
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let batch = parser
+            .next_batch(1)
+            .expect("batch read succeeds")
+            .expect("oversized-QNAME packet is present");
+        fs::remove_file(&path).expect("test pcap removed");
+
+        batch
+    }
+
     #[test]
     fn matcher_worker_budget_respects_staged_execution_plan() {
         let low_core_budget = ExecutionBudget::from_available_cpus(4);
@@ -1133,6 +1188,34 @@ mod tests {
     }
 
     #[test]
+    fn phase_worker_counts_dns_message_rejected_for_oversized_qname() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(oversized_qname_batch("phase-worker-oversized-qname"))
+            .expect("batch is sent");
+        drop(batch_tx);
+
+        let counters = run_phase_processing_worker(
+            dns_processor,
+            batch_rx,
+            output_tx,
+            1,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("phase worker completes");
+
+        assert_eq!(counters.oversized_qname_message_count, 1);
+        assert_eq!(counters.dns_query_count, 0);
+        assert_eq!(counters.dns_response_count, 0);
+        assert!(output_rx.try_iter().next().is_none());
+    }
+
+    #[test]
     fn phase_worker_skips_pending_query_finalization_on_signal_shutdown() {
         let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1157,6 +1240,55 @@ mod tests {
         assert_eq!(counters.dns_query_count, 1);
         assert_eq!(counters.timeout_query_count, 0);
         assert!(output_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn matcher_worker_counts_dns_message_rejected_for_oversized_qname() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let worker_range = 0..1;
+        let RoutedWorkerBatches {
+            batch_max_timestamp_micros,
+            mut worker_batches,
+        } = route_batch_to_worker_batches(
+            oversized_qname_batch("matcher-worker-oversized-qname"),
+            1,
+            std::slice::from_ref(&worker_range),
+        );
+        let shard_packets = worker_batches.pop().expect("worker batch exists");
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(MatcherBatchWork {
+                batch_seq: 0,
+                batch_max_timestamp_micros,
+                shard_packets,
+            })
+            .expect("worker batch is sent");
+        drop(batch_tx);
+
+        run_matcher_worker(
+            dns_processor,
+            0,
+            worker_range,
+            batch_rx,
+            result_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("matcher worker completes");
+
+        let events = result_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+
+        let batch_result = match &events[0] {
+            MatcherWorkerEvent::BatchResult { result, .. } => result,
+            _ => panic!("expected batch result before finalization"),
+        };
+        assert_eq!(batch_result.oversized_qname_message_count, 1);
+        assert_eq!(batch_result.dns_query_count, 0);
+        assert_eq!(batch_result.dns_response_count, 0);
+        assert!(batch_result.output_records.is_empty());
     }
 
     #[test]

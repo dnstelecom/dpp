@@ -5,19 +5,19 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use hickory_proto::ProtoError;
 use hickory_proto::op::Header;
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::RecordType as HickoryRecordType;
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
-use std::error::Error;
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
 use super::types::ProcessedDnsRecord;
-use crate::custom_types::{DnsNameBuf, ProtoResponseCode};
+use crate::custom_types::{DnsNameBuf, DnsNameTooLong, ProtoResponseCode};
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -99,6 +99,25 @@ struct DecodedDnsQuestion {
     query_type: HickoryRecordType,
 }
 
+#[derive(Debug)]
+pub(super) enum PacketProcessingOutcome {
+    Records(Vec<ProcessedDnsRecord>),
+    RejectedOversizedQname,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsQuestionDecodeError {
+    OversizedQname,
+    Invalid,
+}
+
+impl From<&'static str> for DnsQuestionDecodeError {
+    fn from(_: &'static str) -> Self {
+        Self::Invalid
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DnsSectionCounts {
     answers: usize,
@@ -139,7 +158,13 @@ impl DnsProcessor {
         timestamp_micros: i64,
     ) -> Option<Vec<ProcessedDnsRecord>> {
         match Self::extract_udp_dns_meta(data) {
-            Ok(Some(meta)) => self.process_packet_batch_with_meta(data, timestamp_micros, meta),
+            Ok(Some(meta)) => {
+                match self.process_packet_batch_with_meta(data, timestamp_micros, meta) {
+                    PacketProcessingOutcome::Records(records) => Some(records),
+                    PacketProcessingOutcome::RejectedOversizedQname
+                    | PacketProcessingOutcome::Invalid => None,
+                }
+            }
             Ok(None) => Some(Vec::new()),
             Err(_) => None,
         }
@@ -150,27 +175,25 @@ impl DnsProcessor {
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
-    ) -> Option<Vec<ProcessedDnsRecord>> {
-        self.process_packet_with_meta(data, timestamp_micros, meta)
-            .ok()
+    ) -> PacketProcessingOutcome {
+        match self.process_packet_with_meta(data, timestamp_micros, meta) {
+            Ok(records) => PacketProcessingOutcome::Records(records),
+            Err(DnsQuestionDecodeError::OversizedQname) => {
+                PacketProcessingOutcome::RejectedOversizedQname
+            }
+            Err(DnsQuestionDecodeError::Invalid) => PacketProcessingOutcome::Invalid,
+        }
     }
 
     #[inline]
-    fn remove_trailing_dot(name: &str) -> &str {
-        let stripped = name.strip_suffix('.').unwrap_or(name);
-
-        if stripped.is_empty() { name } else { stripped }
-    }
-
-    #[inline]
-    pub(super) fn format_domain_name(name: &Name) -> DnsNameBuf {
+    pub(super) fn format_domain_name(name: &Name) -> Result<DnsNameBuf, DnsNameTooLong> {
         let mut formatted = DnsNameBuf::default();
 
         if Self::write_domain_name(name, &mut formatted) {
-            return formatted;
+            Ok(formatted)
+        } else {
+            Err(DnsNameTooLong)
         }
-
-        DnsNameBuf::new(Self::remove_trailing_dot(&name.to_ascii())).unwrap_or_default()
     }
 
     fn write_domain_name(name: &Name, output: &mut DnsNameBuf) -> bool {
@@ -261,35 +284,35 @@ impl DnsProcessor {
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
+    ) -> Result<Vec<ProcessedDnsRecord>, DnsQuestionDecodeError> {
         let (header, queries) =
             self.decode_dns_questions(meta.dns_data(data)?, meta.is_response)?;
 
-        self.build_dns_records(
+        Ok(self.build_dns_records(
             &header,
-            queries.as_slice(),
+            queries,
             meta.src_ip(),
             meta.dst_ip(),
             meta.src_port(),
             meta.dst_port(),
             timestamp_micros,
             meta.is_response,
-        )
+        ))
     }
 
     fn build_dns_records(
         &self,
         header: &DecodedDnsHeader,
-        queries: &[DecodedDnsQuestion],
+        queries: Vec<DecodedDnsQuestion>,
         src_ip: IpAddr,
         dst_ip: IpAddr,
         src_port: u16,
         dst_port: u16,
         timestamp_micros: i64,
         is_answer: bool,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let records = queries
-            .iter()
+    ) -> Vec<ProcessedDnsRecord> {
+        queries
+            .into_iter()
             .take(if is_answer { 1 } else { usize::MAX })
             .map(|query| {
                 let domain_name = query.name;
@@ -315,16 +338,14 @@ impl DnsProcessor {
                     response_code,
                 }
             })
-            .collect::<Vec<ProcessedDnsRecord>>();
-
-        Ok(records)
+            .collect()
     }
 
     fn decode_dns_questions(
         &self,
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         if self.dns_wire_fast_path {
             Self::decode_dns_questions_fast(dns_data, decode_extended_rcode)
                 .or_else(|_| Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode))
@@ -333,12 +354,21 @@ impl DnsProcessor {
         }
     }
 
+    fn classify_hickory_question_error(error: ProtoError) -> DnsQuestionDecodeError {
+        match error {
+            ProtoError::Decode(DecodeError::DomainNameTooLong(_)) => {
+                DnsQuestionDecodeError::OversizedQname
+            }
+            _ => DnsQuestionDecodeError::Invalid,
+        }
+    }
+
     fn decode_dns_questions_fast(
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         if dns_data.len() < DNS_HEADER_LEN {
-            return Err("DNS data too short");
+            return Err(DnsQuestionDecodeError::Invalid);
         }
 
         let id = Self::parse_u16_at(dns_data, 0, "Failed to parse DNS header")?;
@@ -402,11 +432,11 @@ impl DnsProcessor {
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         let mut decoder = BinDecoder::new(dns_data);
-        let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
+        let header = Header::read(&mut decoder).map_err(|_| DnsQuestionDecodeError::Invalid)?;
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
-            .map_err(|_| "Failed to parse DNS questions")?;
+            .map_err(Self::classify_hickory_question_error)?;
         let mut response_code = ProtoResponseCode::from(header.response_code);
         if decode_extended_rcode && header.counts.additionals > 0 {
             response_code = Self::decode_response_code_with_additionals(
@@ -428,11 +458,14 @@ impl DnsProcessor {
             },
             queries
                 .into_iter()
-                .map(|query: Query| DecodedDnsQuestion {
-                    name: Self::format_domain_name(query.name()),
-                    query_type: query.query_type(),
+                .map(|query: Query| {
+                    Ok(DecodedDnsQuestion {
+                        name: Self::format_domain_name(query.name())
+                            .map_err(|_| DnsQuestionDecodeError::Invalid)?,
+                        query_type: query.query_type(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, DnsQuestionDecodeError>>()?,
         ))
     }
 
@@ -662,12 +695,14 @@ impl DnsProcessor {
     fn read_wire_domain_name(
         dns_data: &[u8],
         cursor: &mut usize,
-    ) -> Result<DnsNameBuf, &'static str> {
+    ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
         let mut output = DnsNameBuf::default();
         let mut position = *cursor;
         let mut resume_position = None;
         let mut wrote_label = false;
         let mut jump_count = 0;
+        let mut expanded_wire_len = 1_usize;
+        let mut oversized = false;
 
         loop {
             let length = *dns_data.get(position).ok_or("DNS name truncated")?;
@@ -675,8 +710,13 @@ impl DnsProcessor {
             match length {
                 0 => {
                     position += 1;
-                    if !wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
+                    if oversized {
+                        return Err(DnsQuestionDecodeError::OversizedQname);
+                    }
+                    if !wrote_label {
+                        output
+                            .try_push('.')
+                            .map_err(|_| DnsQuestionDecodeError::Invalid)?;
                     }
 
                     *cursor = resume_position.unwrap_or(position);
@@ -690,7 +730,7 @@ impl DnsProcessor {
                         (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
 
                     if offset >= dns_data.len() {
-                        return Err("DNS compression pointer out of bounds");
+                        return Err(DnsQuestionDecodeError::Invalid);
                     }
 
                     if resume_position.is_none() {
@@ -699,13 +739,13 @@ impl DnsProcessor {
 
                     jump_count += 1;
                     if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err("DNS compression pointer loop");
+                        return Err(DnsQuestionDecodeError::Invalid);
                     }
 
                     position = offset;
                 }
                 _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err("Unsupported DNS label encoding");
+                    return Err(DnsQuestionDecodeError::Invalid);
                 }
                 _ => {
                     let label_len = usize::from(length);
@@ -713,11 +753,18 @@ impl DnsProcessor {
                         .get(position + 1..position + 1 + label_len)
                         .ok_or("DNS label truncated")?;
 
-                    if wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
-                    }
-                    if !Self::write_label_ascii(label, &mut output) {
-                        return Err("DNS name too long");
+                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label_len);
+                    oversized |= expanded_wire_len > Name::MAX_LENGTH;
+
+                    if !oversized {
+                        if wrote_label {
+                            output
+                                .try_push('.')
+                                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+                        }
+                        if !Self::write_label_ascii(label, &mut output) {
+                            return Err(DnsQuestionDecodeError::Invalid);
+                        }
                     }
 
                     wrote_label = true;
