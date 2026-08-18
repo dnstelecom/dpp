@@ -7,10 +7,14 @@
 
 use crate::config::{InputSource, PACKET_BATCH_SIZE};
 use anyhow::{Context, Result};
-use pcap::{Capture, Error as LibpcapError, Offline};
+use pcap::{Capture, Error as LibpcapError, Linktype, Offline};
+use pcap_file::DataLink;
 use pcap_file::pcap::PcapReader;
 use pcap_file::pcapng::PcapNgReader;
-use pcap_file::pcapng::{Block as PcapNgBlock, blocks::packet::PacketBlock};
+use pcap_file::pcapng::{
+    Block as PcapNgBlock,
+    blocks::{interface_description::InterfaceDescriptionBlock, packet::PacketBlock},
+};
 use std::fs::File;
 use std::io::{BufReader, Cursor, ErrorKind, Read};
 use std::ops::Deref;
@@ -105,10 +109,13 @@ impl PacketBackend {
                         filename.display()
                     )
                 })?;
+            ensure_classic_pcap_ethernet_linktype(reader.header().datalink, filename.display())?;
             return Ok(Self::Classic(reader));
         }
 
-        Ok(Self::Libpcap(Capture::from_file(filename)?))
+        let capture = Capture::from_file(filename)?;
+        ensure_libpcap_ethernet_linktype(capture.get_datalink(), filename.display())?;
+        Ok(Self::Libpcap(capture))
     }
 
     #[cfg(not(windows))]
@@ -130,6 +137,7 @@ impl PacketBackend {
                     .with_context(|| {
                         format!("Unable to parse classic pcap header from '{source_name}'")
                     })?;
+                ensure_classic_pcap_ethernet_linktype(reader.header().datalink, source_name)?;
                 Ok(Self::Classic(reader))
             }
             StreamFormat::PcapNg => {
@@ -381,16 +389,58 @@ fn is_pcapng_magic(magic: [u8; 4]) -> bool {
     magic == [0x0a, 0x0d, 0x0d, 0x0a]
 }
 
+fn ensure_ethernet_datalink(datalink: DataLink, source: impl std::fmt::Display) -> Result<()> {
+    if datalink != DataLink::ETHERNET {
+        anyhow::bail!(
+            "Unsupported link-layer type {datalink:?} in '{source}'; only Ethernet is supported."
+        );
+    }
+
+    Ok(())
+}
+
+fn ensure_classic_pcap_ethernet_linktype(
+    datalink_and_metadata: DataLink,
+    source: impl std::fmt::Display,
+) -> Result<()> {
+    let raw = u32::from(datalink_and_metadata);
+    // Reserved3 (bits 16-25) and R (bit 27) must be zero; P/FCS metadata is valid.
+    if raw & 0x0BFF_0000 != 0 {
+        anyhow::bail!(
+            "Invalid classic pcap link-layer field 0x{raw:08x} in '{source}': reserved bits must be zero."
+        );
+    }
+
+    let linktype = DataLink::from(raw & u32::from(u16::MAX));
+    ensure_ethernet_datalink(linktype, source)
+}
+
+fn ensure_libpcap_ethernet_linktype(
+    linktype: Linktype,
+    source: impl std::fmt::Display,
+) -> Result<()> {
+    if linktype != Linktype::ETHERNET {
+        anyhow::bail!(
+            "Unsupported link-layer type {linktype:?} in '{source}'; only Ethernet is supported."
+        );
+    }
+
+    Ok(())
+}
+
 fn pcapng_block_to_packet_data(
     reader: &PcapNgReader<BufferedCaptureInput>,
     block: PcapNgBlock<'_>,
 ) -> Result<Option<PacketData>> {
     match block {
-        PcapNgBlock::EnhancedPacket(packet) => Ok(Some(PacketData {
-            data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
-            timestamp_micros: duration_to_micros(packet.timestamp),
-            packet_ordinal: 0,
-        })),
+        PcapNgBlock::EnhancedPacket(packet) => {
+            pcapng_packet_interface(reader, packet.interface_id)?;
+            Ok(Some(PacketData {
+                data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
+                timestamp_micros: duration_to_micros(packet.timestamp),
+                packet_ordinal: 0,
+            }))
+        }
         PcapNgBlock::Packet(packet) => Ok(Some(packet_block_to_packet_data(reader, packet)?)),
         PcapNgBlock::SimplePacket(_) => anyhow::bail!(
             "Unsupported pcapng Simple Packet Block: packet timestamps are required for offline DNS matching."
@@ -399,19 +449,29 @@ fn pcapng_block_to_packet_data(
     }
 }
 
+fn pcapng_packet_interface(
+    reader: &PcapNgReader<BufferedCaptureInput>,
+    interface_id: u32,
+) -> Result<&InterfaceDescriptionBlock<'static>> {
+    let interface = reader
+        .interfaces()
+        .get(interface_id as usize)
+        .ok_or_else(|| {
+            anyhow::anyhow!("pcapng packet references unknown interface {interface_id}")
+        })?;
+    ensure_ethernet_datalink(
+        interface.linktype,
+        format_args!("pcapng interface {interface_id}"),
+    )?;
+
+    Ok(interface)
+}
+
 fn packet_block_to_packet_data(
     reader: &PcapNgReader<BufferedCaptureInput>,
     packet: PacketBlock<'_>,
 ) -> Result<PacketData> {
-    let interface = reader
-        .interfaces()
-        .get(packet.interface_id as usize)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "pcapng packet references unknown interface {}",
-                packet.interface_id
-            )
-        })?;
+    let interface = pcapng_packet_interface(reader, u32::from(packet.interface_id))?;
     let nanos_per_unit = u128::from(interface.ts_resolution()?.to_nano_secs());
     let timestamp_nanos = u128::from(packet.timestamp).saturating_mul(nanos_per_unit);
     let timestamp_micros = timestamp_nanos.saturating_div(1_000).min(i64::MAX as u128) as i64;
@@ -445,6 +505,9 @@ where
 mod tests {
     use super::*;
     use crate::test_support::{classic_pcap_bytes, pcapng_bytes, temp_test_path};
+    use pcap_file::pcapng::PcapNgWriter;
+    use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
+    use std::borrow::Cow;
     use std::fs;
     use std::io::Cursor;
 
@@ -466,6 +529,63 @@ mod tests {
             first_non_monotonic_timestamp: None,
             non_monotonic_timestamp_count: 0,
         }
+    }
+
+    fn classic_pcap_bytes_with_network_field(
+        network: u32,
+        packets: &[(u32, u32, &[u8])],
+    ) -> Vec<u8> {
+        let mut bytes = classic_pcap_bytes(packets);
+        bytes[20..24].copy_from_slice(&network.to_le_bytes());
+        bytes
+    }
+
+    fn enhanced_pcapng_bytes(linktypes: &[DataLink], packets: &[(u32, u64, &[u8])]) -> Vec<u8> {
+        let mut writer = PcapNgWriter::new(Vec::new()).expect("pcapng writer initializes");
+        for linktype in linktypes {
+            writer
+                .write_pcapng_block(InterfaceDescriptionBlock::new(*linktype, 0xFFFF))
+                .expect("pcapng interface block writes");
+        }
+
+        for (interface_id, timestamp_micros, payload) in packets {
+            let mut packet = EnhancedPacketBlock::default();
+            packet.interface_id = *interface_id;
+            packet.timestamp = Duration::from_micros(*timestamp_micros);
+            packet.original_len = payload.len() as u32;
+            packet.data = Cow::Borrowed(*payload);
+            writer
+                .write_pcapng_block(packet)
+                .expect("pcapng enhanced packet block writes");
+        }
+
+        writer.into_inner()
+    }
+
+    fn legacy_packet_pcapng_bytes(
+        linktypes: &[DataLink],
+        interface_id: u16,
+        timestamp_micros: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut writer = PcapNgWriter::new(Vec::new()).expect("pcapng writer initializes");
+        for linktype in linktypes {
+            writer
+                .write_pcapng_block(InterfaceDescriptionBlock::new(*linktype, 0xFFFF))
+                .expect("pcapng interface block writes");
+        }
+        writer
+            .write_pcapng_block(PacketBlock {
+                interface_id,
+                drop_count: 0,
+                timestamp: timestamp_micros,
+                captured_len: payload.len() as u32,
+                original_len: payload.len() as u32,
+                data: Cow::Borrowed(payload),
+                options: Vec::new(),
+            })
+            .expect("pcapng legacy packet block writes");
+        writer.into_inner()
     }
 
     #[test]
@@ -521,6 +641,88 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_ethernet_classic_pcap_file_at_open() {
+        let path = temp_test_path("packet-parser-classic-raw", "pcap");
+        fs::write(
+            &path,
+            classic_pcap_bytes_with_network_field(
+                u32::from(DataLink::RAW),
+                &[(1, 2, &[1, 2, 3, 4])],
+            ),
+        )
+        .expect("test pcap written");
+
+        let error = match PacketParser::new(&InputSource::File(path.clone()), false) {
+            Ok(_) => panic!("RAW classic pcap must be rejected"),
+            Err(error) => error,
+        };
+        fs::remove_file(&path).expect("test pcap removed");
+
+        assert!(
+            error.to_string().contains("link-layer type RAW"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_ethernet_classic_pcap_stream_at_open() {
+        let error = match PacketBackend::from_stream(
+            Box::new(Cursor::new(classic_pcap_bytes_with_network_field(
+                u32::from(DataLink::RAW),
+                &[],
+            ))),
+            "test-stream",
+        ) {
+            Ok(_) => panic!("RAW classic pcap stream must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("link-layer type RAW"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn accepts_classic_pcap_ethernet_with_fcs_metadata() {
+        // The FCS length is encoded in 16-bit words; the P bit marks it as present.
+        let ethernet_with_four_byte_fcs =
+            (2_u32 << 28) | (1_u32 << 26) | u32::from(DataLink::ETHERNET);
+        let mut parser = parser_from_stream(classic_pcap_bytes_with_network_field(
+            ethernet_with_four_byte_fcs,
+            &[(1, 2, &[1, 2, 3, 4])],
+        ));
+
+        let batch = parser
+            .next_batch(1)
+            .expect("Ethernet capture with FCS metadata reads")
+            .expect("batch contains one packet");
+
+        assert_eq!(batch[0].timestamp_micros, 1_000_002);
+        assert_eq!(batch[0].data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_classic_pcap_with_reserved_linktype_bits() {
+        let ethernet_with_reserved_bit = 0x0001_0000 | u32::from(DataLink::ETHERNET);
+        let error = match PacketBackend::from_stream(
+            Box::new(Cursor::new(classic_pcap_bytes_with_network_field(
+                ethernet_with_reserved_bit,
+                &[],
+            ))),
+            "test-stream",
+        ) {
+            Ok(_) => panic!("classic pcap with reserved linktype bits must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("reserved bits must be zero"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn reads_pcapng_payload_via_stream_native_reader() {
         let mut parser = parser_from_stream(pcapng_bytes(&[(1_000_002, &[1, 2, 3, 4])]));
         assert!(matches!(parser.backend, PacketBackend::PcapNg(_)));
@@ -534,6 +736,104 @@ mod tests {
         assert_eq!(packet.timestamp_micros, 1_000_002);
         assert_eq!(packet.packet_ordinal, 0);
         assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_non_ethernet_pcapng_enhanced_packet() {
+        let mut parser = parser_from_stream(enhanced_pcapng_bytes(
+            &[DataLink::RAW],
+            &[(0, 1_000_002, &[1, 2, 3, 4])],
+        ));
+
+        let error = parser
+            .next_batch(1)
+            .expect_err("RAW pcapng packet must be rejected");
+
+        assert!(
+            error.to_string().contains("link-layer type RAW"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_ethernet_libpcap_file_at_open() {
+        let path = temp_test_path("packet-parser-libpcap-raw", "pcapng");
+        fs::write(
+            &path,
+            enhanced_pcapng_bytes(&[DataLink::RAW], &[(0, 1_000_002, &[1, 2, 3, 4])]),
+        )
+        .expect("test pcapng written");
+
+        let error = match PacketParser::new(&InputSource::File(path.clone()), false) {
+            Ok(_) => panic!("RAW libpcap capture must be rejected"),
+            Err(error) => error,
+        };
+        fs::remove_file(&path).expect("test pcapng removed");
+
+        assert!(
+            error.to_string().contains("only Ethernet is supported"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validates_each_referenced_pcapng_interface() {
+        let mut parser = parser_from_stream(enhanced_pcapng_bytes(
+            &[DataLink::ETHERNET, DataLink::RAW],
+            &[(0, 1_000_002, &[1]), (1, 2_000_003, &[2])],
+        ));
+
+        let batch = parser
+            .next_batch(1)
+            .expect("Ethernet packet read succeeds")
+            .expect("batch contains Ethernet packet");
+        assert_eq!(batch[0].timestamp_micros, 1_000_002);
+        assert_eq!(batch[0].data.as_slice(), &[1]);
+
+        let error = parser
+            .next_batch(1)
+            .expect_err("packet on RAW interface must be rejected");
+        assert!(
+            error.to_string().contains("pcapng interface 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn reads_ethernet_pcapng_legacy_packet_with_original_timestamp() {
+        let mut parser = parser_from_stream(legacy_packet_pcapng_bytes(
+            &[DataLink::ETHERNET],
+            0,
+            1_000_002,
+            &[1, 2, 3, 4],
+        ));
+
+        let batch = parser
+            .next_batch(1)
+            .expect("legacy packet read succeeds")
+            .expect("batch contains legacy packet");
+
+        assert_eq!(batch[0].timestamp_micros, 1_000_002);
+        assert_eq!(batch[0].data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_non_ethernet_pcapng_legacy_packet() {
+        let mut parser = parser_from_stream(legacy_packet_pcapng_bytes(
+            &[DataLink::ETHERNET, DataLink::RAW],
+            1,
+            1_000_002,
+            &[1, 2, 3, 4],
+        ));
+
+        let error = parser
+            .next_batch(1)
+            .expect_err("legacy RAW pcapng packet must be rejected");
+
+        assert!(
+            error.to_string().contains("link-layer type RAW"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

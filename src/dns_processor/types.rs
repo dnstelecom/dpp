@@ -26,9 +26,10 @@ const INLINE_TIMELINE_CAPACITY: usize = 1;
 // Edition intentionally does not canonicalize names here: byte-preserving matching aligns better
 // with the real behavior we target on offline caching-resolver workloads. As a result, a
 // query/response pair that differs only by case may fail to match even on otherwise valid DNS
-// traffic.
-pub(super) type QueryIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
-pub(super) type ResponseIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType);
+// traffic. Tuple order is id, name, client IP, client port, query type, resolver IP.
+pub(super) type MatcherIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType, IpAddr);
+pub(super) type QueryIdentityKey = MatcherIdentityKey;
+pub(super) type ResponseIdentityKey = MatcherIdentityKey;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TimelineKey {
@@ -97,15 +98,6 @@ impl<Record> Timeline<Record> {
             }
             Self::Tree(tree) => tree.insert(key, record),
         }
-    }
-
-    pub(super) fn contains_timestamp_range(
-        &self,
-        lower_timestamp_micros: i64,
-        upper_timestamp_micros: i64,
-    ) -> bool {
-        self.first_entry_in_range(lower_timestamp_micros, upper_timestamp_micros)
-            .is_some()
     }
 
     pub(super) fn first_entry_in_range(
@@ -345,6 +337,8 @@ impl<T> Drop for EntryArena<T> {
 #[derive(Default)]
 pub(super) struct ShardProcessingResult {
     pub(super) output_records: OutputRecordBatches,
+    /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
+    pub(super) oversized_qname_message_count: usize,
     pub(super) dns_query_count: usize,
     pub(super) duplicated_query_count: usize,
     pub(super) dns_response_count: usize,
@@ -377,6 +371,7 @@ pub(super) struct DnsQuery {
     pub(super) name: DnsNameBuf,
     pub(super) src_ip: IpAddr,
     pub(super) src_port: u16,
+    pub(super) resolver_ip: IpAddr,
     pub(super) timestamp_micros: i64,
     pub(super) packet_ordinal: u64,
     pub(super) record_ordinal: u32,
@@ -390,6 +385,7 @@ pub(super) struct DnsResponse {
     pub(super) name: DnsNameBuf,
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
+    pub(super) resolver_ip: IpAddr,
     pub(super) timestamp_micros: i64,
     pub(super) packet_ordinal: u64,
     pub(super) record_ordinal: u32,

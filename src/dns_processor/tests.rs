@@ -8,17 +8,27 @@
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::RecordType as HickoryRecordType;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
+use super::parser::PacketProcessingOutcome;
 use super::types::{MatcherShardState, ProcessedDnsRecord};
 use crate::custom_types::DnsNameBuf;
 use crate::test_support::{
-    encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload,
+    encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload, temp_test_path,
 };
 
 fn test_processor() -> DnsProcessor {
     DnsProcessor::new(None).expect("processor initializes")
+}
+
+fn test_processor_with_anonymization_key(passphrase: &str) -> DnsProcessor {
+    let key_path = temp_test_path("anonymization", "key");
+    fs::write(&key_path, passphrase).expect("writes anonymization key");
+    let processor = DnsProcessor::new(Some(key_path.as_path())).expect("processor initializes");
+    fs::remove_file(key_path).expect("removes anonymization key");
+    processor
 }
 
 fn test_processor_with_dns_wire_fast_path() -> DnsProcessor {
@@ -50,7 +60,7 @@ fn expected_formatted_name(name: &Name) -> DnsNameBuf {
         .filter(|stripped| !stripped.is_empty())
         .unwrap_or(ascii.as_str());
 
-    DnsNameBuf::new(formatted).unwrap_or_default()
+    DnsNameBuf::new(formatted).expect("RFC-valid name presentation fits")
 }
 
 fn append_example_query(dns_payload: &mut Vec<u8>) {
@@ -58,6 +68,62 @@ fn append_example_query(dns_payload: &mut Vec<u8>) {
         7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ]);
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+}
+
+fn example_dns_query_packet() -> Vec<u8> {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_query(&mut dns_payload);
+    make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload)
+}
+
+fn make_ipv6_udp_dns_packet_with_payload(dns_payload: &[u8]) -> Vec<u8> {
+    let udp_length = 8 + dns_payload.len();
+    let mut packet = Vec::with_capacity(14 + 40 + udp_length);
+    packet.extend_from_slice(&[0, 1, 2, 3, 4, 5]);
+    packet.extend_from_slice(&[6, 7, 8, 9, 10, 11]);
+    packet.extend_from_slice(&0x86dd_u16.to_be_bytes());
+
+    packet.extend_from_slice(&[0x60, 0, 0, 0]);
+    packet.extend_from_slice(
+        &u16::try_from(udp_length)
+            .expect("test UDP length fits")
+            .to_be_bytes(),
+    );
+    packet.push(17);
+    packet.push(64);
+    packet.extend_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    packet.extend_from_slice(&[
+        0x20, 1, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]);
+
+    packet.extend_from_slice(&53_000_u16.to_be_bytes());
+    packet.extend_from_slice(&53_u16.to_be_bytes());
+    packet.extend_from_slice(
+        &u16::try_from(udp_length)
+            .expect("test UDP length fits")
+            .to_be_bytes(),
+    );
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+    packet.extend_from_slice(dns_payload);
+    packet
+}
+
+fn overwrite_u16(packet: &mut [u8], offset: usize, value: u16) {
+    packet[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+fn append_repeated_byte_question(
+    dns_payload: &mut Vec<u8>,
+    labels: &[(usize, u8)],
+    query_type: u16,
+) {
+    for &(label_len, byte) in labels {
+        dns_payload.push(u8::try_from(label_len).expect("test label length fits into u8"));
+        dns_payload.extend(std::iter::repeat_n(byte, label_len));
+    }
+    dns_payload.push(0);
+    dns_payload.extend_from_slice(&query_type.to_be_bytes());
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
 
@@ -321,6 +387,7 @@ fn make_query_with_timestamp(
         name: test_name(),
         src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         src_port: 53000,
+        resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         timestamp_micros,
         packet_ordinal,
         record_ordinal,
@@ -342,6 +409,7 @@ fn make_response_with_timestamp(
         name: test_name(),
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         dst_port: 53000,
+        resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         timestamp_micros,
         packet_ordinal,
         record_ordinal,
@@ -361,6 +429,7 @@ fn insert_query(
         query.src_ip,
         query.src_port,
         query.query_type,
+        query.resolver_ip,
     );
     let key = super::types::TimelineKey::new(
         query.timestamp_micros,
@@ -381,6 +450,7 @@ fn insert_response(
         response.dst_ip,
         response.dst_port,
         response.query_type,
+        response.resolver_ip,
     );
     let key = super::types::TimelineKey::new(
         response.timestamp_micros,
@@ -473,9 +543,11 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
         .process_packet_batch(&packet, 1_234_567)
         .expect("standard parser succeeds");
     let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
-    let meta_records = processor
-        .process_packet_batch_with_meta(&packet, 1_234_567, routing_meta)
-        .expect("metadata-assisted parser succeeds");
+    let meta_records =
+        match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+            PacketProcessingOutcome::Records(records) => records,
+            outcome => panic!("metadata-assisted parser failed: {outcome:?}"),
+        };
 
     assert_eq!(
         routing_meta.flow_key.client_ip,
@@ -503,6 +575,292 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
 }
 
 #[test]
+fn packet_processing_appends_records_with_final_ordinals() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&28_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 3, "fast_path={fast_path}");
+        assert_eq!(records[0].packet_ordinal, 7, "fast_path={fast_path}");
+        assert_eq!(records[0].record_ordinal, 3, "fast_path={fast_path}");
+        assert_eq!(records[1].packet_ordinal, 42, "fast_path={fast_path}");
+        assert_eq!(records[1].record_ordinal, 0, "fast_path={fast_path}");
+        assert_eq!(records[1].name.as_str(), "example.com");
+        assert_eq!(records[2].packet_ordinal, 42, "fast_path={fast_path}");
+        assert_eq!(records[2].record_ordinal, 1, "fast_path={fast_path}");
+        assert_eq!(records[2].name.as_str(), "www.example.com");
+    }
+}
+
+#[test]
+fn packet_processing_failure_does_not_append_partial_records() {
+    let mut oversized = encode_dns_header(0x1234, 0x8180, 2);
+    append_example_query(&mut oversized);
+    append_repeated_byte_question(
+        &mut oversized,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (62, b'a')],
+        1,
+    );
+
+    let mut malformed = encode_dns_header(0x1234, 0x0100, 2);
+    append_example_query(&mut malformed);
+    malformed.extend_from_slice(&[3, b'a']);
+
+    for (case, dns_payload, is_response, oversized_expected) in [
+        ("oversized second response question", oversized, true, true),
+        ("malformed second query question", malformed, false, false),
+    ] {
+        let packet = if is_response {
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload)
+        } else {
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload)
+        };
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+        for (fast_path, processor) in [
+            (false, test_processor()),
+            (true, test_processor_with_dns_wire_fast_path()),
+        ] {
+            let mut records = vec![make_query_record(7, 3)];
+            let outcome = processor.process_packet_batch_with_meta_into(
+                &packet,
+                1_234_567,
+                42,
+                routing_meta,
+                &mut records,
+            );
+
+            assert!(
+                matches!(
+                    (&outcome, oversized_expected),
+                    (PacketProcessingOutcome::RejectedOversizedQname, true)
+                        | (PacketProcessingOutcome::Invalid, false)
+                ),
+                "case={case}, fast_path={fast_path}, outcome={outcome:?}"
+            );
+            assert_eq!(records.len(), 1, "case={case}, fast_path={fast_path}");
+            assert_eq!(records[0].packet_ordinal, 7);
+            assert_eq!(records[0].record_ordinal, 3);
+        }
+    }
+}
+
+#[test]
+fn packet_processing_zero_questions_leaves_destination_unchanged() {
+    let dns_payload = encode_dns_header(0x1234, 0x0100, 0);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(records[0].packet_ordinal, 7);
+        assert_eq!(records[0].record_ordinal, 3);
+    }
+}
+
+#[test]
+fn packet_processing_response_appends_only_first_question() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x8180, 2);
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&28_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 2, "fast_path={fast_path}");
+        assert_eq!(records[1].packet_ordinal, 42);
+        assert_eq!(records[1].record_ordinal, 0);
+        assert!(!records[1].is_query);
+        assert_eq!(records[1].name.as_str(), "example.com");
+    }
+}
+
+#[test]
+fn parser_rejects_dns_beyond_ipv4_total_length() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 2, 20 + 8);
+
+    assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+    for processor in [test_processor(), test_processor_with_dns_wire_fast_path()] {
+        assert!(processor.process_packet_batch(&packet, 1_234_567).is_none());
+    }
+}
+
+#[test]
+fn parser_bounds_dns_decode_to_udp_length() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 20 + 4, 8 + 12);
+    let routing_meta =
+        DnsProcessor::packet_routing_meta(&packet).expect("bounded DNS header is routable");
+
+    assert_eq!(routing_meta.dns_len, 12);
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_invalid_ipv4_and_udp_lengths() {
+    let valid_packet = example_dns_query_packet();
+    let captured_ipv4_length =
+        u16::try_from(valid_packet.len() - 14).expect("test IPv4 length fits");
+    let declared_udp_length =
+        u16::from_be_bytes([valid_packet[14 + 20 + 4], valid_packet[14 + 20 + 5]]);
+
+    for (case, offset, value) in [
+        ("IPv4 total length below IHL", 14 + 2, 19),
+        (
+            "IPv4 total length beyond capture",
+            14 + 2,
+            captured_ipv4_length + 1,
+        ),
+        ("UDP length below header", 14 + 20 + 4, 7),
+        (
+            "UDP length beyond IPv4 payload",
+            14 + 20 + 4,
+            declared_udp_length + 1,
+        ),
+    ] {
+        let mut packet = valid_packet.clone();
+        overwrite_u16(&mut packet, offset, value);
+
+        assert!(
+            DnsProcessor::packet_routing_meta(&packet).is_none(),
+            "case={case}"
+        );
+        assert!(
+            test_processor()
+                .process_packet_batch(&packet, 1_234_567)
+                .is_none(),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn parser_skips_ipv4_fragments_without_reassembly() {
+    let valid_packet = example_dns_query_packet();
+
+    for (case, flags_and_offset) in [("more fragments", 0x2000), ("non-zero offset", 0x0001)] {
+        let mut packet = valid_packet.clone();
+        overwrite_u16(&mut packet, 14 + 6, flags_and_offset);
+
+        assert!(
+            DnsProcessor::packet_routing_meta(&packet).is_none(),
+            "case={case}"
+        );
+        assert!(
+            test_processor()
+                .process_packet_batch(&packet, 1_234_567)
+                .expect("unsupported fragment is skipped")
+                .is_empty(),
+            "case={case}"
+        );
+    }
+}
+
+#[test]
+fn parser_accepts_unfragmented_ipv4_with_df_and_frame_padding() {
+    let mut packet = example_dns_query_packet();
+    overwrite_u16(&mut packet, 14 + 6, 0x4000);
+    packet.extend_from_slice(&[0xaa; 32]);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let records = processor
+            .process_packet_batch(&packet, 1_234_567)
+            .expect("complete datagram parses");
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(records[0].name.as_str(), "example.com");
+    }
+}
+
+#[test]
+fn parser_rejects_udp_payload_beyond_ipv6_payload_length() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_query(&mut dns_payload);
+    let mut packet = make_ipv6_udp_dns_packet_with_payload(&dns_payload);
+    overwrite_u16(&mut packet, 14 + 4, 8);
+
+    assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+    assert!(
+        test_processor()
+            .process_packet_batch(&packet, 1_234_567)
+            .is_none()
+    );
+}
+
+#[test]
 fn deduplicates_later_pending_queries_inside_timeout_window() {
     let processor = test_processor();
     let mut state = test_shard_state();
@@ -527,6 +885,36 @@ fn deduplicates_later_pending_queries_inside_timeout_window() {
 }
 
 #[test]
+fn timestamp_regression_keeps_earliest_pending_query_canonical() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+
+    let first_batch = processor.process_shard_records_with_batch_watermark(
+        vec![make_query_record_with_timestamp(1_300, 1, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(first_batch.dns_query_count, 1);
+    assert_eq!(first_batch.duplicated_query_count, 0);
+    assert_eq!(pending_query_count(&state), 1);
+
+    let regressed_batch = processor.process_shard_records_with_batch_watermark(
+        vec![make_query_record_with_timestamp(1_000, 2, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(regressed_batch.dns_query_count, 1);
+    assert_eq!(regressed_batch.duplicated_query_count, 1);
+    assert_eq!(pending_query_count(&state), 1);
+
+    let final_result = processor.finalize_shard(&mut state);
+    assert_eq!(final_result.timeout_query_count, 1);
+    assert_eq!(final_result.output_records.len(), 1);
+    assert_eq!(final_result.output_records[0].request_timestamp, 1_000);
+    assert_eq!(pending_query_count(&state), 0);
+}
+
+#[test]
 fn duplicate_query_identity_requires_same_source_port() {
     let processor = test_processor();
     let mut state = test_shard_state();
@@ -543,6 +931,95 @@ fn duplicate_query_identity_requires_same_source_port() {
     assert_eq!(batch_result.dns_query_count, 2);
     assert_eq!(batch_result.duplicated_query_count, 0);
     assert_eq!(pending_query_count(&state), 2);
+}
+
+#[test]
+fn resolver_flows_in_the_same_shard_match_independently() {
+    let processor = test_processor();
+    let resolver_a = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 4));
+    let resolver_b = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 11));
+
+    let mut query_a = make_query_record_with_timestamp(1_000, 1, 0);
+    query_a.dst_ip = resolver_a;
+    let mut query_b = make_query_record_with_timestamp(1_050, 2, 0);
+    query_b.dst_ip = resolver_b;
+    let mut response_b = make_response_record_with_timestamp(1_100, 3, 0);
+    response_b.src_ip = resolver_b;
+    let mut response_a = make_response_record_with_timestamp(1_200, 4, 0);
+    response_a.src_ip = resolver_a;
+
+    // One state models distinct resolver flows whose routing hashes land in the same shard.
+    let mut state = test_shard_state();
+    let result = processor.process_shard_records_with_batch_watermark(
+        vec![query_a, query_b, response_b, response_a],
+        &mut state,
+        None,
+    );
+
+    assert_eq!(result.dns_query_count, 2);
+    assert_eq!(result.duplicated_query_count, 0);
+    assert_eq!(result.matched_query_response_count, 2);
+    assert_eq!(result.output_records.len(), 2);
+    assert_eq!(result.output_records[0].request_timestamp, 1_050);
+    assert_eq!(result.output_records[0].response_timestamp, Some(1_100));
+    assert_eq!(result.output_records[1].request_timestamp, 1_000);
+    assert_eq!(result.output_records[1].response_timestamp, Some(1_200));
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 0);
+}
+
+#[test]
+fn anonymization_collision_does_not_merge_client_identities() {
+    let processor = test_processor_with_anonymization_key("secret\n");
+
+    let query_client = IpAddr::V4(Ipv4Addr::new(0, 0, 56, 87));
+    let other_client = IpAddr::V4(Ipv4Addr::new(0, 0, 201, 251));
+    let pseudonymized_client = processor.anonymize_ip(&query_client);
+    assert_eq!(
+        pseudonymized_client,
+        processor.anonymize_ip(&other_client),
+        "fixture must retain its known IPv4 pseudonym collision"
+    );
+
+    let mut query = make_query_record_with_timestamp(1_000, 1, 0);
+    query.src_ip = query_client;
+    let mut other_response = make_response_record_with_timestamp(1_100, 2, 0);
+    other_response.dst_ip = other_client;
+    let mut matching_response = make_response_record_with_timestamp(1_200, 3, 0);
+    matching_response.dst_ip = query_client;
+
+    let mut state = test_shard_state();
+    let result = processor.process_shard_records_with_batch_watermark(
+        vec![query, other_response, matching_response],
+        &mut state,
+        None,
+    );
+
+    assert_eq!(result.matched_query_response_count, 1);
+    assert_eq!(result.output_records.len(), 1);
+    assert_eq!(result.output_records[0].response_timestamp, Some(1_200));
+    assert_eq!(result.output_records[0].source_ip, pseudonymized_client);
+    assert_ne!(result.output_records[0].source_ip, query_client);
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 1);
+}
+
+#[test]
+fn timeout_output_anonymizes_client_ip() {
+    let processor = test_processor_with_anonymization_key("secret\n");
+    let query = make_query_record(1, 0);
+    let raw_client_ip = query.src_ip;
+    let expected_source_ip = processor.anonymize_ip(&raw_client_ip);
+    let mut state = test_shard_state();
+
+    let result =
+        processor.process_shard_records_with_batch_watermark(vec![query], &mut state, None);
+    assert!(result.output_records.is_empty());
+
+    let finalization = processor.finalize_shard(&mut state);
+    assert_eq!(finalization.output_records.len(), 1);
+    assert_eq!(finalization.output_records[0].source_ip, expected_source_ip);
+    assert_ne!(finalization.output_records[0].source_ip, raw_client_ip);
 }
 
 #[test]
@@ -740,6 +1217,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("b.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_500,
             packet_ordinal: 3,
             record_ordinal: 0,
@@ -754,6 +1232,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("a.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 2_000,
             packet_ordinal: 2,
             record_ordinal: 0,
@@ -768,6 +1247,7 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             name: named_test_name("a.example"),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_000,
             packet_ordinal: 1,
             record_ordinal: 0,
@@ -806,6 +1286,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_300,
             packet_ordinal: 4,
             record_ordinal: 0,
@@ -820,6 +1301,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_100,
             packet_ordinal: 2,
             record_ordinal: 0,
@@ -834,6 +1316,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_400,
             packet_ordinal: 5,
             record_ordinal: 0,
@@ -848,6 +1331,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_200,
             packet_ordinal: 3,
             record_ordinal: 0,
@@ -862,6 +1346,7 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             name: test_name(),
             src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             src_port: 53_000,
+            resolver_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             timestamp_micros: 1_000,
             packet_ordinal: 1,
             record_ordinal: 0,
@@ -915,22 +1400,236 @@ fn parser_domain_formatter_matches_hickory_ascii_path() {
 
     for name in cases {
         assert_eq!(
-            DnsProcessor::format_domain_name(&name),
+            DnsProcessor::format_domain_name(&name).expect("name presentation fits"),
             expected_formatted_name(&name)
         );
     }
 }
 
 #[test]
-fn parser_domain_formatter_preserves_overflow_fallback() {
-    let labels = [vec![1u8; 63], vec![1u8; 63], vec![1u8; 63], vec![1u8; 58]];
+fn parser_domain_formatter_supports_maximum_escaped_presentation() {
+    let labels = [vec![1u8; 63], vec![1u8; 63], vec![1u8; 63], vec![1u8; 61]];
     let name = Name::from_labels(labels.iter().map(Vec::as_slice)).expect("valid long raw name");
+    let formatted = DnsProcessor::format_domain_name(&name).expect("name presentation fits");
+    let other_labels = [vec![2u8; 63], vec![2u8; 63], vec![2u8; 63], vec![2u8; 61]];
+    let other_name = Name::from_labels(other_labels.iter().map(Vec::as_slice))
+        .expect("second valid long raw name");
+    let other_formatted =
+        DnsProcessor::format_domain_name(&other_name).expect("second name presentation fits");
 
-    assert_eq!(expected_formatted_name(&name), DnsNameBuf::default());
-    assert_eq!(
-        DnsProcessor::format_domain_name(&name),
-        DnsNameBuf::default()
+    assert_eq!(formatted.as_bytes().len(), 1003);
+    assert_eq!(formatted, expected_formatted_name(&name));
+    assert_eq!(other_formatted.as_bytes().len(), 1003);
+    assert_ne!(formatted, other_formatted);
+}
+
+#[test]
+fn parser_exports_maximum_wire_qname_in_both_decoder_modes() {
+    let labels = [(63, 1), (63, 1), (63, 1), (61, 1)];
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut dns_payload, &labels, 1);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let other_labels = [(63, 2), (63, 2), (63, 2), (61, 2)];
+    let mut other_dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut other_dns_payload, &other_labels, 1);
+    let other_packet = make_udp_dns_packet_with_payload(
+        [10, 0, 0, 1],
+        [8, 8, 8, 8],
+        53_000,
+        53,
+        &other_dns_payload,
     );
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+        let records =
+            match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+                PacketProcessingOutcome::Records(records) => records,
+                outcome => panic!("fast_path={fast_path}, unexpected outcome: {outcome:?}"),
+            };
+
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(
+            records[0].name.as_bytes().len(),
+            1003,
+            "fast_path={fast_path}"
+        );
+        assert!(
+            records[0].name.as_str().starts_with("\\001\\001"),
+            "fast_path={fast_path}"
+        );
+        assert_ne!(
+            records[0].name,
+            DnsNameBuf::default(),
+            "fast_path={fast_path}"
+        );
+
+        let other_routing_meta =
+            DnsProcessor::packet_routing_meta(&other_packet).expect("second DNS routing metadata");
+        let other_records = match processor.process_packet_batch_with_meta(
+            &other_packet,
+            1_234_567,
+            other_routing_meta,
+        ) {
+            PacketProcessingOutcome::Records(records) => records,
+            outcome => panic!("fast_path={fast_path}, unexpected second outcome: {outcome:?}"),
+        };
+        assert_eq!(other_records[0].name.as_bytes().len(), 1003);
+        assert_ne!(
+            records[0].name, other_records[0].name,
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_oversized_wire_qname_in_both_decoder_modes() {
+    let labels = [(63, b'a'), (63, b'a'), (63, b'a'), (62, b'a')];
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_repeated_byte_question(&mut dns_payload, &labels, 1);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::RejectedOversizedQname
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_rejects_oversized_compressed_qname_by_expanded_wire_length() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_repeated_byte_question(
+        &mut dns_payload,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (61, b'a')],
+        1,
+    );
+    dns_payload.extend_from_slice(&[1, b'x', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::RejectedOversizedQname
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_accepts_compressed_qname_at_exact_expanded_wire_limit() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_repeated_byte_question(
+        &mut dns_payload,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (59, b'a')],
+        1,
+    );
+    dns_payload.extend_from_slice(&[1, b'x', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+        let records =
+            match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+                PacketProcessingOutcome::Records(records) => records,
+                outcome => panic!("fast_path={fast_path}, unexpected outcome: {outcome:?}"),
+            };
+
+        assert_eq!(records.len(), 2, "fast_path={fast_path}");
+        assert!(
+            records[1].name.as_str().starts_with("x."),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_keeps_malformed_qname_separate_from_oversized_rejection() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    dns_payload.extend_from_slice(&[3, b'a']);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
+}
+
+#[test]
+fn parser_does_not_count_malformed_forward_pointer_as_oversized_qname() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    dns_payload.extend_from_slice(&[0xC0, 0x12]);
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    for label_len in [63, 63, 63, 62] {
+        dns_payload.push(label_len);
+        dns_payload.extend(std::iter::repeat_n(b'a', usize::from(label_len)));
+    }
+    dns_payload.push(0);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("DNS routing metadata");
+
+        assert!(
+            matches!(
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                PacketProcessingOutcome::Invalid
+            ),
+            "fast_path={fast_path}"
+        );
+    }
 }
 
 #[test]

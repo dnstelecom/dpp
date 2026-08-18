@@ -17,19 +17,33 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use super::DnsProcessor;
-use super::parser::{CanonicalFlowKey, ParsedUdpDnsMeta};
+use super::parser::{CanonicalFlowKey, PacketProcessingOutcome, ParsedUdpDnsMeta};
 use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::{OutputMessage, OutputRecordBatches};
 use crate::packet_parser::{PacketBatch, PacketData, PacketParser, sort_packet_batch};
 use crate::record::DnsRecord;
+use crate::runtime::AffinityPlan;
 
 const BATCH_PREFETCH_DEPTH: usize = 2;
 const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
 
+fn staged_matcher_affinity_slot(worker_idx: usize) -> usize {
+    worker_idx
+}
+
+fn staged_parser_affinity_slot(worker_count: usize) -> usize {
+    worker_count
+}
+
+fn staged_aggregator_affinity_slot(worker_count: usize) -> usize {
+    worker_count + 1
+}
+
 struct PipelineCounters {
+    oversized_qname_message_count: usize,
     dns_query_count: usize,
     duplicated_query_count: usize,
     dns_response_count: usize,
@@ -43,6 +57,7 @@ struct PipelineCounters {
 impl Default for PipelineCounters {
     fn default() -> Self {
         Self {
+            oversized_qname_message_count: 0,
             dns_query_count: 0,
             duplicated_query_count: 0,
             dns_response_count: 0,
@@ -58,6 +73,8 @@ impl Default for PipelineCounters {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProcessingCounters {
     pub(crate) total_packets_processed: usize,
+    /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
+    pub(crate) oversized_qname_message_count: usize,
     pub(crate) dns_query_count: usize,
     pub(crate) duplicated_query_count: usize,
     pub(crate) dns_response_count: usize,
@@ -73,6 +90,7 @@ impl PipelineCounters {
         shard_result: ShardProcessingResult,
         output_closed: &AtomicBool,
     ) -> bool {
+        self.oversized_qname_message_count += shard_result.oversized_qname_message_count;
         self.dns_query_count += shard_result.dns_query_count;
         self.duplicated_query_count += shard_result.duplicated_query_count;
         self.dns_response_count += shard_result.dns_response_count;
@@ -98,6 +116,7 @@ impl PipelineCounters {
     fn finalize(self, total_packets_processed: usize) -> ProcessingCounters {
         ProcessingCounters {
             total_packets_processed,
+            oversized_qname_message_count: self.oversized_qname_message_count,
             dns_query_count: self.dns_query_count,
             duplicated_query_count: self.duplicated_query_count,
             dns_response_count: self.dns_response_count,
@@ -123,6 +142,12 @@ struct RoutedWorkerBatches {
 struct RoutedDnsPackets {
     packets: Vec<PacketData>,
     metas: Vec<ParsedUdpDnsMeta>,
+}
+
+#[derive(Default)]
+struct ParsedShardRecords {
+    records: Vec<ProcessedDnsRecord>,
+    oversized_qname_message_count: usize,
 }
 
 impl RoutedDnsPackets {
@@ -329,14 +354,46 @@ fn worker_shard_ranges(shard_count: usize, worker_count: usize) -> Vec<Range<usi
         .collect()
 }
 
-fn worker_for_shard(shard_idx: usize, worker_ranges: &[Range<usize>]) -> usize {
-    worker_ranges
-        .iter()
-        .position(|range| range.contains(&shard_idx))
-        .expect("worker ranges must cover every shard index")
+struct ShardRoutingPlan {
+    worker_ranges: Vec<Range<usize>>,
+    shard_to_worker: Vec<usize>,
+}
+
+impl ShardRoutingPlan {
+    fn new(shard_count: usize, worker_count: usize) -> Self {
+        debug_assert!(shard_count > 0);
+        debug_assert!(worker_count > 0);
+        debug_assert!(worker_count <= shard_count);
+
+        let worker_ranges = worker_shard_ranges(shard_count, worker_count);
+        let mut shard_to_worker = vec![usize::MAX; shard_count];
+        for (worker_idx, shard_range) in worker_ranges.iter().enumerate() {
+            shard_to_worker[shard_range.clone()].fill(worker_idx);
+        }
+        debug_assert!(
+            shard_to_worker
+                .iter()
+                .all(|worker_idx| *worker_idx < worker_count),
+            "worker ranges must cover every shard index"
+        );
+
+        Self {
+            worker_ranges,
+            shard_to_worker,
+        }
+    }
+
+    fn shard_count(&self) -> usize {
+        self.shard_to_worker.len()
+    }
+
+    fn worker_for_shard(&self, shard_idx: usize) -> usize {
+        self.shard_to_worker[shard_idx]
+    }
 }
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
+    merged.oversized_qname_message_count += shard_result.oversized_qname_message_count;
     merged.dns_query_count += shard_result.dns_query_count;
     merged.duplicated_query_count += shard_result.duplicated_query_count;
     merged.dns_response_count += shard_result.dns_response_count;
@@ -370,14 +427,15 @@ fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
 
 fn route_batch_to_worker_batches(
     mut packet_batch: PacketBatch,
-    shard_count: usize,
-    worker_ranges: &[Range<usize>],
+    routing_plan: &ShardRoutingPlan,
 ) -> RoutedWorkerBatches {
+    let shard_count = routing_plan.shard_count();
     debug_assert!(shard_count > 0);
     sort_packet_batch(packet_batch.as_mut_slice());
     let batch_max_timestamp_micros = packet_batch.last().map(|packet| packet.timestamp_micros);
 
-    let mut worker_batches: Vec<Vec<RoutedDnsPackets>> = worker_ranges
+    let mut worker_batches: Vec<Vec<RoutedDnsPackets>> = routing_plan
+        .worker_ranges
         .iter()
         .map(|range| {
             (0..range.len())
@@ -398,8 +456,8 @@ fn route_batch_to_worker_batches(
         };
 
         let shard_idx = shard_map_index(udp_dns_meta.flow_key, shard_count);
-        let worker_idx = worker_for_shard(shard_idx, worker_ranges);
-        let local_shard_idx = shard_idx - worker_ranges[worker_idx].start;
+        let worker_idx = routing_plan.worker_for_shard(shard_idx);
+        let local_shard_idx = shard_idx - routing_plan.worker_ranges[worker_idx].start;
         worker_batches[worker_idx][local_shard_idx].push(packet_data, udp_dns_meta);
     }
 
@@ -412,27 +470,30 @@ fn route_batch_to_worker_batches(
 fn parse_shard_packets(
     dns_processor: &DnsProcessor,
     shard_packets: RoutedDnsPackets,
-) -> Vec<ProcessedDnsRecord> {
+) -> ParsedShardRecords {
     debug_assert_eq!(shard_packets.packets.len(), shard_packets.metas.len());
-    let mut shard_records = Vec::with_capacity(shard_packets.packets.len());
+    let mut parsed = ParsedShardRecords {
+        records: Vec::with_capacity(shard_packets.packets.len()),
+        ..ParsedShardRecords::default()
+    };
 
     for (packet, udp_dns_meta) in shard_packets.packets.into_iter().zip(shard_packets.metas) {
-        let Some(records) = dns_processor.process_packet_batch_with_meta(
+        match dns_processor.process_packet_batch_with_meta_into(
             &packet.data,
             packet.timestamp_micros,
+            packet.packet_ordinal,
             udp_dns_meta,
-        ) else {
-            continue;
-        };
-
-        for (record_ordinal, mut record) in records.into_iter().enumerate() {
-            record.packet_ordinal = packet.packet_ordinal;
-            record.record_ordinal = record_ordinal as u32;
-            shard_records.push(record);
+            &mut parsed.records,
+        ) {
+            PacketProcessingOutcome::Records(()) => {}
+            PacketProcessingOutcome::RejectedOversizedQname => {
+                parsed.oversized_qname_message_count += 1;
+            }
+            PacketProcessingOutcome::Invalid => {}
         }
     }
 
-    shard_records
+    parsed
 }
 
 fn run_phase_processing_worker(
@@ -442,6 +503,7 @@ fn run_phase_processing_worker(
     shard_count: usize,
     shard_parallelism_enabled: bool,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
     let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
@@ -451,6 +513,7 @@ fn run_phase_processing_worker(
     } else {
         vec![MatcherShardState::default()]
     };
+    let routing_plan = ShardRoutingPlan::new(shard_count, shard_count);
 
     let mut counters = PipelineCounters::default();
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -461,11 +524,7 @@ fn run_phase_processing_worker(
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches: shard_batches,
-        } = route_batch_to_worker_batches(
-            packet_batch,
-            shard_count,
-            &worker_shard_ranges(shard_count, shard_count),
-        );
+        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
 
         let mut shard_results: Vec<(usize, ShardProcessingResult)> = shard_batches
             .into_par_iter()
@@ -473,11 +532,13 @@ fn run_phase_processing_worker(
             .zip(shard_states.par_iter_mut())
             .enumerate()
             .map(|(map_idx, (shard_records, state))| {
-                let shard_result = dns_processor.process_shard_records_with_batch_watermark(
-                    parse_shard_packets(&dns_processor, shard_records),
+                let parsed = parse_shard_packets(&dns_processor, shard_records);
+                let mut shard_result = dns_processor.process_shard_records_with_batch_watermark(
+                    parsed.records,
                     state,
                     batch_max_timestamp_micros,
                 );
+                shard_result.oversized_qname_message_count += parsed.oversized_qname_message_count;
                 (map_idx, shard_result)
             })
             .collect();
@@ -491,7 +552,9 @@ fn run_phase_processing_worker(
         }
     }
 
-    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref())
+        && !intake_failed.load(AtomicOrdering::SeqCst)
+    {
         let mut finalization_results: Vec<(usize, ShardProcessingResult)> = shard_states
             .par_iter_mut()
             .enumerate()
@@ -513,10 +576,9 @@ fn run_phase_processing_worker(
 fn run_parser_stage(
     batch_rx: Receiver<PacketBatch>,
     worker_txs: Vec<Sender<MatcherBatchWork>>,
-    shard_count: usize,
+    routing_plan: ShardRoutingPlan,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let worker_ranges = worker_shard_ranges(shard_count, worker_txs.len());
     let mut batch_seq = 0_u64;
 
     while let Ok(packet_batch) = batch_rx.recv() {
@@ -527,7 +589,7 @@ fn run_parser_stage(
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(packet_batch, shard_count, &worker_ranges);
+        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
 
         for (worker_idx, shard_packets) in worker_batches.into_iter().enumerate() {
             worker_txs[worker_idx]
@@ -565,6 +627,7 @@ fn run_matcher_worker(
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
@@ -580,14 +643,14 @@ fn run_matcher_worker(
         let mut merged = ShardProcessingResult::default();
 
         for (shard_packets, state) in work.shard_packets.into_iter().zip(shard_states.iter_mut()) {
-            merge_shard_results(
-                &mut merged,
-                dns_processor.process_shard_records_with_batch_watermark(
-                    parse_shard_packets(&dns_processor, shard_packets),
-                    state,
-                    work.batch_max_timestamp_micros,
-                ),
+            let parsed = parse_shard_packets(&dns_processor, shard_packets);
+            let mut shard_result = dns_processor.process_shard_records_with_batch_watermark(
+                parsed.records,
+                state,
+                work.batch_max_timestamp_micros,
             );
+            shard_result.oversized_qname_message_count += parsed.oversized_qname_message_count;
+            merge_shard_results(&mut merged, shard_result);
         }
 
         result_tx
@@ -613,7 +676,9 @@ fn run_matcher_worker(
     }
 
     let mut finalization = ShardProcessingResult::default();
-    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+    if !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref())
+        && !intake_failed.load(AtomicOrdering::SeqCst)
+    {
         for state in &mut shard_states {
             merge_shard_results(&mut finalization, dns_processor.finalize_shard(state));
         }
@@ -708,17 +773,19 @@ fn run_staged_processing_pipeline(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     worker_count: usize,
+    affinity_plan: AffinityPlan,
     shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
 ) -> anyhow::Result<PipelineCounters> {
-    let worker_ranges = worker_shard_ranges(shard_count, worker_count);
+    let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
     let (result_tx, result_rx) =
         crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH * worker_count.max(1));
 
     let mut worker_txs = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
 
-    for (worker_idx, shard_range) in worker_ranges.iter().cloned().enumerate() {
+    for (worker_idx, shard_range) in routing_plan.worker_ranges.iter().cloned().enumerate() {
         let (worker_tx, worker_rx) = crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH);
         worker_txs.push(worker_tx);
 
@@ -729,8 +796,14 @@ fn run_staged_processing_pipeline(
                     let dns_processor = Arc::clone(&dns_processor);
                     let result_tx = result_tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
+                    let affinity_plan = affinity_plan.clone();
                     move || {
+                        affinity_plan.apply_to_current_thread(
+                            staged_matcher_affinity_slot(worker_idx),
+                            "staged matcher worker",
+                        );
                         run_matcher_worker(
                             dns_processor,
                             worker_idx,
@@ -738,6 +811,7 @@ fn run_staged_processing_pipeline(
                             worker_rx,
                             result_tx,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -750,9 +824,20 @@ fn run_staged_processing_pipeline(
         .name("DPP_Parser".to_string())
         .spawn({
             let output_closed = Arc::clone(&output_closed);
-            move || run_parser_stage(batch_rx, worker_txs, shard_count, output_closed)
+            let affinity_plan = affinity_plan.clone();
+            move || {
+                affinity_plan.apply_to_current_thread(
+                    staged_parser_affinity_slot(worker_count),
+                    "staged parser",
+                );
+                run_parser_stage(batch_rx, worker_txs, routing_plan, output_closed)
+            }
         })?;
 
+    affinity_plan.apply_to_current_thread(
+        staged_aggregator_affinity_slot(worker_count),
+        "staged aggregator",
+    );
     let aggregator_result = run_aggregator(result_rx, tx, worker_count, output_closed);
 
     let parser_result = join_thread(parser_handle, "Parser stage");
@@ -776,6 +861,7 @@ impl DnsProcessor {
         packet_count: &Arc<AtomicUsize>,
         tx: &Sender<OutputMessage>,
         execution_budget: ExecutionBudget,
+        affinity_plan: AffinityPlan,
         shard_parallelism_enabled: bool,
         shutdown_requested: Arc<AtomicBool>,
         output_closed: Arc<AtomicBool>,
@@ -785,6 +871,7 @@ impl DnsProcessor {
         let worker_count =
             matcher_worker_count(execution_budget, shard_parallelism_enabled, shard_count);
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(BATCH_PREFETCH_DEPTH);
+        let intake_failed = Arc::new(AtomicBool::new(false));
 
         if execution_budget.uses_staged_pipeline() {
             tracing::info!(
@@ -810,6 +897,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_staged_processing_pipeline(
@@ -818,7 +906,9 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             worker_count,
+                            affinity_plan,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -830,6 +920,7 @@ impl DnsProcessor {
                     let dns_processor = Arc::clone(&dns_processor);
                     let output_tx = tx.clone();
                     let shutdown_requested = Arc::clone(&shutdown_requested);
+                    let intake_failed = Arc::clone(&intake_failed);
                     let output_closed = Arc::clone(&output_closed);
                     move || {
                         run_phase_processing_worker(
@@ -839,6 +930,7 @@ impl DnsProcessor {
                             shard_count,
                             shard_parallelism_enabled,
                             shutdown_requested,
+                            intake_failed,
                             output_closed,
                         )
                     }
@@ -846,35 +938,43 @@ impl DnsProcessor {
         };
 
         let mut processed_packet_count = 0usize;
-        while !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
-            let Some(packet_batch) = packet_parser.next_batch(PACKET_BATCH_SIZE)? else {
-                break;
-            };
+        let intake_result = (|| -> anyhow::Result<()> {
+            while !stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                let Some(packet_batch) = packet_parser.next_batch(PACKET_BATCH_SIZE)? else {
+                    break;
+                };
 
-            if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
-                break;
+                if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                    break;
+                }
+
+                let packet_batch_len = packet_batch.len();
+                batch_tx
+                    .send(packet_batch)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "Failed to hand off packet batch to processing pipeline: {}",
+                            err
+                        )
+                    })
+                    .or_else(|error| {
+                        if output_closed.load(AtomicOrdering::Relaxed) {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })?;
+                if output_closed.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                processed_packet_count += packet_batch_len;
             }
 
-            let packet_batch_len = packet_batch.len();
-            batch_tx
-                .send(packet_batch)
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "Failed to hand off packet batch to processing pipeline: {}",
-                        err
-                    )
-                })
-                .or_else(|error| {
-                    if output_closed.load(AtomicOrdering::Relaxed) {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })?;
-            if output_closed.load(AtomicOrdering::Relaxed) {
-                break;
-            }
-            processed_packet_count += packet_batch_len;
+            Ok(())
+        })();
+
+        if intake_result.is_err() {
+            intake_failed.store(true, AtomicOrdering::SeqCst);
         }
 
         if shutdown_requested.load(AtomicOrdering::SeqCst) {
@@ -885,8 +985,19 @@ impl DnsProcessor {
 
         drop(batch_tx);
 
-        let counters = join_thread(pipeline_handle, "Processing pipeline")?;
+        let pipeline_result = join_thread(pipeline_handle, "Processing pipeline");
         packet_count.store(processed_packet_count, AtomicOrdering::Relaxed);
+
+        if let Err(intake_error) = intake_result {
+            if let Err(pipeline_error) = pipeline_result {
+                tracing::error!(
+                    "Processing pipeline teardown also failed after intake error: {pipeline_error:#}"
+                );
+            }
+            return Err(intake_error);
+        }
+
+        let counters = pipeline_result?;
 
         Ok(counters.finalize(processed_packet_count))
     }
@@ -902,7 +1013,8 @@ mod tests {
         make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
     };
     use std::fs;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn shard_result(token: usize) -> ShardProcessingResult {
         ShardProcessingResult {
@@ -934,6 +1046,114 @@ mod tests {
         batch
     }
 
+    fn oversized_qname_batch(test_name: &str) -> PacketBatch {
+        let path = temp_test_path(test_name, "pcap");
+        let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+        dns_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        for label_len in [63_usize, 63, 63, 62] {
+            dns_payload.push(label_len as u8);
+            dns_payload.resize(dns_payload.len() + label_len, b'a');
+        }
+        dns_payload.push(0);
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let packet =
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+        fs::write(&path, classic_pcap_bytes(&[(1, 0, &packet)])).expect("test pcap written");
+
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let batch = parser
+            .next_batch(1)
+            .expect("batch read succeeds")
+            .expect("oversized-QNAME packet is present");
+        fs::remove_file(&path).expect("test pcap removed");
+
+        batch
+    }
+
+    fn capture_with_complete_batch_then_truncated_record(test_name: &str) -> std::path::PathBuf {
+        let path = temp_test_path(test_name, "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let query_packet = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response_packet = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let non_dns_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE);
+        packets.push((1, 0, query_packet.as_slice()));
+        packets.push((1, 200_000, response_packet.as_slice()));
+        packets.push((2, 0, query_packet.as_slice()));
+        packets.extend(std::iter::repeat_n(
+            (3, 0, non_dns_packet.as_slice()),
+            PACKET_BATCH_SIZE - packets.len(),
+        ));
+
+        let mut capture = classic_pcap_bytes(&packets);
+        capture.extend_from_slice(&4_u32.to_le_bytes());
+        capture.extend_from_slice(&0_u32.to_le_bytes());
+        capture.extend_from_slice(&64_u32.to_le_bytes());
+        capture.extend_from_slice(&64_u32.to_le_bytes());
+        capture.extend_from_slice(&[0_u8; 3]);
+        fs::write(&path, capture).expect("truncated test pcap written");
+        path
+    }
+
+    fn capture_with_retry_regression_across_batch_boundary(test_name: &str) -> std::path::PathBuf {
+        let path = temp_test_path(test_name, "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+
+        let query_packet = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let non_dns_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE + 1);
+        packets.extend(std::iter::repeat_n(
+            (1, 0, non_dns_packet.as_slice()),
+            PACKET_BATCH_SIZE - 1,
+        ));
+        packets.push((2, 0, query_packet.as_slice()));
+        packets.push((1, 500_000, query_packet.as_slice()));
+
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+        path
+    }
+
     #[test]
     fn matcher_worker_budget_respects_staged_execution_plan() {
         let low_core_budget = ExecutionBudget::from_available_cpus(4);
@@ -945,6 +1165,58 @@ mod tests {
     }
 
     #[test]
+    fn staged_pipeline_applies_affinity_to_every_processing_role() {
+        let path = temp_test_path("pipeline-staged-affinity", "pcap");
+        fs::write(&path, classic_pcap_bytes(&[])).expect("empty pcap written");
+
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let affinity_plan = AffinityPlan::for_test(vec![2, 5, 9, 12, 17], {
+            let applied = Arc::clone(&applied);
+            move |core_id| {
+                let thread_name = thread::current().name().unwrap_or("unnamed").to_string();
+                applied
+                    .lock()
+                    .expect("affinity record lock")
+                    .push((thread_name, core_id));
+                true
+            }
+        })
+        .expect("test affinity plan resolves");
+
+        let mut parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let packet_count = Arc::new(AtomicUsize::new(0));
+        let (output_tx, _output_rx) = crossbeam::channel::unbounded();
+
+        DnsProcessor::dns_processing_loop(
+            Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+            &mut parser,
+            &packet_count,
+            &output_tx,
+            ExecutionBudget::from_available_cpus(5),
+            affinity_plan,
+            true,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("staged pipeline completes");
+        fs::remove_file(path).expect("empty pcap removed");
+
+        let mut applied = applied.lock().expect("affinity record lock").clone();
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec![
+                ("DPP_Matcher_0".to_string(), 2),
+                ("DPP_Matcher_1".to_string(), 5),
+                ("DPP_Matcher_2".to_string(), 9),
+                ("DPP_Parser".to_string(), 12),
+                ("DPP_Staged_Pipeline".to_string(), 17),
+            ]
+        );
+    }
+
+    #[test]
     fn non_parallel_mode_collapses_to_single_worker() {
         let staged_budget = ExecutionBudget::from_available_cpus(16);
 
@@ -952,14 +1224,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_for_shard_handles_uneven_ranges() {
-        let ranges = vec![0..1, 1..4, 4..7];
+    fn shard_routing_plan_covers_even_and_uneven_worker_ranges() {
+        for (shard_count, worker_count) in [(1, 1), (7, 3), (8, 8), (64, 14)] {
+            let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
 
-        assert_eq!(worker_for_shard(0, &ranges), 0);
-        assert_eq!(worker_for_shard(1, &ranges), 1);
-        assert_eq!(worker_for_shard(3, &ranges), 1);
-        assert_eq!(worker_for_shard(4, &ranges), 2);
-        assert_eq!(worker_for_shard(6, &ranges), 2);
+            assert_eq!(routing_plan.shard_to_worker.len(), shard_count);
+            for shard_idx in 0..shard_count {
+                let worker_idx = routing_plan.worker_for_shard(shard_idx);
+                assert!(worker_idx < worker_count);
+                assert!(routing_plan.worker_ranges[worker_idx].contains(&shard_idx));
+            }
+        }
+
+        let uneven = ShardRoutingPlan::new(7, 3);
+        assert_eq!(uneven.worker_ranges, vec![0..2, 2..4, 4..7]);
+        assert_eq!(uneven.shard_to_worker, vec![0, 0, 1, 1, 2, 2, 2]);
     }
 
     #[test]
@@ -1042,6 +1321,130 @@ mod tests {
     }
 
     #[test]
+    fn intake_error_joins_both_pipeline_models_without_timeout_finalization() {
+        let path = capture_with_complete_batch_then_truncated_record("pipeline-intake-error");
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+            let result = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+
+            assert!(result.is_err(), "available_cpus={available_cpus}");
+            assert_eq!(
+                packet_count.load(AtomicOrdering::Relaxed),
+                PACKET_BATCH_SIZE,
+                "available_cpus={available_cpus}"
+            );
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    message => panic!("unexpected output message: {message:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
+    fn retry_deduplication_survives_timestamp_regression_between_batches() {
+        let path = capture_with_retry_regression_across_batch_boundary(
+            "pipeline-cross-batch-retry-regression",
+        );
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+
+            assert_eq!(
+                counters.total_packets_processed,
+                PACKET_BATCH_SIZE + 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_query_count, 2,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.duplicated_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_response_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.matched_query_response_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.timeout_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(parser.non_monotonic_timestamp_count(), 1);
+
+            let regression = parser
+                .first_non_monotonic_timestamp()
+                .expect("timestamp regression is recorded");
+            assert_eq!(
+                regression.previous_packet_ordinal,
+                (PACKET_BATCH_SIZE - 1) as u64
+            );
+            assert_eq!(regression.previous_timestamp_micros, 2_000_000);
+            assert_eq!(regression.current_packet_ordinal, PACKET_BATCH_SIZE as u64);
+            assert_eq!(regression.current_timestamp_micros, 1_500_000);
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    message => panic!("unexpected output message: {message:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].request_timestamp, 1_500_000);
+            assert_eq!(records[0].response_timestamp, None);
+            assert_eq!(records[0].response_code, None);
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
@@ -1063,10 +1466,7 @@ mod tests {
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = {
-            let whole_batch = 0..4;
-            route_batch_to_worker_batches(batch, 4, std::slice::from_ref(&whole_batch))
-        };
+        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1));
 
         let ordered_packets = worker_batches[0]
             .iter()
@@ -1114,6 +1514,7 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
@@ -1130,6 +1531,35 @@ mod tests {
         assert_eq!(output_records.len(), 1);
         assert_eq!(output_records[0].response_timestamp, None);
         assert_eq!(output_records[0].response_code, None);
+    }
+
+    #[test]
+    fn phase_worker_counts_dns_message_rejected_for_oversized_qname() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(oversized_qname_batch("phase-worker-oversized-qname"))
+            .expect("batch is sent");
+        drop(batch_tx);
+
+        let counters = run_phase_processing_worker(
+            dns_processor,
+            batch_rx,
+            output_tx,
+            1,
+            false,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("phase worker completes");
+
+        assert_eq!(counters.oversized_qname_message_count, 1);
+        assert_eq!(counters.dns_query_count, 0);
+        assert_eq!(counters.dns_response_count, 0);
+        assert!(output_rx.try_iter().next().is_none());
     }
 
     #[test]
@@ -1151,12 +1581,62 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("phase worker completes");
 
         assert_eq!(counters.dns_query_count, 1);
         assert_eq!(counters.timeout_query_count, 0);
         assert!(output_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn matcher_worker_counts_dns_message_rejected_for_oversized_qname() {
+        let dns_processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+        let worker_range = 0..1;
+        let RoutedWorkerBatches {
+            batch_max_timestamp_micros,
+            mut worker_batches,
+        } = route_batch_to_worker_batches(
+            oversized_qname_batch("matcher-worker-oversized-qname"),
+            &ShardRoutingPlan::new(1, 1),
+        );
+        let shard_packets = worker_batches.pop().expect("worker batch exists");
+        let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam::channel::unbounded();
+
+        batch_tx
+            .send(MatcherBatchWork {
+                batch_seq: 0,
+                batch_max_timestamp_micros,
+                shard_packets,
+            })
+            .expect("worker batch is sent");
+        drop(batch_tx);
+
+        run_matcher_worker(
+            dns_processor,
+            0,
+            worker_range,
+            batch_rx,
+            result_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("matcher worker completes");
+
+        let events = result_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+
+        let batch_result = match &events[0] {
+            MatcherWorkerEvent::BatchResult { result, .. } => result,
+            _ => panic!("expected batch result before finalization"),
+        };
+        assert_eq!(batch_result.oversized_qname_message_count, 1);
+        assert_eq!(batch_result.dns_query_count, 0);
+        assert_eq!(batch_result.dns_response_count, 0);
+        assert!(batch_result.output_records.is_empty());
     }
 
     #[test]
@@ -1168,8 +1648,7 @@ mod tests {
             mut worker_batches,
         } = route_batch_to_worker_batches(
             unresolved_query_batch("matcher-worker-signal-shutdown"),
-            1,
-            std::slice::from_ref(&worker_range),
+            &ShardRoutingPlan::new(1, 1),
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1191,6 +1670,7 @@ mod tests {
             batch_rx,
             result_tx,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
         .expect("matcher worker completes");

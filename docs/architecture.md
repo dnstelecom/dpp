@@ -58,8 +58,8 @@ flowchart LR
 The processing pipeline has four logical stages:
 
 1. Packet ingestion and ordering
-   Reads packets from an offline PCAP file and establishes deterministic packet order inside each
-   batch.
+   Reads packets from an offline PCAP file, rejects captures or packets declared with non-Ethernet
+   linktypes, and establishes deterministic packet order inside each batch.
 
 2. DNS extraction
    Parses Ethernet/IP/UDP payloads and builds DNS query/response candidates.
@@ -141,9 +141,18 @@ repeating it for full DNS question decoding.
   interrupted runs must not synthesize timeout tail records from incomplete matcher state. The
   staged pipeline may reuse parser-produced UDP/DNS metadata between routing and
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
-  parsing does not gain a second source of truth for IP/port extraction. The optional runtime flag
+  parsing does not gain a second source of truth for IP/port extraction. That metadata owns the
+  exact DNS byte range validated against IPv4 Total Length or IPv6 Payload Length and then UDP
+  Length; capture padding and trailing IP payload cannot extend the DNS slice. Fragmented IPv4
+  datagrams are skipped because this boundary has no IP reassembly stage. The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
-  the semantic fallback for rare DNS messages that the fast path does not accept. The optional
+  the semantic fallback for rare DNS messages that the fast path does not accept. Both paths accept
+  decompressed wire QNAMEs up to the RFC 1035 limit of 255 octets, including label-length octets and
+  the terminating root octet. A valid name can expand to 1003 bytes in escaped presentation form
+  and must remain distinct through matching and export. If any QNAME exceeds the wire limit, the
+  parser rejects the whole DNS message before the matcher and increments
+  `oversized_qname_message_count` once. This counter's unit is rejected DNS messages, not questions;
+  partial questions from such a message must never reach matcher state or output. The optional
   `--monotonic-capture` contract enables batched timeout eviction inside shard-local matcher state,
   but only under a strict globally monotonic timestamp assumption. When that contract is active,
   the eviction watermark comes from the routed batch maximum timestamp, not from each shard's local
@@ -156,9 +165,13 @@ repeating it for full DNS question decoding.
 
 - `src/app.rs`
   Top-level orchestration layer. Owns the ordered run sequence, process reporting, and shutdown
-  coordination without taking ownership of canonical configuration or writer internals. The final
+  coordination without taking ownership of canonical configuration or writer internals. Capture
+  read failures drain and join complete accepted batches, skip unmatched-query finalization, flush
+  conclusive records as valid partial output, and only then return the processing error. The final
   run summary is also where aggregate matching-quality metrics such as timeout ratio and average
-  matched RTT are derived from authoritative processing counters.
+  matched RTT are derived from authoritative processing counters. Parser rejections caused by an
+  oversized decompressed QNAME are exposed as
+  `metrics.dns_messages_rejected_oversized_qname` without changing their DNS-message unit.
 
 - `src/error.rs`
   Canonical top-level error taxonomy for the application, runtime bootstrap, and output lifecycle.
@@ -181,7 +194,7 @@ repeating it for full DNS question decoding.
   Canonical architecture decision records. `README.md` is the directory index. Current RFCs
   cover ownership boundaries (0001), CLI/runtime split (0002), allocator selection (0003),
   forward-only matcher determinism (0004), dual-path PCAP parsing (0005), and adaptive
-  pipeline execution (0006).
+  pipeline execution (0006), and packet-storage allocation experiments (0007).
 
 - `docs/encapsulation-playbook.md`
   Operational and engineering guidance for captures that contain VLAN, QinQ, MPLS, or other outer
@@ -267,6 +280,9 @@ The DNS matcher must preserve these invariants:
 
 - Each observed DNS query or response candidate has a stable in-flight identity until it is matched
   or discarded.
+- Routing and in-flight matching use the original observed client IP, client port, and resolver IP.
+  The resolver remains internal; deterministic client-IP pseudonymization is applied exactly once
+  when the matcher constructs a finalized `DnsRecord`.
 - Repeated pending queries with the same match identity inside the configured timeout window
   (`1200ms` by default) are deduplicated to the earliest canonical query. Later duplicates are
   counted separately and must not create extra matched or timeout records.

@@ -11,6 +11,7 @@ use crate::config::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::{env, fs, thread};
@@ -33,9 +34,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_threads = env::var("DPP_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
-    let env_bonded = env::var("DPP_BONDED")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    let env_bonded = env::var_os("DPP_BONDED");
 
     let matches = build_cli(version).get_matches();
 
@@ -73,11 +72,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .and_then(|value| value.parse::<usize>().ok())
         .or(env_threads);
 
-    let bonded = matches
-        .get_one::<String>("bonded")
-        .and_then(|value| value.parse::<usize>().ok())
-        .or(env_bonded)
-        .unwrap_or(0);
+    let bonded = resolve_bonded(&matches, env_bonded.as_deref())?;
 
     let output_filename = matches
         .get_one::<String>("output_filename")
@@ -87,6 +82,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
 
     let output_target = output_target_for_path(&output_filename);
     validate_output_path(&output_filename)?;
+    validate_distinct_input_output(&input_source, &output_filename)?;
     validate_output_mode(output_target, format, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
@@ -127,7 +123,7 @@ fn build_cli(version: &'static str) -> Command {
   DPP_OUTPUT_FILENAME   Name of the output file (use '-' to write CSV records to stdout; used if [output_filename] argument is not provided)
   DPP_ANONYMIZE         Path to the key file
   DPP_FILENAME          Path to the input PCAP file, or '-' to read the capture from stdin (used if [filename] argument is not provided)
-  DPP_AFFINITY          Set to 'true' to use cpu affinity
+  DPP_AFFINITY          Set to 'true' to apply CPU affinity to processing threads
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
   DPP_MONOTONIC_CAPTURE
@@ -208,7 +204,8 @@ LICENSE INFORMATION:
                 .short('b')
                 .help("Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity")
                 .value_name("N")
-                .num_args(1),
+                .num_args(1)
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("zstd")
@@ -227,7 +224,7 @@ LICENSE INFORMATION:
             Arg::new("affinity")
                 .long("affinity")
                 .short('a')
-                .help("Use core affinity")
+                .help("Apply CPU affinity to processing threads")
                 .action(ArgAction::SetTrue),
         )
         .arg(
@@ -288,6 +285,21 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
     }
 }
 
+fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usize> {
+    if let Some(value) = matches.get_one::<usize>("bonded") {
+        return Ok(*value);
+    }
+
+    match env_value {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_BONDED must contain valid UTF-8"))?
+            .parse::<usize>()
+            .with_context(|| format!("Failed to parse DPP_BONDED from '{}'", value.display())),
+        None => Ok(0),
+    }
+}
+
 fn resolve_silent_mode(
     matches: &ArgMatches,
     env_silent: bool,
@@ -342,6 +354,29 @@ fn validate_output_path(output_path: &Path) -> Result<()> {
 
     if output_path.is_dir() {
         bail!("Error: The output file path is a directory, not a file.");
+    }
+
+    Ok(())
+}
+
+fn validate_distinct_input_output(input_source: &InputSource, output_path: &Path) -> Result<()> {
+    let InputSource::File(input_path) = input_source else {
+        return Ok(());
+    };
+
+    if matches!(output_target_for_path(output_path), OutputTarget::Stdout) || !output_path.exists()
+    {
+        return Ok(());
+    }
+
+    let paths_refer_to_same_file = same_file::is_same_file(input_path, output_path)
+        .context("Failed to compare input and output file identities")?;
+    if paths_refer_to_same_file {
+        bail!(
+            "Error: Input PCAP '{}' and output path '{}' refer to the same file; refusing to overwrite the input capture.",
+            input_path.display(),
+            output_path.display()
+        );
     }
 
     Ok(())
@@ -468,6 +503,54 @@ mod tests {
         let help = String::from_utf8(help).expect("help is utf-8");
 
         assert!(help.contains("Set IO channel capacity in records"));
+    }
+
+    #[test]
+    fn invalid_cli_bonded_is_rejected() {
+        let error = build_cli("test")
+            .try_get_matches_from(["dpp", "--bonded", "invalid", "input.pcap"])
+            .expect_err("invalid --bonded must be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn invalid_env_bonded_is_rejected_when_cli_is_absent() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+
+        let error = resolve_bonded(&matches, Some(OsStr::new("invalid")))
+            .expect_err("invalid DPP_BONDED must be rejected");
+
+        assert!(error.to_string().contains("Failed to parse DPP_BONDED"));
+    }
+
+    #[test]
+    fn cli_bonded_overrides_invalid_env_value() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--bonded", "2048", "input.pcap"])
+            .expect("cli parses");
+
+        assert_eq!(
+            resolve_bonded(&matches, Some(OsStr::new("invalid"))).expect("CLI value wins"),
+            2_048
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_bonded_is_rejected_when_cli_is_absent() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+
+        let error = resolve_bonded(&matches, Some(OsStr::from_bytes(&[0xff])))
+            .expect_err("non-UTF-8 DPP_BONDED must be rejected");
+
+        assert!(error.to_string().contains("must contain valid UTF-8"));
     }
 
     #[test]
@@ -612,6 +695,66 @@ mod tests {
     #[test]
     fn stdout_output_sentinel_is_accepted() {
         validate_output_path(Path::new("-")).expect("stdout sentinel is accepted");
+    }
+
+    #[test]
+    fn hard_link_to_input_is_rejected_as_output() {
+        let input_path = unique_temp_path("same-file-input.pcap");
+        let output_path = unique_temp_path("same-file-output.csv");
+        fs::write(&input_path, b"pcap bytes").expect("writes input file");
+        fs::hard_link(&input_path, &output_path).expect("creates hard link to input");
+
+        let error = validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect_err("hard link to input must be rejected as output");
+
+        assert!(error.to_string().contains("refer to the same file"));
+        assert_eq!(
+            fs::read(&input_path).expect("reads preserved input"),
+            b"pcap bytes"
+        );
+
+        fs::remove_file(output_path).expect("removes hard link");
+        fs::remove_file(input_path).expect("removes input file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_output_is_rejected_as_input() {
+        use std::os::unix::fs::symlink;
+
+        let output_path = unique_temp_path("same-file-output.csv");
+        let input_path = unique_temp_path("same-file-input.pcap");
+        fs::write(&output_path, b"pcap bytes").expect("writes target file");
+        symlink(&output_path, &input_path).expect("creates input symlink");
+
+        let error = validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect_err("input symlink to output must be rejected");
+
+        assert!(error.to_string().contains("refer to the same file"));
+
+        fs::remove_file(input_path).expect("removes input symlink");
+        fs::remove_file(output_path).expect("removes target file");
+    }
+
+    #[test]
+    fn distinct_nonexistent_output_is_accepted() {
+        let input_path = unique_temp_path("distinct-input.pcap");
+        let output_path = unique_temp_path("distinct-output.csv");
+        fs::write(&input_path, b"pcap bytes").expect("writes input file");
+
+        validate_distinct_input_output(
+            &InputSource::File(input_path.clone()),
+            output_path.as_path(),
+        )
+        .expect("distinct output path is accepted");
+
+        fs::remove_file(input_path).expect("removes input file");
     }
 
     #[test]

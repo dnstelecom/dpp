@@ -70,6 +70,18 @@ fn finalize_output_shutdown(
     })
 }
 
+fn finish_background_teardown<OutputResult, MemoryMonitorResult>(
+    finish_output: impl FnOnce() -> OutputResult,
+    sample_final_write_seconds: impl FnOnce() -> f64,
+    join_memory_monitor: impl FnOnce() -> MemoryMonitorResult,
+) -> (OutputResult, f64, MemoryMonitorResult) {
+    let output_result = finish_output();
+    let final_write_seconds = sample_final_write_seconds();
+    let memory_monitor_result = join_memory_monitor();
+
+    (output_result, final_write_seconds, memory_monitor_result)
+}
+
 #[must_use]
 fn format_information(args: &AppConfig) -> &'static str {
     match (args.format, args.v2, args.zstd) {
@@ -84,14 +96,27 @@ fn format_information(args: &AppConfig) -> &'static str {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTermination {
     Completed,
+    ProcessingFailed,
     DownstreamClosed,
     InterruptedBySignal,
 }
 
 impl RunTermination {
+    fn classify(processing_failed: bool, shutdown_requested: bool, output_closed: bool) -> Self {
+        if processing_failed {
+            Self::ProcessingFailed
+        } else if shutdown_requested {
+            Self::InterruptedBySignal
+        } else if output_closed {
+            Self::DownstreamClosed
+        } else {
+            Self::Completed
+        }
+    }
+
     fn output_shutdown_message(self) -> OutputMessage {
         match self {
-            RunTermination::Completed => OutputMessage::Shutdown,
+            RunTermination::Completed | RunTermination::ProcessingFailed => OutputMessage::Shutdown,
             RunTermination::DownstreamClosed | RunTermination::InterruptedBySignal => {
                 OutputMessage::Abort
             }
@@ -200,6 +225,7 @@ struct RunWarningsSummary {
 #[derive(Serialize)]
 struct RunMetricsSummary {
     total_packets_processed: usize,
+    dns_messages_rejected_oversized_qname: usize,
     total_dns_queries_processed: usize,
     deduplicated_duplicate_queries: usize,
     total_dns_responses_processed: usize,
@@ -353,6 +379,7 @@ fn build_run_summary(
         },
         metrics: RunMetricsSummary {
             total_packets_processed: counters.total_packets_processed,
+            dns_messages_rejected_oversized_qname: counters.oversized_qname_message_count,
             total_dns_queries_processed: counters.dns_query_count,
             deduplicated_duplicate_queries: counters.duplicated_query_count,
             total_dns_responses_processed: counters.dns_response_count,
@@ -374,6 +401,13 @@ fn build_run_summary(
         },
         warnings,
     }
+}
+
+fn oversized_qname_rejection_summary_line(count: usize) -> String {
+    format!(
+        "DNS messages rejected for oversized QNAME: {}",
+        count.to_formatted_string(&Locale::en)
+    )
 }
 
 fn display_text_summary(summary: &RunSummary) {
@@ -404,6 +438,12 @@ fn display_text_summary(summary: &RunSummary) {
             .metrics
             .total_dns_responses_processed
             .to_formatted_string(&Locale::en)
+    );
+    info!(
+        "{}",
+        oversized_qname_rejection_summary_line(
+            summary.metrics.dns_messages_rejected_oversized_qname
+        )
     );
     info!(
         "Total matched Query-Response pairs: {}",
@@ -495,8 +535,9 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let shutdown_requested = runtime::install_shutdown_signal_handler()?;
     let output_closed = Arc::new(AtomicBool::new(false));
     let execution_budget = args.execution_budget();
+    let affinity_plan = runtime::AffinityPlan::resolve(args.affinity)?;
     if let Some(rayon_threads) = execution_budget.rayon_threads {
-        runtime::create_thread_pool(rayon_threads, args.affinity)?;
+        runtime::create_thread_pool(rayon_threads, affinity_plan.clone())?;
     }
 
     let packet_count = Arc::new(AtomicUsize::new(0));
@@ -515,20 +556,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     processing_mode_info();
     display_channel_info(&args);
 
-    let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
-
     display_parquet_format_information(&args);
     display_anonymization(&args);
     display_parser_mode(&args);
     display_match_timeout(&args);
     display_monotonic_capture_mode(&args);
-
-    let (max_memory_usage, memory_thread) = runtime::maybe_start_memory_monitoring(args.silent)?;
-    let writer_thread = output::create_writer_thread(&args, rx)?;
-    info!(
-        "Results will be written to: {}",
-        canonical_path_string(&args.output_filename)
-    );
 
     let dns_processor = Arc::new(
         DnsProcessor::new_with_runtime_options(
@@ -542,48 +574,85 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let mut packet_parser = PacketParser::new(&args.input_source, args.monotonic_capture)
         .map_err(|source| AppRunError::PacketParserInit { source })?;
 
-    let counters = DnsProcessor::dns_processing_loop(
+    let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
+    let (max_memory_usage, memory_thread) = runtime::maybe_start_memory_monitoring(args.silent)?;
+    let writer_thread = output::create_writer_thread(&args, rx)?;
+    info!(
+        "Results will be written to: {}",
+        canonical_path_string(&args.output_filename)
+    );
+
+    let processing_result = DnsProcessor::dns_processing_loop(
         dns_processor,
         &mut packet_parser,
         &packet_count,
         &tx,
         execution_budget,
+        affinity_plan,
         true,
         Arc::clone(&shutdown_requested),
         Arc::clone(&output_closed),
     )
-    .map_err(|source| AppRunError::Processing { source })?;
+    .map_err(|source| AppRunError::Processing { source });
     let processing_seconds = start_time.elapsed().as_secs_f64();
 
     let io_flush_start = Instant::now();
-    let termination = if shutdown_requested.load(AtomicOrdering::SeqCst) {
-        RunTermination::InterruptedBySignal
-    } else if output_closed.load(AtomicOrdering::Relaxed) {
-        RunTermination::DownstreamClosed
-    } else {
-        RunTermination::Completed
-    };
+    let termination = RunTermination::classify(
+        processing_result.is_err(),
+        shutdown_requested.load(AtomicOrdering::SeqCst),
+        output_closed.load(AtomicOrdering::Relaxed),
+    );
     let shutdown_result = tx.send(termination.output_shutdown_message());
     drop(tx);
 
-    if let Some(memory_thread) = memory_thread {
+    if let Some(memory_thread) = memory_thread.as_ref() {
         memory_thread.stop();
-        memory_thread
-            .join()
-            .map_err(|source| AppRunError::MemoryMonitorShutdown { source })?;
     }
 
-    let writer_result = writer_thread
-        .join()
-        .map_err(|e| OutputError::WriterThreadPanic(format!("{:?}", e)))?;
-    finalize_output_shutdown(shutdown_result, writer_result)?;
+    let (output_shutdown_result, final_write_post_processing_seconds, memory_shutdown_result) =
+        finish_background_teardown(
+            || {
+                let writer_result = match writer_thread.join() {
+                    Ok(result) => result,
+                    Err(error) => Err(OutputError::WriterThreadPanic(format!("{:?}", error))),
+                };
+                finalize_output_shutdown(shutdown_result, writer_result)
+            },
+            || io_flush_start.elapsed().as_secs_f64(),
+            || {
+                if let Some(memory_thread) = memory_thread {
+                    memory_thread.join()
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+    let counters = match processing_result {
+        Ok(counters) => {
+            output_shutdown_result?;
+            memory_shutdown_result
+                .map_err(|source| AppRunError::MemoryMonitorShutdown { source })?;
+            counters
+        }
+        Err(processing_error) => {
+            if let Err(error) = memory_shutdown_result {
+                tracing::error!(
+                    "Memory monitor teardown also failed after processing error: {error}"
+                );
+            }
+            if let Err(error) = output_shutdown_result {
+                tracing::error!("Output teardown also failed after processing error: {error}");
+            }
+            return Err(processing_error);
+        }
+    };
 
     if matches!(termination, RunTermination::DownstreamClosed) {
         return Ok(());
     }
 
     if !args.writes_output_to_stdout() {
-        let final_write_post_processing_seconds = io_flush_start.elapsed().as_secs_f64();
         let total_runtime_seconds = start_time.elapsed().as_secs_f64();
         let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
         let warnings = RunWarningsSummary {
@@ -743,6 +812,35 @@ mod tests {
         let result = finalize_output_shutdown(shutdown_result, Err(OutputError::DownstreamClosed));
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn final_write_measurement_excludes_memory_monitor_join() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let (output_result, final_write_seconds, memory_monitor_result) =
+            finish_background_teardown(
+                || {
+                    events.borrow_mut().push("writer_flush");
+                    Ok::<(), ()>(())
+                },
+                || {
+                    events.borrow_mut().push("elapsed_sample");
+                    0.75
+                },
+                || {
+                    events.borrow_mut().push("memory_monitor_join");
+                    Ok::<(), ()>(())
+                },
+            );
+
+        assert!(output_result.is_ok());
+        assert_eq!(final_write_seconds, 0.75);
+        assert!(memory_monitor_result.is_ok());
+        assert_eq!(
+            events.into_inner(),
+            vec!["writer_flush", "elapsed_sample", "memory_monitor_join"]
+        );
     }
 
     #[test]
@@ -962,6 +1060,42 @@ mod tests {
         assert_eq!(summary.metrics.average_matched_rtt_ms, Some(2.0));
     }
 
+    #[test]
+    fn run_summary_reports_dns_messages_rejected_for_oversized_qname() {
+        let config = test_config();
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters {
+                oversized_qname_message_count: 3,
+                ..ProcessingCounters::default()
+            },
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+
+        assert_eq!(summary.metrics.dns_messages_rejected_oversized_qname, 3);
+        assert_eq!(
+            oversized_qname_rejection_summary_line(
+                summary.metrics.dns_messages_rejected_oversized_qname
+            ),
+            "DNS messages rejected for oversized QNAME: 3"
+        );
+
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        let metrics = serialized
+            .get("metrics")
+            .and_then(serde_json::Value::as_object)
+            .expect("metrics object is present");
+        assert_eq!(
+            metrics.get("dns_messages_rejected_oversized_qname"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
     struct BrokenPipeJsonSink {
         bytes_until_broken_pipe: usize,
         written: Vec<u8>,
@@ -1035,6 +1169,22 @@ mod tests {
             RunTermination::Completed.output_shutdown_message(),
             OutputMessage::Shutdown
         ));
+    }
+
+    #[test]
+    fn processing_failure_flushes_partial_output_on_shutdown() {
+        assert!(matches!(
+            RunTermination::ProcessingFailed.output_shutdown_message(),
+            OutputMessage::Shutdown
+        ));
+    }
+
+    #[test]
+    fn processing_failure_takes_precedence_over_concurrent_shutdown() {
+        assert_eq!(
+            RunTermination::classify(true, true, true),
+            RunTermination::ProcessingFailed
+        );
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 [package]
 name = "dpp"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 build = "build.rs"  # Custom build script to include version information from git
 
 [workspace]
@@ -28,7 +28,7 @@ overflow-checks = false  # Benchmark-focused profile for trusted perf runs on re
 # Build dependencies used during the compilation process
 [build-dependencies]
 vergen-gitcl = { version = "10.0.0", features = ["build", "cargo", "rustc", "si"] }
-anyhow = "1.0.102"  # Error handling used in the build script
+anyhow = "1.0.103"  # Error handling used in the build script
 
 # Development profile settings for faster iteration
 [profile.dev]
@@ -45,18 +45,19 @@ opt-level = 3
 
 # Core dependencies for the project
 [dependencies]
-pcap = "2.4"                      # Library for reading pcap files
+pcap = "2.5"                      # Library for reading pcap files
 pcap-file = "3.0.0-rc1"           # Pure-Rust parser for classic pcap and pcapng files
-pnet_packet = "0.35"             # Packet parsing library for network packets
 rayon = "1.12"                    # Parallelism library for multithreaded processing
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] } # DNS protocol parsing library
 csv = "1.4"                       # CSV serialization and deserialization
+same-file = "1.0"                 # Cross-platform input/output file identity checks
 crossbeam = "0.8"                 # Concurrency support with channels and data structures
-anyhow = "1.0"                    # Error handling library
+anyhow = "1.0.104"                # Error handling library
 num-format = "0.4"                # Number formatting for logging and output
 sysinfo = "0.39"                  # System information retrieval (for memory monitoring)
 arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
-parquet = { version = "59.0.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
+bytes = "1.11"                    # Shared byte storage for zero-copy Parquet values
+parquet = { version = "59.2.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
 serde = { version = "1.0", features = ["derive"] }  # Serialization and deserialization support
 clap = { version = "4.6", features = ["derive"] }   # Command-line argument parsing
 tikv-jemallocator = { version = "0.7.0", optional = true } # Jemalloc successor for Rust global allocation
@@ -66,7 +67,7 @@ core_affinity = "0.8.3"           # To assign threads to specific CPU cores
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "chrono"] }
 tracing-log = "0.2.0"             # Bridges log-based dependencies into tracing
-aes = "0.9.1"
+aes = "0.9.2"
 pbkdf2 = "0.13.0"
 sha2 = "0.11.0"
 itoa = "1.0"

@@ -13,6 +13,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::Arc;
 
 /// A wrapper type around `HickoryRecordType` to implement custom traits and behaviors.
 ///
@@ -308,11 +309,29 @@ fn parse_response_code_text(value: &str) -> Option<ProtoResponseCode> {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DnsNameBuf {
-    bytes: [MaybeUninit<u8>; 255],
+const DNS_NAME_INLINE_CAPACITY: usize = 255;
+/// Maximum escaped presentation length for a 255-octet wire name: 250 label bytes, each expanded
+/// to a four-byte octal escape, plus three label separators.
+pub const DNS_NAME_PRESENTATION_MAX_LENGTH: usize = 1003;
+
+#[derive(Clone)]
+struct InlineDnsName {
+    bytes: [MaybeUninit<u8>; DNS_NAME_INLINE_CAPACITY],
     len: u8,
+}
+
+#[derive(Clone)]
+// Boxing the inline variant would allocate for every common QNAME. Keep the large no-allocation
+// hot path and spill only the rare presentation that exceeds 255 bytes.
+#[allow(clippy::large_enum_variant)]
+enum DnsNameStorage {
+    Inline(InlineDnsName),
+    Spill(Arc<String>),
+}
+
+#[derive(Clone)]
+pub struct DnsNameBuf {
+    storage: DnsNameStorage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +339,10 @@ pub struct DnsNameTooLong;
 
 impl fmt::Display for DnsNameTooLong {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DNS name exceeds 255-byte capacity")
+        write!(
+            f,
+            "DNS name presentation exceeds {DNS_NAME_PRESENTATION_MAX_LENGTH}-byte capacity"
+        )
     }
 }
 
@@ -339,10 +361,18 @@ impl DnsNameBuf {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: only the prefix `0..len` is ever exposed, and every mutating constructor writes
-        // that prefix before advancing `len`.
-        unsafe {
-            std::slice::from_raw_parts(self.bytes.as_ptr().cast::<u8>(), usize::from(self.len))
+        match &self.storage {
+            DnsNameStorage::Inline(inline) => {
+                // SAFETY: only the prefix `0..len` is exposed, and mutating constructors write
+                // that prefix before advancing `len`.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        inline.bytes.as_ptr().cast::<u8>(),
+                        usize::from(inline.len),
+                    )
+                }
+            }
+            DnsNameStorage::Spill(spill) => spill.as_bytes(),
         }
     }
 
@@ -352,21 +382,39 @@ impl DnsNameBuf {
     }
 
     pub fn try_push_str(&mut self, value: &str) -> Result<(), DnsNameTooLong> {
-        let start = usize::from(self.len);
+        let start = self.as_bytes().len();
         let end = start
             .checked_add(value.len())
-            .filter(|end| *end <= self.bytes.len())
+            .filter(|end| *end <= DNS_NAME_PRESENTATION_MAX_LENGTH)
             .ok_or(DnsNameTooLong)?;
 
-        // SAFETY: bounds were checked above and source/destination do not overlap.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                value.as_ptr(),
-                self.bytes.as_mut_ptr().cast::<u8>().add(start),
-                value.len(),
-            );
+        match &mut self.storage {
+            DnsNameStorage::Inline(inline) if end <= DNS_NAME_INLINE_CAPACITY => {
+                // SAFETY: bounds were checked above and source/destination do not overlap.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        inline.bytes.as_mut_ptr().cast::<u8>().add(start),
+                        value.len(),
+                    );
+                }
+                inline.len = end as u8;
+            }
+            DnsNameStorage::Inline(inline) => {
+                let mut spill = String::with_capacity(end);
+                // SAFETY: the initialized inline prefix is valid UTF-8 by construction.
+                spill.push_str(unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        inline.bytes.as_ptr().cast::<u8>(),
+                        usize::from(inline.len),
+                    ))
+                });
+                spill.push_str(value);
+                self.storage = DnsNameStorage::Spill(Arc::new(spill));
+            }
+            DnsNameStorage::Spill(spill) => Arc::make_mut(spill).push_str(value),
         }
-        self.len = end as u8;
+
         Ok(())
     }
 }
@@ -374,8 +422,10 @@ impl DnsNameBuf {
 impl Default for DnsNameBuf {
     fn default() -> Self {
         Self {
-            bytes: [MaybeUninit::uninit(); 255],
-            len: 0,
+            storage: DnsNameStorage::Inline(InlineDnsName {
+                bytes: [MaybeUninit::uninit(); DNS_NAME_INLINE_CAPACITY],
+                len: 0,
+            }),
         }
     }
 }
@@ -522,10 +572,10 @@ impl<const N: usize> From<ArrayString<N>> for FixedSizeString<N> {
     }
 }
 
-impl From<DnsNameBuf> for FixedSizeString<255> {
+impl From<DnsNameBuf> for FixedSizeString<DNS_NAME_PRESENTATION_MAX_LENGTH> {
     fn from(name: DnsNameBuf) -> Self {
         FixedSizeString::new(name.as_str())
-            .expect("DnsNameBuf always fits into FixedSizeString<255>")
+            .expect("DnsNameBuf always fits into its maximum presentation capacity")
     }
 }
 
@@ -543,7 +593,10 @@ impl<'de, const N: usize> Deserialize<'de> for FixedSizeString<N> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsNameBuf, FixedSizeString, HickoryResponseCode, ProtoResponseCode};
+    use super::{
+        DNS_NAME_PRESENTATION_MAX_LENGTH, DnsNameBuf, FixedSizeString, HickoryResponseCode,
+        ProtoResponseCode,
+    };
     use std::mem::size_of;
 
     #[test]
@@ -591,8 +644,25 @@ mod tests {
     }
 
     #[test]
-    fn dns_name_buf_rejects_values_longer_than_capacity() {
-        let oversized = "a".repeat(256);
+    fn dns_name_buf_spills_presentation_larger_than_inline_capacity() {
+        let spilled = "a".repeat(256);
+        let name = DnsNameBuf::new(&spilled).expect("spill presentation fits");
+
+        assert_eq!(name.as_str(), spilled);
+        assert_eq!(name.clone(), name);
+    }
+
+    #[test]
+    fn dns_name_buf_accepts_maximum_wire_name_presentation() {
+        let maximum = "a".repeat(DNS_NAME_PRESENTATION_MAX_LENGTH);
+        let name = DnsNameBuf::new(&maximum).expect("maximum presentation fits");
+
+        assert_eq!(name.as_str(), maximum);
+    }
+
+    #[test]
+    fn dns_name_buf_rejects_values_longer_than_presentation_capacity() {
+        let oversized = "a".repeat(DNS_NAME_PRESENTATION_MAX_LENGTH + 1);
 
         let error = DnsNameBuf::new(&oversized).expect_err("overflow must fail");
 
@@ -608,8 +678,8 @@ mod tests {
     }
 
     #[test]
-    fn dns_name_buf_stays_within_256_byte_layout_budget() {
-        assert_eq!(size_of::<DnsNameBuf>(), 256);
+    fn dns_name_buf_keeps_common_names_inline_without_kilobyte_layout() {
+        assert!(size_of::<DnsNameBuf>() <= 272);
     }
 
     #[test]

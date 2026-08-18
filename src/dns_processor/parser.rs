@@ -5,19 +5,19 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use hickory_proto::ProtoError;
 use hickory_proto::op::Header;
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::Name;
 use hickory_proto::rr::RecordType as HickoryRecordType;
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
-use std::error::Error;
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
 use super::types::ProcessedDnsRecord;
-use crate::custom_types::{DnsNameBuf, ProtoResponseCode};
+use crate::custom_types::{DnsNameBuf, DnsNameTooLong, ProtoResponseCode};
 
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -27,6 +27,8 @@ const DNS_HEADER_LEN: usize = 12;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
 const IP_PROTOCOL_UDP: u8 = 17;
+const IPV4_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const DNS_PORT: u16 = 53;
 const DNS_POINTER_MASK: u8 = 0b1100_0000;
 const DNS_POINTER_TAG: u8 = 0b1100_0000;
@@ -47,6 +49,7 @@ pub(super) struct CanonicalFlowKey {
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
     pub(super) dns_offset: u16,
+    pub(super) dns_len: u16,
     pub(super) is_response: bool,
 }
 
@@ -84,8 +87,11 @@ impl ParsedUdpDnsMeta {
     }
 
     fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
-        data.get(usize::from(self.dns_offset)..)
-            .ok_or("Failed to parse UDP packet")
+        let start = usize::from(self.dns_offset);
+        let end = start
+            .checked_add(usize::from(self.dns_len))
+            .ok_or("Failed to parse UDP packet")?;
+        data.get(start..end).ok_or("Failed to parse UDP packet")
     }
 }
 
@@ -97,6 +103,25 @@ struct DecodedDnsHeader {
 struct DecodedDnsQuestion {
     name: DnsNameBuf,
     query_type: HickoryRecordType,
+}
+
+#[derive(Debug)]
+pub(super) enum PacketProcessingOutcome<T = ()> {
+    Records(T),
+    RejectedOversizedQname,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsQuestionDecodeError {
+    OversizedQname,
+    Invalid,
+}
+
+impl From<&'static str> for DnsQuestionDecodeError {
+    fn from(_: &'static str) -> Self {
+        Self::Invalid
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -139,38 +164,73 @@ impl DnsProcessor {
         timestamp_micros: i64,
     ) -> Option<Vec<ProcessedDnsRecord>> {
         match Self::extract_udp_dns_meta(data) {
-            Ok(Some(meta)) => self.process_packet_batch_with_meta(data, timestamp_micros, meta),
+            Ok(Some(meta)) => {
+                match self.process_packet_batch_with_meta(data, timestamp_micros, meta) {
+                    PacketProcessingOutcome::Records(records) => Some(records),
+                    PacketProcessingOutcome::RejectedOversizedQname
+                    | PacketProcessingOutcome::Invalid => None,
+                }
+            }
             Ok(None) => Some(Vec::new()),
             Err(_) => None,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn process_packet_batch_with_meta(
         &self,
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
-    ) -> Option<Vec<ProcessedDnsRecord>> {
-        self.process_packet_with_meta(data, timestamp_micros, meta)
-            .ok()
+    ) -> PacketProcessingOutcome<Vec<ProcessedDnsRecord>> {
+        let mut records = Vec::new();
+        match self.process_packet_batch_with_meta_into(
+            data,
+            timestamp_micros,
+            0,
+            meta,
+            &mut records,
+        ) {
+            PacketProcessingOutcome::Records(()) => PacketProcessingOutcome::Records(records),
+            PacketProcessingOutcome::RejectedOversizedQname => {
+                PacketProcessingOutcome::RejectedOversizedQname
+            }
+            PacketProcessingOutcome::Invalid => PacketProcessingOutcome::Invalid,
+        }
+    }
+
+    pub(super) fn process_packet_batch_with_meta_into(
+        &self,
+        data: &[u8],
+        timestamp_micros: i64,
+        packet_ordinal: u64,
+        meta: ParsedUdpDnsMeta,
+        records: &mut Vec<ProcessedDnsRecord>,
+    ) -> PacketProcessingOutcome {
+        match self.process_packet_with_meta_into(
+            data,
+            timestamp_micros,
+            packet_ordinal,
+            meta,
+            records,
+        ) {
+            Ok(()) => PacketProcessingOutcome::Records(()),
+            Err(DnsQuestionDecodeError::OversizedQname) => {
+                PacketProcessingOutcome::RejectedOversizedQname
+            }
+            Err(DnsQuestionDecodeError::Invalid) => PacketProcessingOutcome::Invalid,
+        }
     }
 
     #[inline]
-    fn remove_trailing_dot(name: &str) -> &str {
-        let stripped = name.strip_suffix('.').unwrap_or(name);
-
-        if stripped.is_empty() { name } else { stripped }
-    }
-
-    #[inline]
-    pub(super) fn format_domain_name(name: &Name) -> DnsNameBuf {
+    pub(super) fn format_domain_name(name: &Name) -> Result<DnsNameBuf, DnsNameTooLong> {
         let mut formatted = DnsNameBuf::default();
 
         if Self::write_domain_name(name, &mut formatted) {
-            return formatted;
+            Ok(formatted)
+        } else {
+            Err(DnsNameTooLong)
         }
-
-        DnsNameBuf::new(Self::remove_trailing_dot(&name.to_ascii())).unwrap_or_default()
     }
 
     fn write_domain_name(name: &Name, output: &mut DnsNameBuf) -> bool {
@@ -256,75 +316,71 @@ impl DnsProcessor {
             && output.try_push(char::from(b'0' + (byte & 0b111))).is_ok()
     }
 
-    fn process_packet_with_meta(
+    fn process_packet_with_meta_into(
         &self,
         data: &[u8],
         timestamp_micros: i64,
+        packet_ordinal: u64,
         meta: ParsedUdpDnsMeta,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
+        records: &mut Vec<ProcessedDnsRecord>,
+    ) -> Result<(), DnsQuestionDecodeError> {
         let (header, queries) =
             self.decode_dns_questions(meta.dns_data(data)?, meta.is_response)?;
 
-        self.build_dns_records(
+        self.build_dns_records_into(
             &header,
-            queries.as_slice(),
-            meta.src_ip(),
-            meta.dst_ip(),
-            meta.src_port(),
-            meta.dst_port(),
+            queries,
             timestamp_micros,
-            meta.is_response,
-        )
+            packet_ordinal,
+            meta,
+            records,
+        );
+
+        Ok(())
     }
 
-    fn build_dns_records(
+    fn build_dns_records_into(
         &self,
         header: &DecodedDnsHeader,
-        queries: &[DecodedDnsQuestion],
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        src_port: u16,
-        dst_port: u16,
+        queries: Vec<DecodedDnsQuestion>,
         timestamp_micros: i64,
-        is_answer: bool,
-    ) -> Result<Vec<ProcessedDnsRecord>, Box<dyn Error>> {
-        let records = queries
-            .iter()
-            .take(if is_answer { 1 } else { usize::MAX })
-            .map(|query| {
-                let domain_name = query.name;
-                let query_type = query.query_type;
-                let response_code = if is_answer {
-                    header.response_code
-                } else {
-                    HickoryResponseCode::ServFail.into()
-                };
+        packet_ordinal: u64,
+        meta: ParsedUdpDnsMeta,
+        records: &mut Vec<ProcessedDnsRecord>,
+    ) {
+        for (record_ordinal, query) in queries
+            .into_iter()
+            .take(if meta.is_response { 1 } else { usize::MAX })
+            .enumerate()
+        {
+            let response_code = if meta.is_response {
+                header.response_code
+            } else {
+                HickoryResponseCode::ServFail.into()
+            };
 
-                ProcessedDnsRecord {
-                    id: header.id,
-                    timestamp_micros,
-                    packet_ordinal: 0,
-                    record_ordinal: 0,
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port,
-                    is_query: !is_answer,
-                    name: domain_name,
-                    query_type,
-                    response_code,
-                }
-            })
-            .collect::<Vec<ProcessedDnsRecord>>();
-
-        Ok(records)
+            records.push(ProcessedDnsRecord {
+                id: header.id,
+                timestamp_micros,
+                packet_ordinal,
+                record_ordinal: record_ordinal as u32,
+                src_ip: meta.src_ip(),
+                src_port: meta.src_port(),
+                dst_ip: meta.dst_ip(),
+                dst_port: meta.dst_port(),
+                is_query: !meta.is_response,
+                name: query.name,
+                query_type: query.query_type,
+                response_code,
+            });
+        }
     }
 
     fn decode_dns_questions(
         &self,
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         if self.dns_wire_fast_path {
             Self::decode_dns_questions_fast(dns_data, decode_extended_rcode)
                 .or_else(|_| Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode))
@@ -333,12 +389,21 @@ impl DnsProcessor {
         }
     }
 
+    fn classify_hickory_question_error(error: ProtoError) -> DnsQuestionDecodeError {
+        match error {
+            ProtoError::Decode(DecodeError::DomainNameTooLong(_)) => {
+                DnsQuestionDecodeError::OversizedQname
+            }
+            _ => DnsQuestionDecodeError::Invalid,
+        }
+    }
+
     fn decode_dns_questions_fast(
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         if dns_data.len() < DNS_HEADER_LEN {
-            return Err("DNS data too short");
+            return Err(DnsQuestionDecodeError::Invalid);
         }
 
         let id = Self::parse_u16_at(dns_data, 0, "Failed to parse DNS header")?;
@@ -402,11 +467,11 @@ impl DnsProcessor {
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
         decode_extended_rcode: bool,
-    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), &'static str> {
+    ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         let mut decoder = BinDecoder::new(dns_data);
-        let header = Header::read(&mut decoder).map_err(|_| "Failed to parse DNS header")?;
+        let header = Header::read(&mut decoder).map_err(|_| DnsQuestionDecodeError::Invalid)?;
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
-            .map_err(|_| "Failed to parse DNS questions")?;
+            .map_err(Self::classify_hickory_question_error)?;
         let mut response_code = ProtoResponseCode::from(header.response_code);
         if decode_extended_rcode && header.counts.additionals > 0 {
             response_code = Self::decode_response_code_with_additionals(
@@ -428,11 +493,14 @@ impl DnsProcessor {
             },
             queries
                 .into_iter()
-                .map(|query: Query| DecodedDnsQuestion {
-                    name: Self::format_domain_name(query.name()),
-                    query_type: query.query_type(),
+                .map(|query: Query| {
+                    Ok(DecodedDnsQuestion {
+                        name: Self::format_domain_name(query.name())
+                            .map_err(|_| DnsQuestionDecodeError::Invalid)?,
+                        query_type: query.query_type(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, DnsQuestionDecodeError>>()?,
         ))
     }
 
@@ -662,12 +730,14 @@ impl DnsProcessor {
     fn read_wire_domain_name(
         dns_data: &[u8],
         cursor: &mut usize,
-    ) -> Result<DnsNameBuf, &'static str> {
+    ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
         let mut output = DnsNameBuf::default();
         let mut position = *cursor;
         let mut resume_position = None;
         let mut wrote_label = false;
         let mut jump_count = 0;
+        let mut expanded_wire_len = 1_usize;
+        let mut oversized = false;
 
         loop {
             let length = *dns_data.get(position).ok_or("DNS name truncated")?;
@@ -675,8 +745,13 @@ impl DnsProcessor {
             match length {
                 0 => {
                     position += 1;
-                    if !wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
+                    if oversized {
+                        return Err(DnsQuestionDecodeError::OversizedQname);
+                    }
+                    if !wrote_label {
+                        output
+                            .try_push('.')
+                            .map_err(|_| DnsQuestionDecodeError::Invalid)?;
                     }
 
                     *cursor = resume_position.unwrap_or(position);
@@ -690,7 +765,7 @@ impl DnsProcessor {
                         (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
 
                     if offset >= dns_data.len() {
-                        return Err("DNS compression pointer out of bounds");
+                        return Err(DnsQuestionDecodeError::Invalid);
                     }
 
                     if resume_position.is_none() {
@@ -699,13 +774,13 @@ impl DnsProcessor {
 
                     jump_count += 1;
                     if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err("DNS compression pointer loop");
+                        return Err(DnsQuestionDecodeError::Invalid);
                     }
 
                     position = offset;
                 }
                 _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err("Unsupported DNS label encoding");
+                    return Err(DnsQuestionDecodeError::Invalid);
                 }
                 _ => {
                     let label_len = usize::from(length);
@@ -713,11 +788,18 @@ impl DnsProcessor {
                         .get(position + 1..position + 1 + label_len)
                         .ok_or("DNS label truncated")?;
 
-                    if wrote_label && output.try_push('.').is_err() {
-                        return Err("DNS name too long");
-                    }
-                    if !Self::write_label_ascii(label, &mut output) {
-                        return Err("DNS name too long");
+                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label_len);
+                    oversized |= expanded_wire_len > Name::MAX_LENGTH;
+
+                    if !oversized {
+                        if wrote_label {
+                            output
+                                .try_push('.')
+                                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+                        }
+                        if !Self::write_label_ascii(label, &mut output) {
+                            return Err(DnsQuestionDecodeError::Invalid);
+                        }
                     }
 
                     wrote_label = true;
@@ -769,6 +851,25 @@ impl DnsProcessor {
             return Err("Failed to parse IPv4 packet");
         }
 
+        let total_length = usize::from(Self::parse_u16_at(
+            header,
+            2,
+            "Failed to parse IPv4 packet",
+        )?);
+        if total_length < header_len {
+            return Err("Failed to parse IPv4 packet");
+        }
+        let datagram = data
+            .get(..total_length)
+            .ok_or("Failed to parse IPv4 packet")?;
+
+        let flags_and_fragment_offset =
+            Self::parse_u16_at(header, 6, "Failed to parse IPv4 packet")?;
+        if flags_and_fragment_offset & (IPV4_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
+            // DNS extraction has no IPv4 fragment reassembly stage.
+            return Ok(None);
+        }
+
         if header[9] != IP_PROTOCOL_UDP {
             return Ok(None);
         }
@@ -781,7 +882,7 @@ impl DnsProcessor {
         ));
 
         Self::extract_udp_dns_from_transport(
-            &data[header_len..],
+            &datagram[header_len..],
             src_ip,
             dst_ip,
             l3_offset + header_len,
@@ -800,6 +901,18 @@ impl DnsProcessor {
             return Err("Failed to parse IPv6 packet");
         }
 
+        let payload_length = usize::from(Self::parse_u16_at(
+            header,
+            4,
+            "Failed to parse IPv6 packet",
+        )?);
+        let packet_length = IPV6_HEADER_LEN
+            .checked_add(payload_length)
+            .ok_or("Failed to parse IPv6 packet")?;
+        let payload = data
+            .get(IPV6_HEADER_LEN..packet_length)
+            .ok_or("Failed to parse IPv6 packet")?;
+
         if header[6] != IP_PROTOCOL_UDP {
             return Ok(None);
         }
@@ -811,12 +924,7 @@ impl DnsProcessor {
             <[u8; 16]>::try_from(&header[24..40]).unwrap(),
         ));
 
-        Self::extract_udp_dns_from_transport(
-            &data[IPV6_HEADER_LEN..],
-            src_ip,
-            dst_ip,
-            l3_offset + IPV6_HEADER_LEN,
-        )
+        Self::extract_udp_dns_from_transport(payload, src_ip, dst_ip, l3_offset + IPV6_HEADER_LEN)
     }
 
     fn extract_udp_dns_from_transport(
@@ -835,7 +943,12 @@ impl DnsProcessor {
             return Ok(None);
         }
 
-        let dns_data = data
+        let udp_length = usize::from(Self::parse_u16(data, 4)?);
+        if udp_length < UDP_HEADER_LEN {
+            return Err("Failed to parse UDP packet");
+        }
+        let datagram = data.get(..udp_length).ok_or("Failed to parse UDP packet")?;
+        let dns_data = datagram
             .get(UDP_HEADER_LEN..)
             .ok_or("Failed to parse UDP packet")?;
         if dns_data.len() < DNS_HEADER_LEN {
@@ -850,6 +963,8 @@ impl DnsProcessor {
             flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port),
             dns_offset: u16::try_from(dns_offset)
                 .map_err(|_| "UDP DNS offset exceeds supported range")?,
+            dns_len: u16::try_from(dns_data.len())
+                .map_err(|_| "UDP DNS payload exceeds supported range")?,
             is_response: src_port == DNS_PORT,
         }))
     }

@@ -52,6 +52,30 @@ The detection is a simple 4-byte magic check (`0xa1b2c3d4` or `0xd4c3b2a1` for c
 `0xa1b23c4d` or `0x4d3cb2a1` for nanosecond-resolution classic, `0x0a0d0d0a` for PCAPNG). For
 regular files, everything else goes to `libpcap`. For stdin streams, everything else is rejected.
 
+### IP and UDP boundaries
+
+The routing stage and shard-local DNS decoder share one `ParsedUdpDnsMeta` value containing the
+validated DNS offset and length. IPv4 Total Length or IPv6 Payload Length first bounds the IP
+payload; UDP Length then bounds the DNS payload. Bytes outside either declared boundary, including
+Ethernet padding and trailing capture bytes, never reach a DNS decoder.
+
+DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or a non-zero fragment
+offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
+
+### DNS QNAME boundary
+
+The standard `hickory` DNS question decoder and the optional custom DNS wire fast path enforce the
+same RFC 1035 boundary after name decompression. A QNAME may occupy at most 255 wire octets,
+including label-length octets and the terminating root octet. Its escaped presentation form can be
+as large as 1003 bytes and remains valid input; DPP preserves it for matching and export rather than
+replacing it with an empty name.
+
+If any decompressed QNAME exceeds the wire limit, the entire DNS message is rejected before matcher
+or writer handoff. The processing counter `oversized_qname_message_count` increments exactly once
+for that message, regardless of its question count, and the JSON report exposes the same DNS-message
+unit as `metrics.dns_messages_rejected_oversized_qname`. No question from the rejected message may
+enter matcher state or output.
+
 ### Monotonic timestamp contract
 
 The `--monotonic-capture` flag opts into a strict invariant: packet timestamps must be globally

@@ -24,8 +24,8 @@ jobs:
       - name: Install libpcap development headers
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
 
-      - name: Install Rust 1.96.0
-        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2

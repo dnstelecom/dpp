@@ -8,7 +8,7 @@
 use crate::config::{AppConfig, OUTPUT_FLUSH_THRESHOLD, PARQUET_WRITE_BATCH_SIZE};
 use crate::output::{OutputMessage, drain_output_messages};
 use crate::record::DnsRecord;
-use arrayvec::ArrayString;
+use bytes::Bytes;
 use crossbeam::channel::Receiver;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::file::properties::EnabledStatistics;
@@ -17,7 +17,7 @@ use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 use parquet::schema::types::TypePtr;
 use std::error::Error;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -77,10 +77,65 @@ where
     Ok(SerializedFileWriter::new(sink, schema, props)?)
 }
 
-fn format_ip_address(ip: &IpAddr) -> ArrayString<45> {
-    let mut formatted = ArrayString::<45>::new();
-    write!(&mut formatted, "{ip}").expect("IpAddr display fits within 45 bytes");
-    formatted
+struct PackedByteArrayBuilder {
+    data: Vec<u8>,
+    lengths: Vec<u16>,
+}
+
+impl PackedByteArrayBuilder {
+    fn with_capacity(value_count: usize, byte_capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(byte_capacity),
+            lengths: Vec::with_capacity(value_count),
+        }
+    }
+
+    fn push_bytes(&mut self, value: &[u8]) {
+        self.data.extend_from_slice(value);
+        self.push_last_length(value.len());
+    }
+
+    fn push_display(&mut self, value: impl fmt::Display) {
+        let start = self.data.len();
+        write!(self, "{value}").expect("writing to a byte buffer cannot fail");
+        self.push_last_length(self.data.len() - start);
+    }
+
+    fn push_last_length(&mut self, length: usize) {
+        self.lengths
+            .push(u16::try_from(length).expect("packed Parquet text values fit within u16 length"));
+    }
+
+    fn finish(self) -> Vec<ByteArray> {
+        let data = Bytes::from(self.data);
+        let mut offset = 0;
+        let values = self
+            .lengths
+            .into_iter()
+            .map(|length| {
+                let length = usize::from(length);
+                let value = ByteArray::from(data.slice(offset..offset + length));
+                offset += length;
+                value
+            })
+            .collect();
+        debug_assert_eq!(offset, data.len());
+        values
+    }
+}
+
+impl fmt::Write for PackedByteArrayBuilder {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.data.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn max_formatted_ip_length(ip: &IpAddr) -> usize {
+    match ip {
+        IpAddr::V4(_) => 15,
+        IpAddr::V6(_) => 39,
+    }
 }
 
 fn write_column<Type>(
@@ -133,11 +188,20 @@ where
     let mut response_timestamp_definition_levels = Vec::with_capacity(len);
     let mut source_ports = Vec::with_capacity(len);
     let mut ids = Vec::with_capacity(len);
-    let mut source_ips = Vec::with_capacity(len);
-    let mut names = Vec::with_capacity(len);
     let mut query_types = Vec::with_capacity(len);
     let mut response_codes = Vec::with_capacity(len);
     let mut response_code_definition_levels = Vec::with_capacity(len);
+    let (source_ip_byte_capacity, name_byte_capacity) =
+        buffer
+            .iter()
+            .fold((0, 0), |(ip_bytes, name_bytes), record| {
+                (
+                    ip_bytes + max_formatted_ip_length(&record.source_ip),
+                    name_bytes + record.name.as_bytes().len(),
+                )
+            });
+    let mut source_ip_builder = PackedByteArrayBuilder::with_capacity(len, source_ip_byte_capacity);
+    let mut name_builder = PackedByteArrayBuilder::with_capacity(len, name_byte_capacity);
 
     for record in buffer.iter() {
         request_timestamps.push(record.request_timestamp);
@@ -150,17 +214,25 @@ where
         source_ports.push(i32::from(record.source_port));
         ids.push(i32::from(record.id));
 
-        let source_ip = format_ip_address(&record.source_ip);
-        source_ips.push(ByteArray::from(source_ip.as_str()));
-        names.push(ByteArray::from(record.name.as_str()));
-        query_types.push(ByteArray::from(record.query_type.as_str()));
+        source_ip_builder.push_display(record.source_ip);
+        name_builder.push_bytes(record.name.as_bytes());
+        query_types.push(ByteArray::from(Bytes::from_static(
+            record.query_type.as_str().as_bytes(),
+        )));
         if let Some(response_code) = &record.response_code {
-            response_codes.push(ByteArray::from(response_code.as_str()));
+            response_codes.push(ByteArray::from(Bytes::from_static(
+                response_code.as_str().as_bytes(),
+            )));
             response_code_definition_levels.push(1);
         } else {
             response_code_definition_levels.push(0);
         }
     }
+
+    // The ByteArray values share row-group-owned backing storage. Parquet consumes them
+    // synchronously before these vectors are dropped.
+    let source_ips = source_ip_builder.finish();
+    let names = name_builder.finish();
 
     let mut row_group_writer = parquet_writer.next_row_group()?;
     write_column::<Int64Type>(
@@ -226,6 +298,7 @@ pub(crate) fn parquet_writer(
 mod tests {
     use super::*;
     use crate::config::{InputSource, OutputFormat};
+    use crate::custom_types::DnsNameBuf;
     use crate::test_support::{temp_test_path, test_dns_record};
     use crossbeam::channel;
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -464,6 +537,86 @@ mod tests {
             row.get_column_iter().nth(7),
             Some((_, Field::Null))
         ));
+
+        fs::remove_file(filename).expect("removes temp parquet file");
+    }
+
+    #[test]
+    fn packed_text_columns_preserve_values_across_row_groups() {
+        fn max_escaped_name(octet: u8) -> String {
+            [63, 63, 63, 61]
+                .map(|label_len| format!("\\{octet:03}").repeat(label_len))
+                .join(".")
+        }
+
+        let filename = temp_test_path("parquet-writer-packed-text", "parquet");
+        let config = AppConfig {
+            input_source: InputSource::File(PathBuf::from("input.pcap")),
+            output_filename: filename.clone(),
+            format: OutputFormat::Parquet,
+            report_format: crate::config::ReportFormat::Text,
+            match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            monotonic_capture: false,
+            zstd: false,
+            v2: false,
+            silent: true,
+            num_cpus: 1,
+            requested_threads: None,
+            affinity: false,
+            bonded: 0,
+            anonymize: None,
+            dns_wire_fast_path: false,
+        };
+        let file = File::create(&filename).expect("creates parquet file");
+        let mut writer = create_parquet_writer(file, &config).expect("creates parquet writer");
+
+        let mut empty_name = test_dns_record();
+        empty_name.source_ip = "192.0.2.1".parse().expect("IPv4 address parses");
+        empty_name.name = DnsNameBuf::new("").expect("empty presentation name fits");
+        empty_name.response_timestamp = None;
+        empty_name.response_code = None;
+
+        let escaped_zero = max_escaped_name(0);
+        let mut long_ipv6 = test_dns_record();
+        long_ipv6.source_ip = "2001:db8::1".parse().expect("IPv6 address parses");
+        long_ipv6.name = DnsNameBuf::new(&escaped_zero).expect("maximum presentation name fits");
+
+        let mut buffer = vec![empty_name, long_ipv6];
+        flush_buffer_async_parquet(&mut writer, &mut buffer).expect("first row group is written");
+        assert!(buffer.is_empty());
+
+        let escaped_one = max_escaped_name(1);
+        let mut second_group = test_dns_record();
+        second_group.source_ip = "2001:db8:ffff::ffff".parse().expect("IPv6 address parses");
+        second_group.name = DnsNameBuf::new(&escaped_one).expect("maximum presentation name fits");
+        buffer.push(second_group);
+        flush_buffer_async_parquet(&mut writer, &mut buffer).expect("second row group is written");
+        writer.close().expect("parquet writer closes");
+
+        let reader = SerializedFileReader::new(File::open(&filename).expect("opens output"))
+            .expect("parquet output is readable");
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let rows = reader
+            .get_row_iter(None)
+            .expect("parquet rows are readable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parquet rows decode");
+        assert_eq!(rows.len(), 3);
+
+        for (row, expected_ip, expected_name) in [
+            (&rows[0], "192.0.2.1", ""),
+            (&rows[1], "2001:db8::1", escaped_zero.as_str()),
+            (&rows[2], "2001:db8:ffff::ffff", escaped_one.as_str()),
+        ] {
+            assert!(matches!(
+                row.get_column_iter().nth(2),
+                Some((_, Field::Str(value))) if value == expected_ip
+            ));
+            assert!(matches!(
+                row.get_column_iter().nth(5),
+                Some((_, Field::Str(value))) if value == expected_name
+            ));
+        }
 
         fs::remove_file(filename).expect("removes temp parquet file");
     }

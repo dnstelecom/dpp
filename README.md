@@ -83,7 +83,7 @@ ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/ar
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+- [Rust](https://rustup.rs/) 1.97.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 - Cargo
 - PCAP files for offline processing
 - `libpcap` development headers for fallback support on non-classic formats
@@ -150,7 +150,8 @@ dpp --report-format json input.pcap output.csv > dpp-summary.json
 
 If `output_filename` is omitted, DPP chooses the default file name from the resolved output format:
 `dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or `pq`. Use `-` only when you
-want CSV records on stdout.
+want CSV records on stdout. DPP refuses to start when the input and output paths refer to the same
+file, including hard-link aliases, so the input capture cannot be overwritten.
 
 ### Create an anonymization key
 
@@ -173,8 +174,10 @@ dpp --anonymize /tmp/anon.key input.pcap output.csv
 Notes:
 
 - Keep the key file private. Anyone with the same file can reproduce the same pseudonymized output.
-- The key file must contain valid UTF-8 text because DPP reads it as a text passphrase.
+- The key file must contain a non-empty UTF-8 passphrase. Leading and trailing whitespace is ignored.
 - Rotating the key changes the resulting pseudonymized IP addresses for the same input capture.
+- Matching and deduplication use the original client IP. Pseudonymization is applied only to the
+  `source_ip` field of finalized output records, so pseudonym collisions cannot merge clients.
 - DPP intentionally uses a fixed PBKDF2 salt for deterministic pseudonymization. The passphrase is
   still the operator-controlled secret; changing it rotates the derived pseudonyms.
 - If `--anonymize` or `DPP_ANONYMIZE` is configured and the key file is missing, unreadable, or
@@ -199,7 +202,7 @@ Notes:
 | `-b, --bonded <N>`                | Set I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the safe default bounded capacity |
 | `-z, --zstd`                      | Enable Zstd compression for Parquet output                                                                          |
 | `--v2`                            | Use Parquet Version 2                                                                                               |
-| `-a, --affinity`                  | Enable core affinity                                                                                                |
+| `-a, --affinity`                  | Apply CPU affinity to processing threads                                                                            |
 | `--dns-wire-fast-path`            | Enable the optional question-only DNS wire fast path with `hickory` fallback                                        |
 | `--anonymize <path>`              | Path to the pseudonymization key file                                                                               |
 | `-h, --help`                      | Print help                                                                                                          |
@@ -215,10 +218,10 @@ Notes:
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
 | `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                          |
 | `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected       |
-| `DPP_BONDED`             | I/O channel capacity in batched output messages; each message carries up to `1024` records; `0` uses the default bounded capacity |
+| `DPP_BONDED`             | I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the default bounded capacity |
 | `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
 | `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
-| `DPP_AFFINITY`           | Enable CPU affinity                                                                                                       |
+| `DPP_AFFINITY`           | Apply CPU affinity to processing threads                                                                                  |
 | `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                                    |
 | `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                            |
 | `DPP_SILENT`             | Suppress info-level log output                                                                                            |
@@ -239,9 +242,9 @@ Unsupported non-PCAP/non-PCAPNG stream magic on `stdin` is rejected explicitly i
 hidden temp-file or second ingest path.
 
 Repeated pending queries that share the same match identity (`id`, `name`, client IP, client port,
-and `query_type`) inside the configured match window (`1200ms` by default) are deduplicated to the earliest canonical
-query. Deduplicated retries increment a separate counter and do not emit extra timeout or matched
-records.
+resolver IP, and `query_type`) inside the configured match window (`1200ms` by default) are
+deduplicated to the earliest canonical query. Deduplicated retries increment a separate counter and
+do not emit extra timeout or matched records.
 
 For QNAME matching, DPP preserves the observed presentation-form name bytes and does not lowercase
 them before building matcher identity keys. This is a deliberate Community Edition trade-off, not
@@ -251,6 +254,15 @@ reuses label bytes from another wire location. DPP still keeps byte-preserving m
 because that better matches the real behavior we target on offline caching-resolver workloads. As
 a result, a query and response that differ only by case may fail to match even on otherwise valid
 DNS traffic.
+
+DPP accepts QNAMEs up to the RFC 1035 limit of 255 octets in decompressed wire form, including
+label-length octets and the terminating root octet. Escaping arbitrary label bytes can expand that
+valid wire name to as many as 1003 bytes in DPP's presentation form; those expanded names remain
+distinct and are matched and exported without substituting an empty name. If any decompressed QNAME
+in a DNS message exceeds 255 octets, DPP rejects the entire message before matching or export. The
+text report includes `DNS messages rejected for oversized QNAME`; JSON exposes the count as
+`metrics.dns_messages_rejected_oversized_qname`. The unit is DNS messages, not individual questions,
+and no questions from a rejected message contribute DNS query or response records.
 
 Timeout records leave response fields empty:
 
@@ -274,8 +286,9 @@ accepted work, skips synthetic timeout finalization for pending unmatched querie
 still-buffered output tail, and then exits. This applies to CSV and Parquet outputs alike. The
 final JSON summary reports this through the `warnings.graceful_signal_shutdown` field.
 
-The final report now also includes basic matching-quality metrics:
+The final report now also includes basic processing and matching-quality metrics:
 
+- `metrics.dns_messages_rejected_oversized_qname`
 - `metrics.timed_out_queries`
 - `metrics.timed_out_query_ratio`
 - `metrics.average_matched_rtt_ms`
@@ -352,7 +365,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.046  INFO > Commercial licensing options: carrier-support@dnstele.com
 04:15:01.046  INFO > Nameto Oy (c) 2026. All rights reserved.
 04:15:01.062  INFO OS: Linux, ARCH: x86_64
-04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), Affinity: false
+04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), affinity requested: false
 04:15:01.062  INFO Free memory (system reported): 2,857 MB
 04:15:01.062  INFO Starting to process PCAP file: /mnt/mirror/src/dpp/server1_jul_2024.pcap
 04:15:01.062  INFO Processing mode: forward sorting with response-query matching
@@ -477,8 +490,11 @@ Additional notes:
 ## Limitations
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
+- DPP does not reassemble IPv4 fragments, so fragmented IPv4 datagrams are skipped.
+- If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
+  from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
-- **Outer encapsulation layers:** The fast extraction path assumes Ethernet followed by IPv4 or IPv6. Captures containing VLAN, QinQ, MPLS, or similar outer encapsulation layers may require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
+- **Ethernet linktype only:** DPP rejects captures or packets declared with non-Ethernet linktypes instead of interpreting them as Ethernet. Ethernet frames containing VLAN, QinQ, MPLS, or similar outer encapsulation layers require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.
 - **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks because the output channel rounds the requested record backlog up to batched messages of up to `1024` records each.
 - **Monotonic-capture mode is explicit:** Batched timeout eviction is available only with `--monotonic-capture` because it depends on globally monotonic packet timestamps. If the capture is not monotonic, DPP aborts and recommends `reordercap`.

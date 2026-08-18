@@ -2,7 +2,7 @@
 name = "dns-pcap-generator"
 version = "0.21.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
