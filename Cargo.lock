@@ -670,6 +670,7 @@ dependencies = [
  "aes",
  "anyhow",
  "arrayvec",
+ "bytes",
  "clap",
  "core_affinity",
  "crossbeam",

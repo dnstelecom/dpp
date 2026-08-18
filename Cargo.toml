@@ -57,6 +57,7 @@ anyhow = "1.0"                    # Error handling library
 num-format = "0.4"                # Number formatting for logging and output
 sysinfo = "0.39"                  # System information retrieval (for memory monitoring)
 arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
+bytes = "1.11"                    # Shared byte storage for zero-copy Parquet values
 parquet = { version = "59.0.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
 serde = { version = "1.0", features = ["derive"] }  # Serialization and deserialization support
 clap = { version = "4.6", features = ["derive"] }   # Command-line argument parsing

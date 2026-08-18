@@ -9,6 +9,7 @@ use crate::config::{AppConfig, OUTPUT_FLUSH_THRESHOLD, PARQUET_WRITE_BATCH_SIZE}
 use crate::output::{OutputMessage, drain_output_messages};
 use crate::record::DnsRecord;
 use arrayvec::ArrayString;
+use bytes::Bytes;
 use crossbeam::channel::Receiver;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::file::properties::EnabledStatistics;
@@ -153,9 +154,13 @@ where
         let source_ip = format_ip_address(&record.source_ip);
         source_ips.push(ByteArray::from(source_ip.as_str()));
         names.push(ByteArray::from(record.name.as_str()));
-        query_types.push(ByteArray::from(record.query_type.as_str()));
+        query_types.push(ByteArray::from(Bytes::from_static(
+            record.query_type.as_str().as_bytes(),
+        )));
         if let Some(response_code) = &record.response_code {
-            response_codes.push(ByteArray::from(response_code.as_str()));
+            response_codes.push(ByteArray::from(Bytes::from_static(
+                response_code.as_str().as_bytes(),
+            )));
             response_code_definition_levels.push(1);
         } else {
             response_code_definition_levels.push(0);
