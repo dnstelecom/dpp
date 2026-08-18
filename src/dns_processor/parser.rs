@@ -106,8 +106,8 @@ struct DecodedDnsQuestion {
 }
 
 #[derive(Debug)]
-pub(super) enum PacketProcessingOutcome {
-    Records(Vec<ProcessedDnsRecord>),
+pub(super) enum PacketProcessingOutcome<T = ()> {
+    Records(T),
     RejectedOversizedQname,
     Invalid,
 }
@@ -176,14 +176,45 @@ impl DnsProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn process_packet_batch_with_meta(
         &self,
         data: &[u8],
         timestamp_micros: i64,
         meta: ParsedUdpDnsMeta,
+    ) -> PacketProcessingOutcome<Vec<ProcessedDnsRecord>> {
+        let mut records = Vec::new();
+        match self.process_packet_batch_with_meta_into(
+            data,
+            timestamp_micros,
+            0,
+            meta,
+            &mut records,
+        ) {
+            PacketProcessingOutcome::Records(()) => PacketProcessingOutcome::Records(records),
+            PacketProcessingOutcome::RejectedOversizedQname => {
+                PacketProcessingOutcome::RejectedOversizedQname
+            }
+            PacketProcessingOutcome::Invalid => PacketProcessingOutcome::Invalid,
+        }
+    }
+
+    pub(super) fn process_packet_batch_with_meta_into(
+        &self,
+        data: &[u8],
+        timestamp_micros: i64,
+        packet_ordinal: u64,
+        meta: ParsedUdpDnsMeta,
+        records: &mut Vec<ProcessedDnsRecord>,
     ) -> PacketProcessingOutcome {
-        match self.process_packet_with_meta(data, timestamp_micros, meta) {
-            Ok(records) => PacketProcessingOutcome::Records(records),
+        match self.process_packet_with_meta_into(
+            data,
+            timestamp_micros,
+            packet_ordinal,
+            meta,
+            records,
+        ) {
+            Ok(()) => PacketProcessingOutcome::Records(()),
             Err(DnsQuestionDecodeError::OversizedQname) => {
                 PacketProcessingOutcome::RejectedOversizedQname
             }
@@ -285,66 +316,64 @@ impl DnsProcessor {
             && output.try_push(char::from(b'0' + (byte & 0b111))).is_ok()
     }
 
-    fn process_packet_with_meta(
+    fn process_packet_with_meta_into(
         &self,
         data: &[u8],
         timestamp_micros: i64,
+        packet_ordinal: u64,
         meta: ParsedUdpDnsMeta,
-    ) -> Result<Vec<ProcessedDnsRecord>, DnsQuestionDecodeError> {
+        records: &mut Vec<ProcessedDnsRecord>,
+    ) -> Result<(), DnsQuestionDecodeError> {
         let (header, queries) =
             self.decode_dns_questions(meta.dns_data(data)?, meta.is_response)?;
 
-        Ok(self.build_dns_records(
+        self.build_dns_records_into(
             &header,
             queries,
-            meta.src_ip(),
-            meta.dst_ip(),
-            meta.src_port(),
-            meta.dst_port(),
             timestamp_micros,
-            meta.is_response,
-        ))
+            packet_ordinal,
+            meta,
+            records,
+        );
+
+        Ok(())
     }
 
-    fn build_dns_records(
+    fn build_dns_records_into(
         &self,
         header: &DecodedDnsHeader,
         queries: Vec<DecodedDnsQuestion>,
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        src_port: u16,
-        dst_port: u16,
         timestamp_micros: i64,
-        is_answer: bool,
-    ) -> Vec<ProcessedDnsRecord> {
-        queries
+        packet_ordinal: u64,
+        meta: ParsedUdpDnsMeta,
+        records: &mut Vec<ProcessedDnsRecord>,
+    ) {
+        for (record_ordinal, query) in queries
             .into_iter()
-            .take(if is_answer { 1 } else { usize::MAX })
-            .map(|query| {
-                let domain_name = query.name;
-                let query_type = query.query_type;
-                let response_code = if is_answer {
-                    header.response_code
-                } else {
-                    HickoryResponseCode::ServFail.into()
-                };
+            .take(if meta.is_response { 1 } else { usize::MAX })
+            .enumerate()
+        {
+            let response_code = if meta.is_response {
+                header.response_code
+            } else {
+                HickoryResponseCode::ServFail.into()
+            };
 
-                ProcessedDnsRecord {
-                    id: header.id,
-                    timestamp_micros,
-                    packet_ordinal: 0,
-                    record_ordinal: 0,
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port,
-                    is_query: !is_answer,
-                    name: domain_name,
-                    query_type,
-                    response_code,
-                }
-            })
-            .collect()
+            records.push(ProcessedDnsRecord {
+                id: header.id,
+                timestamp_micros,
+                packet_ordinal,
+                record_ordinal: record_ordinal as u32,
+                src_ip: meta.src_ip(),
+                src_port: meta.src_port(),
+                dst_ip: meta.dst_ip(),
+                dst_port: meta.dst_port(),
+                is_query: !meta.is_response,
+                name: query.name,
+                query_type: query.query_type,
+                response_code,
+            });
+        }
     }
 
     fn decode_dns_questions(

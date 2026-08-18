@@ -575,6 +575,166 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
 }
 
 #[test]
+fn packet_processing_appends_records_with_final_ordinals() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&28_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 3, "fast_path={fast_path}");
+        assert_eq!(records[0].packet_ordinal, 7, "fast_path={fast_path}");
+        assert_eq!(records[0].record_ordinal, 3, "fast_path={fast_path}");
+        assert_eq!(records[1].packet_ordinal, 42, "fast_path={fast_path}");
+        assert_eq!(records[1].record_ordinal, 0, "fast_path={fast_path}");
+        assert_eq!(records[1].name.as_str(), "example.com");
+        assert_eq!(records[2].packet_ordinal, 42, "fast_path={fast_path}");
+        assert_eq!(records[2].record_ordinal, 1, "fast_path={fast_path}");
+        assert_eq!(records[2].name.as_str(), "www.example.com");
+    }
+}
+
+#[test]
+fn packet_processing_failure_does_not_append_partial_records() {
+    let mut oversized = encode_dns_header(0x1234, 0x8180, 2);
+    append_example_query(&mut oversized);
+    append_repeated_byte_question(
+        &mut oversized,
+        &[(63, b'a'), (63, b'a'), (63, b'a'), (62, b'a')],
+        1,
+    );
+
+    let mut malformed = encode_dns_header(0x1234, 0x0100, 2);
+    append_example_query(&mut malformed);
+    malformed.extend_from_slice(&[3, b'a']);
+
+    for (case, dns_payload, is_response, oversized_expected) in [
+        ("oversized second response question", oversized, true, true),
+        ("malformed second query question", malformed, false, false),
+    ] {
+        let packet = if is_response {
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload)
+        } else {
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload)
+        };
+        let routing_meta =
+            DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+        for (fast_path, processor) in [
+            (false, test_processor()),
+            (true, test_processor_with_dns_wire_fast_path()),
+        ] {
+            let mut records = vec![make_query_record(7, 3)];
+            let outcome = processor.process_packet_batch_with_meta_into(
+                &packet,
+                1_234_567,
+                42,
+                routing_meta,
+                &mut records,
+            );
+
+            assert!(
+                matches!(
+                    (&outcome, oversized_expected),
+                    (PacketProcessingOutcome::RejectedOversizedQname, true)
+                        | (PacketProcessingOutcome::Invalid, false)
+                ),
+                "case={case}, fast_path={fast_path}, outcome={outcome:?}"
+            );
+            assert_eq!(records.len(), 1, "case={case}, fast_path={fast_path}");
+            assert_eq!(records[0].packet_ordinal, 7);
+            assert_eq!(records[0].record_ordinal, 3);
+        }
+    }
+}
+
+#[test]
+fn packet_processing_zero_questions_leaves_destination_unchanged() {
+    let dns_payload = encode_dns_header(0x1234, 0x0100, 0);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 1, "fast_path={fast_path}");
+        assert_eq!(records[0].packet_ordinal, 7);
+        assert_eq!(records[0].record_ordinal, 3);
+    }
+}
+
+#[test]
+fn packet_processing_response_appends_only_first_question() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x8180, 2);
+    append_example_query(&mut dns_payload);
+    dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
+    dns_payload.extend_from_slice(&28_u16.to_be_bytes());
+    dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+    let packet =
+        make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload);
+    let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
+
+    for (fast_path, processor) in [
+        (false, test_processor()),
+        (true, test_processor_with_dns_wire_fast_path()),
+    ] {
+        let mut records = vec![make_query_record(7, 3)];
+        let outcome = processor.process_packet_batch_with_meta_into(
+            &packet,
+            1_234_567,
+            42,
+            routing_meta,
+            &mut records,
+        );
+
+        assert!(
+            matches!(outcome, PacketProcessingOutcome::Records(())),
+            "fast_path={fast_path}, outcome={outcome:?}"
+        );
+        assert_eq!(records.len(), 2, "fast_path={fast_path}");
+        assert_eq!(records[1].packet_ordinal, 42);
+        assert_eq!(records[1].record_ordinal, 0);
+        assert!(!records[1].is_query);
+        assert_eq!(records[1].name.as_str(), "example.com");
+    }
+}
+
+#[test]
 fn parser_rejects_dns_beyond_ipv4_total_length() {
     let mut packet = example_dns_query_packet();
     overwrite_u16(&mut packet, 14 + 2, 20 + 8);

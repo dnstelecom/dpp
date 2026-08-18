@@ -478,23 +478,18 @@ fn parse_shard_packets(
     };
 
     for (packet, udp_dns_meta) in shard_packets.packets.into_iter().zip(shard_packets.metas) {
-        let records = match dns_processor.process_packet_batch_with_meta(
+        match dns_processor.process_packet_batch_with_meta_into(
             &packet.data,
             packet.timestamp_micros,
+            packet.packet_ordinal,
             udp_dns_meta,
+            &mut parsed.records,
         ) {
-            PacketProcessingOutcome::Records(records) => records,
+            PacketProcessingOutcome::Records(()) => {}
             PacketProcessingOutcome::RejectedOversizedQname => {
                 parsed.oversized_qname_message_count += 1;
-                continue;
             }
-            PacketProcessingOutcome::Invalid => continue,
-        };
-
-        for (record_ordinal, mut record) in records.into_iter().enumerate() {
-            record.packet_ordinal = packet.packet_ordinal;
-            record.record_ordinal = record_ordinal as u32;
-            parsed.records.push(record);
+            PacketProcessingOutcome::Invalid => {}
         }
     }
 
