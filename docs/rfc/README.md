@@ -22,3 +22,4 @@ design decision — the problem it solves, the chosen approach, and the trade-of
 | [0005](0005-dual-path-pcap-parsing.md)     | Dual-Path PCAP Parsing and Monotonic Timestamps | Pure-Rust vs libpcap backends, monotonic contract        |
 | [0006](0006-adaptive-pipeline.md)          | Adaptive Pipeline: Staged vs Phase-Parallel     | Automatic execution model selection by CPU budget        |
 | [0007](0007-packet-storage-allocation.md)  | Packet Storage Allocation Experiments           | Rejected arena/slab designs and reconsideration gate      |
+| [0008](0008-matcher-state-expiry.md)       | Matcher State Expiry Experiments                | Rejected expiry indexes and safe reconsideration gates    |
