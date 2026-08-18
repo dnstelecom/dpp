@@ -208,6 +208,9 @@ Notes:
 | `-h, --help`                      | Print help                                                                                                          |
 | `-V, --version`                   | Print version                                                                                                       |
 
+On macOS, DPP continues without affinity after one warning because the platform does not
+provide supported per-core thread pinning through the affinity backend.
+
 ### Environment variables
 
 | Variable                 | Description                                                                                                               |
@@ -361,12 +364,12 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.046  INFO Build Timestamp: 2026-03-26T04:08:26.901327423Z
 04:15:01.046  INFO Build Hostname: hel-atom1
 04:15:01.046  INFO Allocator: tikv-jemallocator
-04:15:01.046  INFO > This software is licensed under under GNU GPLv3.
+04:15:01.046  INFO > This software is licensed under GNU GPLv3.
 04:15:01.046  INFO > Commercial licensing options: carrier-support@dnstele.com
 04:15:01.046  INFO > Nameto Oy (c) 2026. All rights reserved.
 04:15:01.062  INFO OS: Linux, ARCH: x86_64
-04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), affinity requested: false
-04:15:01.062  INFO Free memory (system reported): 2,857 MB
+04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), affinity requested: false, effective: false
+04:15:01.062  INFO Available memory (system reported): 2,857 MB
 04:15:01.062  INFO Starting to process PCAP file: /mnt/mirror/src/dpp/server1_jul_2024.pcap
 04:15:01.062  INFO Processing mode: forward sorting with response-query matching
 04:15:01.062  INFO IO channel: BOUNDED with 128 batched messages / 131,072 records max (default)

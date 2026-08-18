@@ -41,6 +41,16 @@ pub(crate) struct AffinityPlan {
 
 impl AffinityPlan {
     pub(crate) fn resolve(enabled: bool) -> Result<Self, RuntimeError> {
+        #[cfg(target_os = "macos")]
+        if enabled {
+            // macOS does not expose supported per-core thread pinning through
+            // the core_affinity backend, so avoid one failed syscall per worker.
+            return Ok(Self {
+                core_ids: None,
+                pin_current_thread: Arc::new(|_| true),
+            });
+        }
+
         Self::resolve_with(
             enabled,
             core_affinity::get_core_ids,
@@ -77,7 +87,7 @@ impl AffinityPlan {
         Self::resolve(false).expect("disabled affinity does not query the operating system")
     }
 
-    fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.core_ids.is_some()
     }
 
@@ -200,27 +210,35 @@ pub(crate) fn log_accessible_input_file(args: &AppConfig) -> Result<(), RuntimeE
     Ok(())
 }
 
-pub(crate) fn log_system_info(args: &AppConfig) -> Result<(), RuntimeError> {
+pub(crate) fn log_system_info(
+    args: &AppConfig,
+    affinity_effective: bool,
+) -> Result<(), RuntimeError> {
     if args.silent {
         return Ok(());
     }
 
     let mut system = System::new_all();
     system.refresh_all();
-    let free_memory_mb = system.free_memory() as usize / (1024 * 1024);
-    let free_memory_mb_formatted = free_memory_mb.to_formatted_string(&Locale::en);
+    let available_memory_mb = system.available_memory() as usize / (1024 * 1024);
+    let available_memory_mb_formatted = available_memory_mb.to_formatted_string(&Locale::en);
 
     let formatted_os = format_os_name(std::env::consts::OS);
 
     info!("OS: {}, ARCH: {}", formatted_os, std::env::consts::ARCH);
     info!(
-        "Available parallelism: {}, execution budget: auto (all available CPUs), affinity requested: {}",
-        args.num_cpus, args.affinity,
+        "Available parallelism: {}, execution budget: auto (all available CPUs), affinity requested: {}, effective: {}",
+        args.num_cpus, args.affinity, affinity_effective,
     );
     info!(
-        "Free memory (system reported): {} MB",
-        free_memory_mb_formatted
+        "Available memory (system reported): {} MB",
+        available_memory_mb_formatted
     );
+
+    #[cfg(target_os = "macos")]
+    if args.affinity && !affinity_effective {
+        warn!("CPU affinity is not supported on macOS; continuing without affinity");
+    }
 
     Ok(())
 }
@@ -256,7 +274,7 @@ pub(crate) fn log_build_messages() -> Result<(), RuntimeError> {
 
     info!("Allocator: {}", allocator::ALLOCATOR_NAME);
 
-    info!("> This software is licensed under under GNU GPLv3.");
+    info!("> This software is licensed under GNU GPLv3.");
     info!("> Commercial licensing options: carrier-support@dnstele.com");
     info!("> Nameto Oy (c) 2026. All rights reserved.");
 
@@ -450,6 +468,15 @@ mod tests {
         assert_eq!(plan.core_id_for_slot(3).map(|core_id| core_id.id), Some(2));
         assert!(!plan.apply_to_current_thread(4, "test worker"));
         assert_eq!(*applied_core.lock().expect("applied core lock"), Some(5));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_affinity_request_is_disabled_before_worker_startup() {
+        let plan = AffinityPlan::resolve(true).expect("macOS affinity fallback resolves");
+
+        assert!(!plan.is_enabled());
+        assert!(plan.apply_to_current_thread(0, "test worker"));
     }
 
     #[test]
