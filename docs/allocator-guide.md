@@ -30,7 +30,7 @@ Invalid feature combinations fail the build explicitly.
 
 ## Build Commands
 
-Requires Rust 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+Requires Rust 1.97.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 
 Default allocator build:
 

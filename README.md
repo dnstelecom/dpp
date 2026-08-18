@@ -83,7 +83,7 @@ ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/ar
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.96.0 or newer; this repository is pinned by `rust-toolchain.toml`.
+- [Rust](https://rustup.rs/) 1.97.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 - Cargo
 - PCAP files for offline processing
 - `libpcap` development headers for fallback support on non-classic formats

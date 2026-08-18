@@ -4,7 +4,7 @@
 name = "dpp"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 build = "build.rs"  # Custom build script to include version information from git
 
 [workspace]
