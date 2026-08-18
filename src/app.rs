@@ -550,7 +550,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     }
 
     runtime::log_build_messages()?;
-    runtime::log_system_info(&args)?;
+    runtime::log_system_info(&args, affinity_plan.is_enabled())?;
     runtime::log_accessible_input_file(&args)?;
 
     processing_mode_info();
