@@ -70,6 +70,18 @@ fn finalize_output_shutdown(
     })
 }
 
+fn finish_background_teardown<OutputResult, MemoryMonitorResult>(
+    finish_output: impl FnOnce() -> OutputResult,
+    sample_final_write_seconds: impl FnOnce() -> f64,
+    join_memory_monitor: impl FnOnce() -> MemoryMonitorResult,
+) -> (OutputResult, f64, MemoryMonitorResult) {
+    let output_result = finish_output();
+    let final_write_seconds = sample_final_write_seconds();
+    let memory_monitor_result = join_memory_monitor();
+
+    (output_result, final_write_seconds, memory_monitor_result)
+}
+
 #[must_use]
 fn format_information(args: &AppConfig) -> &'static str {
     match (args.format, args.v2, args.zstd) {
@@ -593,18 +605,28 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     let shutdown_result = tx.send(termination.output_shutdown_message());
     drop(tx);
 
-    let memory_shutdown_result = if let Some(memory_thread) = memory_thread {
+    if let Some(memory_thread) = memory_thread.as_ref() {
         memory_thread.stop();
-        memory_thread.join()
-    } else {
-        Ok(())
-    };
+    }
 
-    let writer_result = match writer_thread.join() {
-        Ok(result) => result,
-        Err(error) => Err(OutputError::WriterThreadPanic(format!("{:?}", error))),
-    };
-    let output_shutdown_result = finalize_output_shutdown(shutdown_result, writer_result);
+    let (output_shutdown_result, final_write_post_processing_seconds, memory_shutdown_result) =
+        finish_background_teardown(
+            || {
+                let writer_result = match writer_thread.join() {
+                    Ok(result) => result,
+                    Err(error) => Err(OutputError::WriterThreadPanic(format!("{:?}", error))),
+                };
+                finalize_output_shutdown(shutdown_result, writer_result)
+            },
+            || io_flush_start.elapsed().as_secs_f64(),
+            || {
+                if let Some(memory_thread) = memory_thread {
+                    memory_thread.join()
+                } else {
+                    Ok(())
+                }
+            },
+        );
 
     let counters = match processing_result {
         Ok(counters) => {
@@ -631,7 +653,6 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     }
 
     if !args.writes_output_to_stdout() {
-        let final_write_post_processing_seconds = io_flush_start.elapsed().as_secs_f64();
         let total_runtime_seconds = start_time.elapsed().as_secs_f64();
         let max_memory_kib = max_memory_usage_kib(max_memory_usage.as_ref());
         let warnings = RunWarningsSummary {
@@ -791,6 +812,35 @@ mod tests {
         let result = finalize_output_shutdown(shutdown_result, Err(OutputError::DownstreamClosed));
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn final_write_measurement_excludes_memory_monitor_join() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let (output_result, final_write_seconds, memory_monitor_result) =
+            finish_background_teardown(
+                || {
+                    events.borrow_mut().push("writer_flush");
+                    Ok::<(), ()>(())
+                },
+                || {
+                    events.borrow_mut().push("elapsed_sample");
+                    0.75
+                },
+                || {
+                    events.borrow_mut().push("memory_monitor_join");
+                    Ok::<(), ()>(())
+                },
+            );
+
+        assert!(output_result.is_ok());
+        assert_eq!(final_write_seconds, 0.75);
+        assert!(memory_monitor_result.is_ok());
+        assert_eq!(
+            events.into_inner(),
+            vec!["writer_flush", "elapsed_sample", "memory_monitor_join"]
+        );
     }
 
     #[test]
