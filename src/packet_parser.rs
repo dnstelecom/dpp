@@ -7,16 +7,16 @@
 
 use crate::config::{InputSource, PACKET_BATCH_SIZE};
 use anyhow::{Context, Result};
+use byteorder_slice::{BigEndian, LittleEndian};
 use pcap::{Capture, Error as LibpcapError, Linktype, Offline};
-use pcap_file::DataLink;
 use pcap_file::pcap::PcapReader;
-use pcap_file::pcapng::PcapNgReader;
 use pcap_file::pcapng::{
     Block as PcapNgBlock,
-    blocks::{interface_description::InterfaceDescriptionBlock, packet::PacketBlock},
+    blocks::interface_description::{InterfaceDescriptionBlock, InterfaceDescriptionOption},
 };
+use pcap_file::{DataLink, Endianness};
 use std::fs::File;
-use std::io::{BufReader, Cursor, ErrorKind, Read};
+use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
@@ -85,7 +85,7 @@ type BufferedCaptureInput = BufReader<CaptureInputReader>;
 
 enum PacketBackend {
     Classic(PcapReader<BufferedCaptureInput>),
-    PcapNg(PcapNgReader<BufferedCaptureInput>),
+    PcapNg(PcapNgStreamReader),
     Libpcap(Capture<Offline>),
 }
 
@@ -141,10 +141,11 @@ impl PacketBackend {
                 Ok(Self::Classic(reader))
             }
             StreamFormat::PcapNg => {
-                let reader = PcapNgReader::new(BufReader::new(CaptureInputReader::Stream(reader)))
-                    .with_context(|| {
-                        format!("Unable to parse pcapng section header from '{source_name}'")
-                    })?;
+                let reader =
+                    PcapNgStreamReader::new(BufReader::new(CaptureInputReader::Stream(reader)))
+                        .with_context(|| {
+                            format!("Unable to parse pcapng section header from '{source_name}'")
+                        })?;
                 Ok(Self::PcapNg(reader))
             }
             StreamFormat::Unknown => anyhow::bail!(
@@ -176,20 +177,7 @@ impl PacketBackend {
                 Err(LibpcapError::NoMorePackets) => Ok(None),
                 Err(err) => Err(err.into()),
             },
-            PacketBackend::PcapNg(reader) => loop {
-                let next_block = reader
-                    .next_block()
-                    .map(|result| result.map(|block| block.into_owned()));
-                match next_block {
-                    Some(Ok(block)) => {
-                        if let Some(packet) = pcapng_block_to_packet_data(reader, block)? {
-                            break Ok(Some(packet));
-                        }
-                    }
-                    Some(Err(err)) => break Err(err.into()),
-                    None => break Ok(None),
-                }
-            },
+            PacketBackend::PcapNg(reader) => reader.next_packet_data(),
         }
     }
 }
@@ -198,7 +186,7 @@ impl PacketParser {
     /// Creates a new `PacketParser` instance by opening the specified capture source.
     ///
     /// Classic pcap files use a pure-Rust streaming reader. Other formats fall back to libpcap to
-    /// preserve existing compatibility assumptions. Stdin uses libpcap's offline stream reader.
+    /// preserve existing compatibility assumptions. Stdin uses parser-owned streaming readers.
     pub fn new(input_source: &InputSource, enforce_monotonic_timestamps: bool) -> Result<Self> {
         Ok(Self {
             backend: PacketBackend::from_input_source(input_source)?,
@@ -428,59 +416,200 @@ fn ensure_libpcap_ethernet_linktype(
     Ok(())
 }
 
-fn pcapng_block_to_packet_data(
-    reader: &PcapNgReader<BufferedCaptureInput>,
-    block: PcapNgBlock<'_>,
-) -> Result<Option<PacketData>> {
-    match block {
-        PcapNgBlock::EnhancedPacket(packet) => {
-            pcapng_packet_interface(reader, packet.interface_id)?;
-            Ok(Some(PacketData {
-                data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
-                timestamp_micros: duration_to_micros(packet.timestamp),
-                packet_ordinal: 0,
-            }))
+/// Owns stdin PCAPNG framing and its sole section-local interface table. The dependency's
+/// stateful reader converts timestamps incorrectly; even `next_raw_block` rejects valid
+/// resolutions while updating interfaces. Only its stateless block validation is used here.
+struct PcapNgStreamReader {
+    input: BufferedCaptureInput,
+    endianness: Endianness,
+    interfaces: Vec<PcapNgInterface>,
+    block_bytes: Vec<u8>,
+}
+
+impl PcapNgStreamReader {
+    fn new(input: BufferedCaptureInput) -> Result<Self> {
+        let mut reader = Self {
+            input,
+            endianness: Endianness::Big,
+            interfaces: Vec::new(),
+            block_bytes: Vec::new(),
+        };
+        anyhow::ensure!(reader.read_block_bytes()?, "Missing pcapng section header");
+        anyhow::ensure!(
+            matches!(reader.decode_block()?, PcapNgBlock::SectionHeader(_)),
+            "Missing pcapng section header"
+        );
+        Ok(reader)
+    }
+
+    fn read_block_bytes(&mut self) -> Result<bool> {
+        if self.input.fill_buf()?.is_empty() {
+            return Ok(false);
         }
-        PcapNgBlock::Packet(packet) => Ok(Some(packet_block_to_packet_data(reader, packet)?)),
-        PcapNgBlock::SimplePacket(_) => anyhow::bail!(
-            "Unsupported pcapng Simple Packet Block: packet timestamps are required for offline DNS matching."
-        ),
-        _ => Ok(None),
+
+        // Read only the fixed prefix before trusting the declared block length. The body
+        // grows with bytes actually received, so a huge length in a truncated stream cannot
+        // force an equally huge allocation. Memory remains bounded by the largest read block.
+        let mut prefix = [0_u8; 12];
+        self.input.read_exact(&mut prefix)?;
+        if is_pcapng_magic(prefix[..4].try_into().expect("four-byte block type")) {
+            self.endianness = match &prefix[8..12] {
+                [0x1a, 0x2b, 0x3c, 0x4d] => Endianness::Big,
+                [0x4d, 0x3c, 0x2b, 0x1a] => Endianness::Little,
+                _ => anyhow::bail!("Invalid pcapng section byte-order magic"),
+            };
+        }
+        let block_len = self.u32(&prefix[4..8]);
+        anyhow::ensure!(
+            block_len >= 12 && block_len.is_multiple_of(4),
+            "Invalid pcapng block length {block_len}: expected a multiple of four, at least 12"
+        );
+        self.block_bytes.clear();
+        self.block_bytes.extend_from_slice(&prefix);
+        self.input
+            .by_ref()
+            .take(u64::from(block_len - 12))
+            .read_to_end(&mut self.block_bytes)?;
+        anyhow::ensure!(
+            self.block_bytes.len() == block_len as usize,
+            "Truncated pcapng block: expected {block_len} bytes, read {}",
+            self.block_bytes.len()
+        );
+        Ok(true)
+    }
+
+    fn decode_block(&self) -> Result<PcapNgBlock<'_>> {
+        // Retain upstream validation of the trailing block length, body bounds, options,
+        // and all known non-packet blocks, without invoking timestamp-resolution conversion.
+        let (_, block) = match self.endianness {
+            Endianness::Big => PcapNgBlock::from_slice::<BigEndian>(&self.block_bytes)?,
+            Endianness::Little => PcapNgBlock::from_slice::<LittleEndian>(&self.block_bytes)?,
+        };
+        Ok(block)
+    }
+
+    fn u32(&self, bytes: &[u8]) -> u32 {
+        let bytes = bytes.try_into().expect("validated four-byte pcapng field");
+        match self.endianness {
+            Endianness::Big => u32::from_be_bytes(bytes),
+            Endianness::Little => u32::from_le_bytes(bytes),
+        }
+    }
+
+    fn next_packet_data(&mut self) -> Result<Option<PacketData>> {
+        while self.read_block_bytes()? {
+            match self.decode_block()? {
+                PcapNgBlock::SectionHeader(_) => self.interfaces.clear(),
+                PcapNgBlock::InterfaceDescription(interface) => {
+                    let interface = PcapNgInterface::new(&interface)?;
+                    self.interfaces.push(interface);
+                }
+                PcapNgBlock::EnhancedPacket(packet) => {
+                    return self
+                        .packet_data(packet.interface_id, packet.original_len, &packet.data)
+                        .map(Some);
+                }
+                PcapNgBlock::Packet(packet) => {
+                    return self
+                        .packet_data(
+                            u32::from(packet.interface_id),
+                            packet.original_len,
+                            &packet.data,
+                        )
+                        .map(Some);
+                }
+                PcapNgBlock::SimplePacket(_) => anyhow::bail!(
+                    "Unsupported pcapng Simple Packet Block: packet timestamps are required for offline DNS matching."
+                ),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn packet_data(&self, interface_id: u32, original_len: u32, data: &[u8]) -> Result<PacketData> {
+        let interface = self.interfaces.get(interface_id as usize).ok_or_else(|| {
+            anyhow::anyhow!("pcapng packet references unknown interface {interface_id}")
+        })?;
+        ensure_ethernet_datalink(
+            interface.linktype,
+            format_args!("pcapng interface {interface_id}"),
+        )?;
+        anyhow::ensure!(
+            data.len() <= original_len as usize,
+            "pcapng captured packet length exceeds original packet length"
+        );
+        anyhow::ensure!(
+            interface.snaplen == 0 || data.len() <= interface.snaplen as usize,
+            "pcapng captured packet length exceeds interface snaplen"
+        );
+
+        // Both EPB and legacy PB store two section-endian u32 words, high then low.
+        // The stateless decoder has already validated this fixed header and the payload.
+        // Ignore its timestamp representation: legacy PB incorrectly decodes a single u64.
+        let ticks = (u64::from(self.u32(&self.block_bytes[12..16])) << 32)
+            | u64::from(self.u32(&self.block_bytes[16..20]));
+        Ok(PacketData {
+            data: PacketPayload::owned(Box::from(data)),
+            timestamp_micros: interface.timestamp_micros(ticks),
+            packet_ordinal: 0,
+        })
     }
 }
 
-fn pcapng_packet_interface(
-    reader: &PcapNgReader<BufferedCaptureInput>,
-    interface_id: u32,
-) -> Result<&InterfaceDescriptionBlock<'static>> {
-    let interface = reader
-        .interfaces()
-        .get(interface_id as usize)
-        .ok_or_else(|| {
-            anyhow::anyhow!("pcapng packet references unknown interface {interface_id}")
-        })?;
-    ensure_ethernet_datalink(
-        interface.linktype,
-        format_args!("pcapng interface {interface_id}"),
-    )?;
-
-    Ok(interface)
+struct PcapNgInterface {
+    linktype: DataLink,
+    snaplen: u32,
+    // None means 10^exponent exceeds u128. Even u64::MAX ticks then round down to 0us.
+    units_per_second: Option<u128>,
+    offset_seconds: i64,
 }
 
-fn packet_block_to_packet_data(
-    reader: &PcapNgReader<BufferedCaptureInput>,
-    packet: PacketBlock<'_>,
-) -> Result<PacketData> {
-    let interface = pcapng_packet_interface(reader, u32::from(packet.interface_id))?;
-    let nanos_per_unit = u128::from(interface.ts_resolution()?.to_nano_secs());
-    let timestamp_nanos = u128::from(packet.timestamp).saturating_mul(nanos_per_unit);
-    let timestamp_micros = timestamp_nanos.saturating_div(1_000).min(i64::MAX as u128) as i64;
+impl PcapNgInterface {
+    fn new(interface: &InterfaceDescriptionBlock<'_>) -> Result<Self> {
+        let mut resolution = None;
+        let mut offset_seconds = None;
+        for option in &interface.options {
+            match option {
+                InterfaceDescriptionOption::IfTsResol(value) => {
+                    anyhow::ensure!(resolution.is_none(), "Duplicate pcapng if_tsresol option");
+                    resolution = Some(*value);
+                }
+                InterfaceDescriptionOption::IfTsOffset(value) => {
+                    anyhow::ensure!(
+                        offset_seconds.is_none(),
+                        "Duplicate pcapng if_tsoffset option"
+                    );
+                    // The dependency exposes u64, but the option is a signed two's-complement i64.
+                    offset_seconds = Some(*value as i64);
+                }
+                _ => {}
+            }
+        }
+        let resolution = resolution.unwrap_or(6);
+        let exponent = u32::from(resolution & 0x7f);
+        let units_per_second = if resolution & 0x80 == 0 {
+            10_u128.checked_pow(exponent)
+        } else {
+            Some(1_u128 << exponent)
+        };
+        Ok(Self {
+            linktype: interface.linktype,
+            snaplen: interface.snaplen,
+            units_per_second,
+            offset_seconds: offset_seconds.unwrap_or(0),
+        })
+    }
 
-    Ok(PacketData {
-        data: PacketPayload::owned(packet.data.into_owned().into_boxed_slice()),
-        timestamp_micros,
-        packet_ordinal: 0,
-    })
+    fn timestamp_micros(&self, ticks: u64) -> i64 {
+        // Scale the full counter before division: fractional nanosecond units, including
+        // every binary resolution, must not be rounded individually before multiplication.
+        let micros = self
+            .units_per_second
+            .map_or(0, |units| u128::from(ticks) * 1_000_000 / units);
+        let adjusted = micros as i128 + i128::from(self.offset_seconds) * 1_000_000;
+        adjusted.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
 }
 
 fn duration_to_micros(duration: Duration) -> i64 {
@@ -568,24 +697,7 @@ mod tests {
         timestamp_micros: u64,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut writer = PcapNgWriter::new(Vec::new()).expect("pcapng writer initializes");
-        for linktype in linktypes {
-            writer
-                .write_pcapng_block(InterfaceDescriptionBlock::new(*linktype, 0xFFFF))
-                .expect("pcapng interface block writes");
-        }
-        writer
-            .write_pcapng_block(PacketBlock {
-                interface_id,
-                drop_count: 0,
-                timestamp: timestamp_micros,
-                captured_len: payload.len() as u32,
-                original_len: payload.len() as u32,
-                data: Cow::Borrowed(payload),
-                options: Vec::new(),
-            })
-            .expect("pcapng legacy packet block writes");
-        writer.into_inner()
+        super::wire_tests::legacy_packet_bytes(linktypes, interface_id, timestamp_micros, payload)
     }
 
     #[test]
@@ -959,3 +1071,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "packet_parser_wire_tests.rs"]
+mod wire_tests;

@@ -670,6 +670,7 @@ dependencies = [
  "aes",
  "anyhow",
  "arrayvec",
+ "byteorder_slice",
  "bytes",
  "clap",
  "core_affinity",

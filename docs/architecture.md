@@ -90,8 +90,13 @@ repeating it for full DNS question decoding.
   files use a pure-Rust streaming reader; regular-file PCAPNG and other non-classic formats
   currently fall back to libpcap. EOF-terminated stdin capture streams are also supported through
   parser-owned stream-native readers: classic PCAP stdin uses the same pure-Rust fast path family
-  as classic file input, and PCAPNG stdin uses a pure-Rust pcapng reader so stdin probing does not
-  need a temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
+  as classic file input, and PCAPNG stdin owns block framing and one section-local interface table.
+  PCAPNG uses the dependency's stateless structural validation, while the parser converts raw
+  high/low timestamp words using the interface's full binary/decimal resolution and signed offset.
+  Conversion scales the complete counter before rounding to microseconds and saturates only the
+  final signed timestamp. It never invokes the dependency's stateful timestamp conversion.
+  Buffers grow with received block bytes rather than untrusted declared lengths. Stdin probing
+  needs no temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
   The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file` `3.0.0-rc1` release
   candidate until a stable line with the required functionality is available.
   The parser can also enforce globally monotonic capture timestamps for the optional batched
