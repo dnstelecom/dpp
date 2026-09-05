@@ -85,6 +85,10 @@ Ethernet padding and trailing capture bytes, never reach a DNS decoder.
 
 DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or a non-zero fragment
 offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
+IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication and atomic
+Fragment headers with per-header bounds checks. Non-atomic fragments require reassembly and are
+skipped. The DNS offset can exceed 65535 after a long valid extension chain, so the internal
+metadata stores it as `u32`; the UDP-bounded DNS length remains `u16`.
 
 ### DNS QNAME boundary
 
@@ -93,6 +97,8 @@ same RFC 1035 boundary after name decompression. A QNAME may occupy at most 255 
 including label-length octets and the terminating root octet. Its escaped presentation form can be
 as large as 1003 bytes and remains valid input; DPP preserves it for matching and export rather than
 replacing it with an empty name.
+Both question decoders reject compression pointers that point forward or overlap the current name.
+The fast path's fallback must not become a way to accept a message the semantic decoder rejects.
 
 If any decompressed QNAME exceeds the wire limit, the entire DNS message is rejected before matcher
 or writer handoff. The processing counter `oversized_qname_message_count` increments exactly once

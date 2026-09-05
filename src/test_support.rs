@@ -123,7 +123,11 @@ pub(crate) fn make_udp_dns_packet(
     src_port: u16,
     dst_port: u16,
 ) -> Vec<u8> {
-    make_udp_dns_packet_with_payload(src_ip, dst_ip, src_port, dst_port, &[0_u8; 12])
+    let mut header = [0_u8; 12];
+    if src_port == 53 {
+        header[2] = 0x80;
+    }
+    make_udp_dns_packet_with_payload(src_ip, dst_ip, src_port, dst_port, &header)
 }
 
 pub(crate) fn test_dns_record() -> DnsRecord {

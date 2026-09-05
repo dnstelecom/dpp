@@ -245,9 +245,15 @@ Unsupported non-PCAP/non-PCAPNG stream magic on `stdin` is rejected explicitly i
 hidden temp-file or second ingest path.
 
 Repeated pending queries that share the same match identity (`id`, `name`, client IP, client port,
-resolver IP, and `query_type`) inside the configured match window (`1200ms` by default) are
+resolver IP, `query_type`, QCLASS, and OPCODE) inside the configured match window (`1200ms` by default) are
 deduplicated to the earliest canonical query. Deduplicated retries increment a separate counter and
-do not emit extra timeout or matched records.
+do not emit extra timeout or matched records. In default mode, pending retry timestamps are retained
+so an earlier timestamp arriving in a later batch can split pending groups without widening the
+match window. Finalized transactions are never reopened. With `--monotonic-capture`, no retry
+history is needed or allocated.
+
+DNS QR determines query/response direction, including valid exchanges with UDP port 53 on both
+endpoints. QCLASS and OPCODE distinguish transactions internally and do not add output columns.
 
 For QNAME matching, DPP preserves the observed presentation-form name bytes and does not lowercase
 them before building matcher identity keys. This is a deliberate Community Edition trade-off, not
@@ -497,7 +503,9 @@ Additional notes:
 ## Limitations
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
-- DPP does not reassemble IPv4 fragments, so fragmented IPv4 datagrams are skipped.
+- DPP does not reassemble IPv4 or IPv6 fragments. IPv6 Hop-by-Hop, Routing, Destination Options,
+  Authentication and atomic Fragment headers are traversed before UDP; fragments requiring
+  reassembly, ESP and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
 - If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
   from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.

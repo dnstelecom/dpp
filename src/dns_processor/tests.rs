@@ -392,6 +392,8 @@ fn make_query_with_timestamp(
         packet_ordinal,
         record_ordinal,
         query_type: HickoryRecordType::A,
+        query_class: 1,
+        opcode: 0,
     }
 }
 
@@ -415,6 +417,8 @@ fn make_response_with_timestamp(
         record_ordinal,
         response_code: HickoryResponseCode::NoError.into(),
         query_type: HickoryRecordType::A,
+        query_class: 1,
+        opcode: 0,
     }
 }
 
@@ -430,6 +434,8 @@ fn insert_query(
         query.src_port,
         query.query_type,
         query.resolver_ip,
+        query.query_class,
+        query.opcode,
     );
     let key = super::types::TimelineKey::new(
         query.timestamp_micros,
@@ -451,6 +457,8 @@ fn insert_response(
         response.dst_port,
         response.query_type,
         response.resolver_ip,
+        response.query_class,
+        response.opcode,
     );
     let key = super::types::TimelineKey::new(
         response.timestamp_micros,
@@ -481,6 +489,8 @@ fn make_query_record_with_timestamp(
         is_query: true,
         name: test_name(),
         query_type: HickoryRecordType::A,
+        query_class: 1,
+        opcode: 0,
         response_code: HickoryResponseCode::ServFail.into(),
     }
 }
@@ -502,6 +512,8 @@ fn make_response_record_with_timestamp(
         is_query: false,
         name: test_name(),
         query_type: HickoryRecordType::A,
+        query_class: 1,
+        opcode: 0,
         response_code: HickoryResponseCode::NoError.into(),
     }
 }
@@ -885,6 +897,70 @@ fn deduplicates_later_pending_queries_inside_timeout_window() {
 }
 
 #[test]
+fn query_class_and_opcode_keep_pending_transactions_independent() {
+    for (query_class, opcode) in [(3, 0), (1, 4)] {
+        let processor = test_processor();
+        let mut state = test_shard_state();
+        let mut other_query = make_query_record_with_timestamp(1_100, 2, 0);
+        other_query.query_class = query_class;
+        other_query.opcode = opcode;
+        let mut other_response = make_response_record_with_timestamp(1_200, 3, 0);
+        other_response.query_class = query_class;
+        other_response.opcode = opcode;
+
+        let result = processor.process_shard_records_with_batch_watermark(
+            vec![
+                make_query_record_with_timestamp(1_000, 1, 0),
+                other_query,
+                other_response,
+                make_response_record_with_timestamp(1_300, 4, 0),
+            ],
+            &mut state,
+            None,
+        );
+        assert_eq!(result.duplicated_query_count, 0);
+        assert_eq!(result.matched_query_response_count, 2);
+        assert_eq!(result.output_records[0].request_timestamp, 1_100);
+        assert_eq!(result.output_records[0].response_timestamp, Some(1_200));
+        assert_eq!(result.output_records[1].request_timestamp, 1_000);
+        assert_eq!(result.output_records[1].response_timestamp, Some(1_300));
+        assert_eq!(pending_query_count(&state), 0);
+        assert_eq!(pending_response_count(&state), 0);
+    }
+}
+
+#[test]
+fn mismatched_query_class_or_opcode_never_pairs_in_either_arrival_order() {
+    for (query_class, opcode) in [(3, 0), (1, 4)] {
+        for response_first in [false, true] {
+            let processor = test_processor();
+            let mut state = test_shard_state();
+            let query = make_query_record_with_timestamp(1_000, 1, 0);
+            let mut response = make_response_record_with_timestamp(1_100, 2, 0);
+            response.query_class = query_class;
+            response.opcode = opcode;
+            let records = if response_first {
+                [response, query]
+            } else {
+                [query, response]
+            };
+            for record in records {
+                let batch = processor.process_shard_records_with_batch_watermark(
+                    vec![record],
+                    &mut state,
+                    None,
+                );
+                assert_eq!(batch.matched_query_response_count, 0);
+            }
+            let finalization = processor.finalize_shard(&mut state);
+            assert_eq!(finalization.matched_query_response_count, 0);
+            assert_eq!(finalization.timeout_query_count, 1);
+            assert_eq!(pending_response_count(&state), 1);
+        }
+    }
+}
+
+#[test]
 fn timestamp_regression_keeps_earliest_pending_query_canonical() {
     let processor = test_processor();
     let mut state = test_shard_state();
@@ -912,6 +988,200 @@ fn timestamp_regression_keeps_earliest_pending_query_canonical() {
     assert_eq!(final_result.output_records.len(), 1);
     assert_eq!(final_result.output_records[0].request_timestamp, 1_000);
     assert_eq!(pending_query_count(&state), 0);
+}
+
+#[test]
+fn chained_timestamp_regressions_restore_queries_outside_the_canonical_window() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+    let mut duplicates = 0;
+    for (ordinal, timestamp) in [3_000_000, 2_000_000, 1_000_000].into_iter().enumerate() {
+        let batch = processor.process_shard_records_with_batch_watermark(
+            vec![make_query_record_with_timestamp(
+                timestamp,
+                ordinal as u64,
+                0,
+            )],
+            &mut state,
+            None,
+        );
+        duplicates += batch.duplicated_query_count;
+        assert!(batch.output_records.is_empty());
+    }
+    assert_eq!(duplicates, 1);
+    assert_eq!(pending_query_count(&state), 2);
+
+    let response = processor.process_shard_records_with_batch_watermark(
+        vec![make_response_record_with_timestamp(3_100_000, 3, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(response.matched_query_response_count, 1);
+    assert_eq!(response.output_records[0].request_timestamp, 3_000_000);
+    assert_eq!(
+        response.output_records[0].response_timestamp,
+        Some(3_100_000)
+    );
+    let finalization = processor.finalize_shard(&mut state);
+    assert_eq!(finalization.timeout_query_count, 1);
+    assert_eq!(finalization.output_records[0].request_timestamp, 1_000_000);
+    assert_eq!(pending_query_count(&state), 0);
+    assert_eq!(pending_response_count(&state), 0);
+}
+
+#[test]
+fn earlier_attempt_repartitions_multiple_pending_retry_groups() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+    let mut duplicates = 0;
+    for (ordinal, timestamp) in [
+        3_000_000, 4_000_000, 4_300_000, 5_300_000, 5_600_000, 6_600_000, 2_000_000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let batch = processor.process_shard_records_with_batch_watermark(
+            vec![make_query_record_with_timestamp(
+                timestamp,
+                ordinal as u64,
+                0,
+            )],
+            &mut state,
+            None,
+        );
+        duplicates += batch.duplicated_query_count;
+    }
+    let finalization = processor.finalize_shard(&mut state);
+    let timestamps = finalization
+        .output_records
+        .into_batch_iter()
+        .flatten()
+        .map(|record| record.request_timestamp)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, vec![2_000_000, 4_000_000, 5_300_000, 6_600_000]);
+    assert_eq!(duplicates, 3);
+    assert_eq!(finalization.timeout_query_count, 4);
+}
+
+#[test]
+fn repartition_matches_buffered_response_and_preserves_restored_query() {
+    let processor = test_processor();
+    let mut state = test_shard_state();
+    let first = processor.process_shard_records_with_batch_watermark(
+        vec![
+            make_query_record_with_timestamp(3_000_000, 0, 0),
+            make_query_record_with_timestamp(4_000_000, 1, 0),
+        ],
+        &mut state,
+        None,
+    );
+    assert_eq!(first.duplicated_query_count, 1);
+    let buffered = processor.process_shard_records_with_batch_watermark(
+        vec![make_response_record_with_timestamp(2_500_000, 2, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(buffered.matched_query_response_count, 0);
+    let regressed = processor.process_shard_records_with_batch_watermark(
+        vec![make_query_record_with_timestamp(2_000_000, 3, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(regressed.duplicated_query_count, 0);
+    assert_eq!(regressed.matched_query_response_count, 1);
+    assert_eq!(regressed.output_records[0].request_timestamp, 2_000_000);
+    assert_eq!(
+        regressed.output_records[0].response_timestamp,
+        Some(2_500_000)
+    );
+    assert_eq!(pending_query_count(&state), 1);
+    let restored = processor.process_shard_records_with_batch_watermark(
+        vec![make_response_record_with_timestamp(4_100_000, 4, 0)],
+        &mut state,
+        None,
+    );
+    assert_eq!(restored.matched_query_response_count, 1);
+    assert_eq!(restored.output_records[0].request_timestamp, 4_000_000);
+    assert_eq!(processor.finalize_shard(&mut state).timeout_query_count, 0);
+}
+
+#[test]
+fn pending_retry_groups_are_independent_of_query_arrival_order() {
+    fn check_permutations(timestamps: &mut [i64], next: usize) {
+        if next < timestamps.len() {
+            for index in next..timestamps.len() {
+                timestamps.swap(next, index);
+                check_permutations(timestamps, next + 1);
+                timestamps.swap(next, index);
+            }
+            return;
+        }
+        let processor = test_processor();
+        let mut state = test_shard_state();
+        let mut duplicates = 0;
+        for (ordinal, timestamp) in timestamps.iter().copied().enumerate() {
+            let batch = processor.process_shard_records_with_batch_watermark(
+                vec![make_query_record_with_timestamp(
+                    timestamp,
+                    ordinal as u64,
+                    0,
+                )],
+                &mut state,
+                None,
+            );
+            duplicates += batch.duplicated_query_count;
+        }
+        let finalization = processor.finalize_shard(&mut state);
+        let actual = finalization
+            .output_records
+            .into_batch_iter()
+            .flatten()
+            .map(|record| record.request_timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![1_000_000, 3_000_000, 5_000_000],
+            "{timestamps:?}"
+        );
+        assert_eq!(duplicates, 3, "{timestamps:?}");
+    }
+    // Covers equal timestamps, exact timeout boundaries, and changes to multiple groups.
+    check_permutations(
+        &mut [
+            1_000_000, 2_200_000, 3_000_000, 3_000_000, 4_200_000, 5_000_000,
+        ],
+        0,
+    );
+}
+
+#[test]
+fn monotonic_queries_do_not_retain_retry_timestamps() {
+    for monotonic_capture in [false, true] {
+        let processor =
+            DnsProcessor::new_with_runtime_options(None, false, 1_200_000, monotonic_capture)
+                .expect("processor initializes");
+        let mut state = test_shard_state();
+        let result = processor.process_shard_records_with_batch_watermark(
+            vec![
+                make_query_record_with_timestamp(1_000_000, 0, 0),
+                make_query_record_with_timestamp(1_100_000, 1, 0),
+            ],
+            &mut state,
+            None,
+        );
+        assert_eq!(result.duplicated_query_count, 1);
+        let (_, payload) = state
+            .query_map
+            .values()
+            .next()
+            .expect("pending query")
+            .first_entry_in_range(0, i64::MAX)
+            .expect("pending canonical attempt");
+        assert_eq!(
+            payload.retained_retry_count(),
+            usize::from(!monotonic_capture)
+        );
+    }
 }
 
 #[test]
@@ -1222,6 +1492,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             packet_ordinal: 3,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1237,6 +1509,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             packet_ordinal: 2,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1252,6 +1526,8 @@ fn finalization_preserves_full_key_order_across_identity_and_timestamp() {
             packet_ordinal: 1,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
 
@@ -1291,6 +1567,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             packet_ordinal: 4,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1306,6 +1584,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             packet_ordinal: 2,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1321,6 +1601,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             packet_ordinal: 5,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1336,6 +1618,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             packet_ordinal: 3,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
     insert_query(
@@ -1351,6 +1635,8 @@ fn timeline_overflow_preserves_sorted_finalization_order() {
             packet_ordinal: 1,
             record_ordinal: 0,
             query_type: HickoryRecordType::A,
+            query_class: 1,
+            opcode: 0,
         },
     );
 

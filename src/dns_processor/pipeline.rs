@@ -1445,6 +1445,84 @@ mod tests {
     }
 
     #[test]
+    fn both_pipeline_models_preserve_matches_after_chained_retry_regressions() {
+        let path = temp_test_path("pipeline-chained-retry-regression", "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let query = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let padding = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+        let mut packets = Vec::with_capacity(2 * PACKET_BATCH_SIZE + 2);
+        for timestamp in [3, 2] {
+            packets.push((timestamp, 0, query.as_slice()));
+            packets.extend(std::iter::repeat_n(
+                (timestamp, 0, padding.as_slice()),
+                PACKET_BATCH_SIZE - 1,
+            ));
+        }
+        packets.push((1, 0, query.as_slice()));
+        packets.push((3, 100_000, response.as_slice()));
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &Arc::new(AtomicUsize::new(0)),
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+            assert_eq!(counters.total_packets_processed, 2 * PACKET_BATCH_SIZE + 2);
+            assert_eq!(counters.dns_query_count, 3);
+            assert_eq!(counters.duplicated_query_count, 1);
+            assert_eq!(counters.dns_response_count, 1);
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 1);
+            drop(output_tx);
+            let rows = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    other => panic!("unexpected output message: {other:?}"),
+                })
+                .map(|record| (record.request_timestamp, record.response_timestamp))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                vec![(3_000_000, Some(3_100_000)), (1_000_000, None)],
+                "available_cpus={available_cpus}"
+            );
+        }
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
