@@ -148,7 +148,10 @@ repeating it for full DNS question decoding.
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
   parsing does not gain a second source of truth for IP/port extraction. That metadata owns the
   exact DNS byte range validated against IPv4 Total Length or IPv6 Payload Length and then UDP
-  Length; capture padding and trailing IP payload cannot extend the DNS slice. DNS QR determines
+  Length; capture padding and trailing IP payload cannot extend the DNS slice. A compact relative
+  offset preserves DNS starts above 65535 without widening every packet's routing metadata: the
+  offset is measured from the minimum Ethernet/IPv4/UDP header length, and construction checks
+  that it fits. DNS QR determines
   direction and the canonical client/resolver flow, including exchanges with UDP port 53 on both
   ends. IPv6 Hop-by-Hop, Routing, Destination Options, AH and atomic Fragment headers are traversed
   within the declared payload boundary. Non-atomic IPv6 and fragmented IPv4 datagrams are skipped

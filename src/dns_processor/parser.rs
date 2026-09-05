@@ -24,6 +24,7 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const DNS_HEADER_LEN: usize = 12;
+const MIN_DNS_OFFSET: usize = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
 const IP_PROTOCOL_UDP: u8 = 17;
@@ -54,12 +55,18 @@ pub(super) struct CanonicalFlowKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
-    pub(super) dns_offset: u32,
+    // DNS starts at least at byte 42. A maximum IPv6 frame ends at byte 65589;
+    // reserving the validated 12-byte DNS header bounds this delta to 65535.
+    dns_offset_delta: u16,
     pub(super) dns_len: u16,
     pub(super) is_response: bool,
 }
 
 impl ParsedUdpDnsMeta {
+    fn dns_offset(self) -> usize {
+        MIN_DNS_OFFSET + usize::from(self.dns_offset_delta)
+    }
+
     fn src_ip(self) -> IpAddr {
         if self.is_response {
             self.flow_key.resolver_ip
@@ -93,7 +100,7 @@ impl ParsedUdpDnsMeta {
     }
 
     fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
-        let start = self.dns_offset as usize;
+        let start = self.dns_offset();
         let end = start
             .checked_add(usize::from(self.dns_len))
             .ok_or("Failed to parse UDP packet")?;
@@ -1059,8 +1066,12 @@ impl DnsProcessor {
 
         Ok(Some(ParsedUdpDnsMeta {
             flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port, is_response),
-            dns_offset: u32::try_from(dns_offset)
-                .map_err(|_| "UDP DNS offset exceeds supported range")?,
+            dns_offset_delta: u16::try_from(
+                dns_offset
+                    .checked_sub(MIN_DNS_OFFSET)
+                    .ok_or("UDP DNS offset precedes minimum header length")?,
+            )
+            .map_err(|_| "UDP DNS offset exceeds supported range")?,
             dns_len: u16::try_from(dns_data.len())
                 .map_err(|_| "UDP DNS payload exceeds supported range")?,
             is_response,
@@ -1347,10 +1358,71 @@ mod protocol_regression_tests {
         let chain = vec![(IPV6_DESTINATION_OPTIONS, vec![0; 8]); 8186];
         let packet = ipv6(&dns, &chain);
         let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
-        assert!(meta.dns_offset > u32::from(u16::MAX));
+        assert!(meta.dns_offset() > usize::from(u16::MAX));
         assert_eq!(meta.dns_data(&packet).unwrap(), dns);
         for processor in processors() {
             assert_eq!(processor.process_packet_batch(&packet, 0).unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn dns_offsets_cover_minimum_headers_and_maximum_ip_payloads() {
+        for is_ipv6 in [false, true] {
+            let ip_header_len = if is_ipv6 {
+                IPV6_HEADER_LEN
+            } else {
+                IPV4_MIN_HEADER_LEN
+            };
+            let dns_len =
+                usize::from(u16::MAX) - UDP_HEADER_LEN - if is_ipv6 { 0 } else { ip_header_len };
+            let mut dns = question(0x0100, 1);
+            dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+            // Fill the maximum UDP payload with a valid EDNS Padding option.
+            let padding_len = dns_len - dns.len() - 11 - 4;
+            dns.push(0);
+            dns.extend_from_slice(&DNS_OPT_RECORD_TYPE.to_be_bytes());
+            dns.extend_from_slice(&u16::MAX.to_be_bytes());
+            dns.extend_from_slice(&[0; 4]);
+            dns.extend_from_slice(&u16::try_from(4 + padding_len).unwrap().to_be_bytes());
+            dns.extend_from_slice(&12_u16.to_be_bytes());
+            dns.extend_from_slice(&u16::try_from(padding_len).unwrap().to_be_bytes());
+            dns.resize(dns_len, 0);
+            let packet = if is_ipv6 {
+                ipv6(&dns, &[])
+            } else {
+                ipv4(&dns, false, 53000)
+            };
+            let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+            assert_eq!(
+                meta.dns_offset(),
+                ETHERNET_HEADER_LEN + ip_header_len + UDP_HEADER_LEN
+            );
+            assert_eq!(usize::from(meta.dns_len), dns_len);
+            assert_eq!(meta.dns_data(&packet).unwrap(), dns);
+            if !is_ipv6 {
+                assert_eq!(meta.dns_offset_delta, 0);
+            }
+            for processor in processors() {
+                assert_eq!(processor.process_packet_batch(&packet, 0).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn relative_dns_offset_covers_largest_ipv6_frame_and_extension_prefix() {
+        let dns = encode_dns_header(0xbeef, 0x0100, 0);
+        // Extension lengths are multiples of eight; this is the largest prefix
+        // leaving room for UDP and the minimum 12-byte DNS message.
+        let chain = vec![(IPV6_DESTINATION_OPTIONS, vec![0; 8]); 8189];
+        let mut packet = ipv6(&dns, &chain);
+        packet.extend_from_slice(&[0; 3]);
+        packet[18..20].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            packet.len(),
+            ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + usize::from(u16::MAX)
+        );
+        let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+        assert_eq!(meta.dns_offset(), 65574);
+        assert_eq!(meta.dns_data(&packet).unwrap(), dns);
     }
 }

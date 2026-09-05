@@ -58,3 +58,28 @@ The full workspace suite passes 248 tests, including manually encoded PCAPNG bou
 and CSV/Parquet preservation of unknown codes. `cargo fmt --all -- --check` and the CI Clippy
 command also pass. See the benchmark scaffold in [README.md](README.md) for future measurements
 on caller-selected production-like captures.
+
+## Performance recovery follow-up
+
+The first accepted optimization stores the DNS start relative to the minimum 42-byte
+Ethernet/IPv4/UDP prefix. The full validated range still fits: even a maximum-length IPv6 frame
+must leave at least 12 DNS bytes. Routing metadata returns from 44 to 42 bytes on this host,
+including packets whose absolute DNS start exceeds 65535. Tests cover minimum headers, maximum
+IPv4/IPv6 lengths, and the longest accepted IPv6 extension prefix.
+
+Ten new position-balanced pairs against the correctness-fixed version (`2ef34a4`) used the same
+capture and build settings above, with an excluded warmup pair per mode. Relative offsets alone
+gave median times of 1.0274 / 0.9924 seconds (reference / candidate) in default mode and
+1.0136 / 1.0009 seconds in monotonic mode. Median paired speed ratios were 1.0318 and 1.0133.
+All processing counters and average matched RTT agreed. Faster routing can increase the occupied
+pipeline backlog and measured RSS despite smaller metadata: median peak RSS was 189.9 / 284.9 MiB
+in default mode and 198.7 / 272.2 MiB in monotonic mode. Scheduling is a hypothesis for this
+increase, not an isolated causal measurement. This is a throughput optimization, not a claim of
+lower process memory. Queue bounds and payload ownership are unchanged.
+
+Short four-pair screens rejected query-helper inlining/cold regrouping, CSV formatter inlining,
+and a fused borrowed matcher lookup: none showed a consistent end-to-end improvement in default
+mode. A CPU sample located the limiting stage in packet routing and its streaming hash calls.
+`build.rs` was also checked: it sets executable stack size and build metadata, and was unchanged
+by the correctness fixes. Optimization levels, LTO and codegen units remain owned by `Cargo.toml`;
+no compiler or linker settings were changed for this recovery work.
