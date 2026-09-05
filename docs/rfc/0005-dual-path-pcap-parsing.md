@@ -87,8 +87,11 @@ DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or
 offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
 IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication and atomic
 Fragment headers with per-header bounds checks. Non-atomic fragments require reassembly and are
-skipped. The DNS offset can exceed 65535 after a long valid extension chain, so the internal
-metadata stores it as `u32`; the UDP-bounded DNS length remains `u16`.
+skipped. The DNS offset can exceed 65535 after a long valid extension chain. Internal metadata
+stores a checked `u16` delta from the minimum 42-byte Ethernet/IPv4/UDP prefix and reconstructs
+the absolute offset when accessing packet bytes. A maximum IPv6 frame ends at byte 65589 and
+must leave at least 12 DNS bytes, so this delta covers the full supported range. The UDP-bounded
+DNS length remains `u16`; routing metadata is 42 bytes on the measured macOS ARM64 target.
 
 ### DNS QNAME boundary
 

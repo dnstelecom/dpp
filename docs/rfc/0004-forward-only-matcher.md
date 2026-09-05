@@ -72,7 +72,9 @@ order within each shard and never backtracks. The key design choices:
 These must hold for any valid implementation:
 
 - Each query reaches exactly one terminal outcome: matched once, or emitted once as a timeout.
-- For a fixed input PCAP and configuration, output is bit-for-bit deterministic.
+- For a fixed input PCAP and runtime configuration, finalized record values and order are
+  deterministic. Output container layout, such as Parquet row-group boundaries, need not be
+  byte-identical across runs.
 - Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never leaks into the exported
   `DnsRecord`.
 - Duplicate responses remain distinguishable in matcher state until matched or discarded.
