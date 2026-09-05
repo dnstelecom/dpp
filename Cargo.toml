@@ -2,7 +2,7 @@
 
 [package]
 name = "dpp"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.97.1"
 build = "build.rs"  # Custom build script to include version information from git
@@ -47,6 +47,7 @@ opt-level = 3
 [dependencies]
 pcap = "2.5"                      # Library for reading pcap files
 pcap-file = "3.0.0-rc1"           # Pure-Rust parser for classic pcap and pcapng files
+byteorder_slice = "3.0"          # Stateless pcapng block decoding without upstream timestamp conversion
 rayon = "1.12"                    # Parallelism library for multithreaded processing
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] } # DNS protocol parsing library
 csv = "1.4"                       # CSV serialization and deserialization

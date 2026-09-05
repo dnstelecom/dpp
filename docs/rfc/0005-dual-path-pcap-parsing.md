@@ -40,9 +40,10 @@ file's magic bytes when the input source is a regular file:
   using parser-owned probe-and-replay so the same stdin byte stream remains the single source of
   truth.
 
-- **EOF-terminated stdin PCAPNG streams** → pure-Rust `pcapng` reader via `pcap-file`, for the
-  same reason: once stdin bytes have been inspected, the parser stays stream-native instead of
-  trying to reopen the stream through a second owner.
+- **EOF-terminated stdin PCAPNG streams** → parser-owned pure-Rust block framing and one
+  section-local interface table, with stateless block/body/option validation via `pcap-file`.
+  Once stdin bytes have been inspected, the parser stays stream-native instead of trying to
+  reopen the stream through a second owner.
 
 - **EOF-terminated stdin streams with unknown magic** → explicit rejection. DPP does not create a
   temp file or hidden second ingest path to recover fallback compatibility for unsupported stdin
@@ -51,6 +52,29 @@ file's magic bytes when the input source is a regular file:
 The detection is a simple 4-byte magic check (`0xa1b2c3d4` or `0xd4c3b2a1` for classic,
 `0xa1b23c4d` or `0x4d3cb2a1` for nanosecond-resolution classic, `0x0a0d0d0a` for PCAPNG). For
 regular files, everything else goes to `libpcap`. For stdin streams, everything else is rejected.
+
+### PCAPNG timestamp ownership
+
+The parser reads timestamp high/low words separately in section byte order for both Enhanced
+Packet Blocks and legacy Packet Blocks. It applies each interface's `if_tsresol` and signed
+`if_tsoffset` exactly once. All seven-bit resolution exponents are accepted; the complete raw
+counter is scaled before integer rounding to microseconds, including sub-nanosecond units.
+The final timestamp saturates to `i64` only after adding the signed offset. New sections reset
+the interface table and may change byte order.
+
+The stateful `pcap-file 3.0.0-rc1` reader is deliberately bypassed: it swaps legacy little-endian
+timestamp words, mis-scales binary resolutions, ignores offsets, and panics on exponent 30.
+The newer `3.0.0-rc.3`, inspected on 2026-09-05, fixes those calculations but still rejects
+sub-nanosecond resolutions and dates before the Unix epoch. Upgrading alone does not satisfy
+this timestamp contract. The existing stateless decoder accepts the wire resolution field
+without applying the faulty conversion, and remains responsible for structural validation.
+
+The parser validates referenced interfaces, captured/original/snap lengths, and uniqueness of
+timestamp options. Input buffers grow only as bytes arrive; a huge declared length on a truncated
+stream cannot trigger allocation of that entire declared block. Independent manually encoded
+fixtures cover both byte orders and packet-block formats, interface offsets, resolution extremes,
+section resets, truncation, and malformed lengths/options. Tests must not encode expected
+timestamp layouts with the same dependency writer whose decoder they are validating.
 
 ### IP and UDP boundaries
 
@@ -61,6 +85,13 @@ Ethernet padding and trailing capture bytes, never reach a DNS decoder.
 
 DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or a non-zero fragment
 offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
+IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication and atomic
+Fragment headers with per-header bounds checks. Non-atomic fragments require reassembly and are
+skipped. The DNS offset can exceed 65535 after a long valid extension chain. Internal metadata
+stores a checked `u16` delta from the minimum 42-byte Ethernet/IPv4/UDP prefix and reconstructs
+the absolute offset when accessing packet bytes. A maximum IPv6 frame ends at byte 65589 and
+must leave at least 12 DNS bytes, so this delta covers the full supported range. The UDP-bounded
+DNS length remains `u16`; routing metadata is 42 bytes on the measured macOS ARM64 target.
 
 ### DNS QNAME boundary
 
@@ -69,6 +100,8 @@ same RFC 1035 boundary after name decompression. A QNAME may occupy at most 255 
 including label-length octets and the terminating root octet. Its escaped presentation form can be
 as large as 1003 bytes and remains valid input; DPP preserves it for matching and export rather than
 replacing it with an empty name.
+Both question decoders reject compression pointers that point forward or overlap the current name.
+The fast path's fallback must not become a way to accept a message the semantic decoder rejects.
 
 If any decompressed QNAME exceeds the wire limit, the entire DNS message is rejected before matcher
 or writer handoff. The processing counter `oversized_qname_message_count` increments exactly once

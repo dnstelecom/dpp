@@ -83,6 +83,12 @@ and uses the remaining CPU budget for shard workers. Routed DNS packets also car
 metadata into shard workers so the worker path can reuse the first L3/L4 parse instead of
 repeating it for full DNS question decoding.
 
+Flow routing buffers the existing tuple's `Hash` writes on the stack and runs SeaHash once over
+the resulting bytes. The integer encoding and digest remain identical to the streaming hasher,
+so shard assignment and output order are preserved. If a future tuple encoding exceeds the
+buffer, routing replays its bytes into the streaming hasher; this adds no persistent flow state
+or second encoding of canonical addresses and ports.
+
 ## Core Components
 
 - `src/packet_parser.rs`
@@ -90,8 +96,13 @@ repeating it for full DNS question decoding.
   files use a pure-Rust streaming reader; regular-file PCAPNG and other non-classic formats
   currently fall back to libpcap. EOF-terminated stdin capture streams are also supported through
   parser-owned stream-native readers: classic PCAP stdin uses the same pure-Rust fast path family
-  as classic file input, and PCAPNG stdin uses a pure-Rust pcapng reader so stdin probing does not
-  need a temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
+  as classic file input, and PCAPNG stdin owns block framing and one section-local interface table.
+  PCAPNG uses the dependency's stateless structural validation, while the parser converts raw
+  high/low timestamp words using the interface's full binary/decimal resolution and signed offset.
+  Conversion scales the complete counter before rounding to microseconds and saturates only the
+  final signed timestamp. It never invokes the dependency's stateful timestamp conversion.
+  Buffers grow with received block bytes rather than untrusted declared lengths. Stdin probing
+  needs no temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
   The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file` `3.0.0-rc1` release
   candidate until a stable line with the required functionality is available.
   The parser can also enforce globally monotonic capture timestamps for the optional batched
@@ -143,10 +154,19 @@ repeating it for full DNS question decoding.
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
   parsing does not gain a second source of truth for IP/port extraction. That metadata owns the
   exact DNS byte range validated against IPv4 Total Length or IPv6 Payload Length and then UDP
-  Length; capture padding and trailing IP payload cannot extend the DNS slice. Fragmented IPv4
-  datagrams are skipped because this boundary has no IP reassembly stage. The optional runtime flag
+  Length; capture padding and trailing IP payload cannot extend the DNS slice. A compact relative
+  offset preserves DNS starts above 65535 without widening every packet's routing metadata: the
+  offset is measured from the minimum Ethernet/IPv4/UDP header length, and construction checks
+  that it fits. DNS QR determines
+  direction and the canonical client/resolver flow, including exchanges with UDP port 53 on both
+  ends. IPv6 Hop-by-Hop, Routing, Destination Options, AH and atomic Fragment headers are traversed
+  within the declared payload boundary. Non-atomic IPv6 and fragmented IPv4 datagrams are skipped
+  because this boundary has no IP reassembly stage. The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
-  the semantic fallback for rare DNS messages that the fast path does not accept. Both paths accept
+  the semantic fallback for rare DNS messages that the fast path does not accept. Compression
+  pointers must target prior, nonoverlapping names; enabling the fast path must not weaken that
+  validation. TSIG status extraction consumes and bounds-checks the declared Other Data, including
+  the six-byte server time in BADTIME responses. Both paths accept
   decompressed wire QNAMEs up to the RFC 1035 limit of 255 octets, including label-length octets and
   the terminating root octet. A valid name can expand to 1003 bytes in escaped presentation form
   and must remain distinct through matching and export. If any QNAME exceeds the wire limit, the
@@ -283,9 +303,17 @@ The DNS matcher must preserve these invariants:
 - Routing and in-flight matching use the original observed client IP, client port, and resolver IP.
   The resolver remains internal; deterministic client-IP pseudonymization is applied exactly once
   when the matcher constructs a finalized `DnsRecord`.
+- DNS ID, observed QNAME, QTYPE, QCLASS and OPCODE also distinguish in-flight identities. QCLASS,
+  OPCODE and resolver identity remain internal and do not change the exported record schema.
 - Repeated pending queries with the same match identity inside the configured timeout window
   (`1200ms` by default) are deduplicated to the earliest canonical query. Later duplicates are
   counted separately and must not create extra matched or timeout records.
+- In default mode, each pending canonical query owns any retry timestamps needed to regroup
+  unresolved attempts when an earlier query arrives across a batch boundary. Regrouping uses
+  earliest-first timeout windows for that identity, so chains of regressions cannot transitively
+  swallow attempts outside the final canonical window. Already finalized transactions are never
+  reopened. Monotonic mode allocates no retry history. This adds one optional pointer per pending
+  query and storage for default-mode retries; only earlier-canonical replacements regroup attempts.
 - Match identity preserves the observed presentation-form QNAME bytes instead of lowercasing them.
   This is a deliberate Community Edition trade-off, not a protocol guarantee. RFC 4343 defines
   ASCII label comparison as case-insensitive, and a valid response is allowed to differ from the

@@ -16,6 +16,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 use parquet::schema::types::TypePtr;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
@@ -138,6 +139,13 @@ fn max_formatted_ip_length(ip: &IpAddr) -> usize {
     }
 }
 
+fn protocol_text_bytes(text: Cow<'static, str>) -> ByteArray {
+    ByteArray::from(match text {
+        Cow::Borrowed(value) => Bytes::from_static(value.as_bytes()),
+        Cow::Owned(value) => Bytes::from(value),
+    })
+}
+
 fn write_column<Type>(
     row_group_writer: &mut parquet::file::writer::SerializedRowGroupWriter<'_, impl Write + Send>,
     values: &[Type::T],
@@ -216,13 +224,9 @@ where
 
         source_ip_builder.push_display(record.source_ip);
         name_builder.push_bytes(record.name.as_bytes());
-        query_types.push(ByteArray::from(Bytes::from_static(
-            record.query_type.as_str().as_bytes(),
-        )));
+        query_types.push(protocol_text_bytes(record.query_type.as_str()));
         if let Some(response_code) = &record.response_code {
-            response_codes.push(ByteArray::from(Bytes::from_static(
-                response_code.as_str().as_bytes(),
-            )));
+            response_codes.push(protocol_text_bytes(response_code.as_str()));
             response_code_definition_levels.push(1);
         } else {
             response_code_definition_levels.push(0);

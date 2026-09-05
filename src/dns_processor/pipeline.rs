@@ -5,6 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use arrayvec::ArrayVec;
 use crossbeam::channel::{Receiver, Sender};
 use rayon::prelude::*;
 use seahash::SeaHasher;
@@ -409,13 +410,103 @@ fn routed_shard_capacity_hint(packet_count: usize, shard_count: usize) -> usize 
     (packet_count / shard_count) + 1
 }
 
+// Buffer the tuple's existing Hash writes so routing runs SeaHash once per flow.
+// Streaming fallback keeps future Hash implementations correct if they exceed this capacity.
+enum BufferedFlowHasher {
+    Buffered(ArrayVec<u8, 64>),
+    Streaming(SeaHasher),
+}
+
+impl Default for BufferedFlowHasher {
+    fn default() -> Self {
+        Self::Buffered(ArrayVec::new())
+    }
+}
+
+impl Hasher for BufferedFlowHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        match self {
+            Self::Buffered(bytes) => seahash::hash(bytes.as_slice()),
+            Self::Streaming(hasher) => hasher.finish(),
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Buffered(buffer) => {
+                if buffer.try_extend_from_slice(bytes).is_err() {
+                    let mut hasher = SeaHasher::new();
+                    hasher.write(buffer.as_slice());
+                    hasher.write(bytes);
+                    *self = Self::Streaming(hasher);
+                }
+            }
+            Self::Streaming(hasher) => hasher.write(bytes),
+        }
+    }
+
+    // SeaHasher 4.1 encodes these integer writes as little endian. Its u128/i128
+    // methods use Hasher's native-endian defaults, which this adapter also inherits.
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.write(&value.to_le_bytes());
+    }
+}
+
 fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
     debug_assert!(shard_count > 0);
     if shard_count == 1 {
         return 0;
     }
 
-    let mut hasher = SeaHasher::new();
+    let mut hasher = BufferedFlowHasher::default();
     (
         flow_key.client_ip,
         flow_key.client_port,
@@ -1445,6 +1536,84 @@ mod tests {
     }
 
     #[test]
+    fn both_pipeline_models_preserve_matches_after_chained_retry_regressions() {
+        let path = temp_test_path("pipeline-chained-retry-regression", "pcap");
+        let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let query = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let padding = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+        let mut packets = Vec::with_capacity(2 * PACKET_BATCH_SIZE + 2);
+        for timestamp in [3, 2] {
+            packets.push((timestamp, 0, query.as_slice()));
+            packets.extend(std::iter::repeat_n(
+                (timestamp, 0, padding.as_slice()),
+                PACKET_BATCH_SIZE - 1,
+            ));
+        }
+        packets.push((1, 0, query.as_slice()));
+        packets.push((3, 100_000, response.as_slice()));
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(DnsProcessor::new(None).expect("processor initializes")),
+                &mut parser,
+                &Arc::new(AtomicUsize::new(0)),
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+            assert_eq!(counters.total_packets_processed, 2 * PACKET_BATCH_SIZE + 2);
+            assert_eq!(counters.dns_query_count, 3);
+            assert_eq!(counters.duplicated_query_count, 1);
+            assert_eq!(counters.dns_response_count, 1);
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 1);
+            drop(output_tx);
+            let rows = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    other => panic!("unexpected output message: {other:?}"),
+                })
+                .map(|record| (record.request_timestamp, record.response_timestamp))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                vec![(3_000_000, Some(3_100_000)), (1_000_000, None)],
+                "available_cpus={available_cpus}"
+            );
+        }
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
@@ -1801,5 +1970,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..8).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod buffered_flow_hash_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn assert_flow_hash_matches_reference(flow: CanonicalFlowKey) {
+        let identity = (flow.client_ip, flow.client_port, flow.resolver_ip);
+        let mut reference = SeaHasher::new();
+        identity.hash(&mut reference);
+        let expected = reference.finish();
+        let mut buffered = BufferedFlowHasher::default();
+        identity.hash(&mut buffered);
+        assert_eq!(buffered.finish(), expected, "{flow:?}");
+        for shard_count in [1, 2, 3, 4, 7, 16, 64, 257, 1024] {
+            assert_eq!(
+                shard_map_index(flow, shard_count),
+                (expected as usize) % shard_count,
+                "{flow:?}, shard_count={shard_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_address_families_ports_and_shards() {
+        let addresses = [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::from(u128::MAX)),
+            IpAddr::V6(Ipv6Addr::from(
+                0x2001_0db8_0001_0203_0405_0607_0809_0a0b_u128,
+            )),
+            IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped()),
+        ];
+        for client_ip in addresses {
+            for resolver_ip in addresses {
+                for client_port in [0, 1, 53, 1023, 1024, 32768, 65535] {
+                    assert_flow_hash_matches_reference(CanonicalFlowKey {
+                        client_ip,
+                        client_port,
+                        resolver_ip,
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_matches_many_deterministic_flows() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state
+        }
+        let mut state = 0x0123_4567_89ab_cdef;
+        for index in 0..4096 {
+            let client_v4 = Ipv4Addr::from(next(&mut state) as u32);
+            let client_v6 =
+                Ipv6Addr::from((u128::from(next(&mut state)) << 64) | u128::from(next(&mut state)));
+            let resolver_v4 = Ipv4Addr::from(next(&mut state) as u32);
+            let resolver_v6 =
+                Ipv6Addr::from((u128::from(next(&mut state)) << 64) | u128::from(next(&mut state)));
+            assert_flow_hash_matches_reference(CanonicalFlowKey {
+                client_ip: if index & 1 == 0 {
+                    client_v4.into()
+                } else {
+                    client_v6.into()
+                },
+                client_port: next(&mut state) as u16,
+                resolver_ip: if index & 2 == 0 {
+                    resolver_v4.into()
+                } else {
+                    resolver_v6.into()
+                },
+            });
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_integer_write_encodings() {
+        macro_rules! check {
+            ($method:ident, $value:expr) => {
+                for prefix_len in [0, 63, 65] {
+                    let prefix = [0x37; 65];
+                    let mut reference = SeaHasher::new();
+                    let mut buffered = BufferedFlowHasher::default();
+                    reference.write(&prefix[..prefix_len]);
+                    buffered.write(&prefix[..prefix_len]);
+                    reference.$method($value);
+                    buffered.$method($value);
+                    assert_eq!(buffered.finish(), reference.finish(), stringify!($method));
+                }
+            };
+        }
+        check!(write_u8, 0xef);
+        check!(write_u16, 0x1234);
+        check!(write_u32, 0x1234_5678);
+        check!(write_u64, 0x1234_5678_9abc_def0);
+        check!(write_usize, 0x1234_5678);
+        check!(write_i8, -17);
+        check!(write_i16, -0x1234);
+        check!(write_i32, -0x1234_5678);
+        check!(write_i64, -0x1234_5678_9abc_def0);
+        check!(write_isize, -0x1234_5678);
+        check!(write_u128, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        check!(write_i128, -0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_streaming_overflow_and_finish_semantics() {
+        let bytes: Vec<u8> = (0..257).map(|index| (index * 73 + 19) as u8).collect();
+        for length in [
+            0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 66, 127, 128, 129, 256, 257,
+        ] {
+            for chunk_size in [1, 2, 3, 7, 8, 15, 16, 31, 63, 64, 65, 97, 257] {
+                let mut reference = SeaHasher::new();
+                let mut buffered = BufferedFlowHasher::default();
+                for chunk in bytes[..length].chunks(chunk_size) {
+                    reference.write(chunk);
+                    buffered.write(chunk);
+                    assert_eq!(buffered.finish(), reference.finish());
+                    // finish is nondestructive, and an empty write cannot alter the stream.
+                    buffered.write(&[]);
+                    assert_eq!(buffered.finish(), reference.finish());
+                }
+                assert_eq!(buffered.finish(), reference.finish());
+                reference.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+                buffered.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+                assert_eq!(buffered.finish(), reference.finish());
+            }
+        }
     }
 }

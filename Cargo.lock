@@ -665,11 +665,12 @@ dependencies = [
 
 [[package]]
 name = "dpp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes",
  "anyhow",
  "arrayvec",
+ "byteorder_slice",
  "bytes",
  "clap",
  "core_affinity",

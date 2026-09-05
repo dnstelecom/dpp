@@ -24,9 +24,16 @@ const IPV4_MIN_HEADER_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const DNS_HEADER_LEN: usize = 12;
+const MIN_DNS_OFFSET: usize = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
 const IP_PROTOCOL_UDP: u8 = 17;
+const IPV6_HOP_BY_HOP: u8 = 0;
+const IPV6_ROUTING: u8 = 43;
+const IPV6_FRAGMENT: u8 = 44;
+const IP_AUTHENTICATION: u8 = 51;
+const IPV6_DESTINATION_OPTIONS: u8 = 60;
+const IPV6_FRAGMENT_OFFSET_AND_MORE: u16 = 0xfff9;
 const IPV4_MORE_FRAGMENTS: u16 = 0x2000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const DNS_PORT: u16 = 53;
@@ -48,12 +55,18 @@ pub(super) struct CanonicalFlowKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
-    pub(super) dns_offset: u16,
+    // DNS starts at least at byte 42. A maximum IPv6 frame ends at byte 65589;
+    // reserving the validated 12-byte DNS header bounds this delta to 65535.
+    dns_offset_delta: u16,
     pub(super) dns_len: u16,
     pub(super) is_response: bool,
 }
 
 impl ParsedUdpDnsMeta {
+    fn dns_offset(self) -> usize {
+        MIN_DNS_OFFSET + usize::from(self.dns_offset_delta)
+    }
+
     fn src_ip(self) -> IpAddr {
         if self.is_response {
             self.flow_key.resolver_ip
@@ -87,7 +100,7 @@ impl ParsedUdpDnsMeta {
     }
 
     fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
-        let start = usize::from(self.dns_offset);
+        let start = self.dns_offset();
         let end = start
             .checked_add(usize::from(self.dns_len))
             .ok_or("Failed to parse UDP packet")?;
@@ -97,12 +110,14 @@ impl ParsedUdpDnsMeta {
 
 struct DecodedDnsHeader {
     id: u16,
+    opcode: u8,
     response_code: ProtoResponseCode,
 }
 
 struct DecodedDnsQuestion {
     name: DnsNameBuf,
     query_type: HickoryRecordType,
+    query_class: u16,
 }
 
 #[derive(Debug)]
@@ -371,6 +386,8 @@ impl DnsProcessor {
                 is_query: !meta.is_response,
                 name: query.name,
                 query_type: query.query_type,
+                query_class: query.query_class,
+                opcode: header.opcode,
                 response_code,
             });
         }
@@ -425,10 +442,14 @@ impl DnsProcessor {
                 "DNS question truncated",
             )?);
             cursor += 2;
-            let _query_class = Self::parse_u16_at(dns_data, cursor, "DNS question truncated")?;
+            let query_class = Self::parse_u16_at(dns_data, cursor, "DNS question truncated")?;
             cursor += 2;
 
-            queries.push(DecodedDnsQuestion { name, query_type });
+            queries.push(DecodedDnsQuestion {
+                name,
+                query_type,
+                query_class,
+            });
         }
         let mut response_code =
             ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
@@ -459,7 +480,11 @@ impl DnsProcessor {
                 )?;
             }
         }
-        let header = DecodedDnsHeader { id, response_code };
+        let header = DecodedDnsHeader {
+            id,
+            opcode: ((flags >> 11) & 0x0f) as u8,
+            response_code,
+        };
 
         Ok((header, queries))
     }
@@ -489,6 +514,7 @@ impl DnsProcessor {
         Ok((
             DecodedDnsHeader {
                 id: header.id,
+                opcode: header.op_code.into(),
                 response_code,
             },
             queries
@@ -498,6 +524,7 @@ impl DnsProcessor {
                         name: Self::format_domain_name(query.name())
                             .map_err(|_| DnsQuestionDecodeError::Invalid)?,
                         query_type: query.query_type(),
+                        query_class: query.query_class().into(),
                     })
                 })
                 .collect::<Result<Vec<_>, DnsQuestionDecodeError>>()?,
@@ -606,7 +633,12 @@ impl DnsProcessor {
 
         let error = Self::parse_u16_at(dns_data, cursor, "TSIG record truncated")?;
         cursor += 2;
-        Self::skip_bytes_in_range(&mut cursor, rdata_end, 2)?;
+        let other_len = usize::from(Self::parse_u16_at(
+            dns_data,
+            cursor,
+            "TSIG record truncated",
+        )?);
+        Self::skip_bytes_in_range(&mut cursor, rdata_end, 2 + other_len)?;
         if cursor != rdata_end {
             return Err("TSIG record has trailing data");
         }
@@ -681,9 +713,14 @@ impl DnsProcessor {
         let mut position = *cursor;
         let mut resume_position = None;
         let mut jump_count = 0;
+        let mut segment_start = position;
+        let mut segment_end = dns_data.len();
 
         loop {
-            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
+            let length = *dns_data
+                .get(..segment_end)
+                .and_then(|segment| segment.get(position))
+                .ok_or("DNS name truncated")?;
 
             match length {
                 0 => {
@@ -693,13 +730,14 @@ impl DnsProcessor {
                 }
                 _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
                     let next = *dns_data
-                        .get(position + 1)
+                        .get(..segment_end)
+                        .and_then(|segment| segment.get(position + 1))
                         .ok_or("DNS compression pointer truncated")?;
                     let offset =
                         (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
 
-                    if offset >= dns_data.len() {
-                        return Err("DNS compression pointer out of bounds");
+                    if offset >= segment_start {
+                        return Err("DNS compression pointer is not prior to name");
                     }
 
                     if resume_position.is_none() {
@@ -711,6 +749,8 @@ impl DnsProcessor {
                         return Err("DNS compression pointer loop");
                     }
 
+                    segment_end = segment_start;
+                    segment_start = offset;
                     position = offset;
                 }
                 _ if (length & DNS_POINTER_MASK) != 0 => {
@@ -719,7 +759,8 @@ impl DnsProcessor {
                 _ => {
                     let label_len = usize::from(length);
                     dns_data
-                        .get(position + 1..position + 1 + label_len)
+                        .get(..segment_end)
+                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
                         .ok_or("DNS label truncated")?;
                     position += 1 + label_len;
                 }
@@ -738,9 +779,14 @@ impl DnsProcessor {
         let mut jump_count = 0;
         let mut expanded_wire_len = 1_usize;
         let mut oversized = false;
+        let mut segment_start = position;
+        let mut segment_end = dns_data.len();
 
         loop {
-            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
+            let length = *dns_data
+                .get(..segment_end)
+                .and_then(|segment| segment.get(position))
+                .ok_or("DNS name truncated")?;
 
             match length {
                 0 => {
@@ -759,12 +805,15 @@ impl DnsProcessor {
                 }
                 _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
                     let next = *dns_data
-                        .get(position + 1)
+                        .get(..segment_end)
+                        .and_then(|segment| segment.get(position + 1))
                         .ok_or("DNS compression pointer truncated")?;
                     let offset =
                         (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
 
-                    if offset >= dns_data.len() {
+                    // Each pointer must refer to an earlier, nonoverlapping name,
+                    // matching Hickory's question decoder (RFC 1035 section 4.1.4).
+                    if offset >= segment_start {
                         return Err(DnsQuestionDecodeError::Invalid);
                     }
 
@@ -777,6 +826,8 @@ impl DnsProcessor {
                         return Err(DnsQuestionDecodeError::Invalid);
                     }
 
+                    segment_end = segment_start;
+                    segment_start = offset;
                     position = offset;
                 }
                 _ if (length & DNS_POINTER_MASK) != 0 => {
@@ -785,7 +836,8 @@ impl DnsProcessor {
                 _ => {
                     let label_len = usize::from(length);
                     let label = dns_data
-                        .get(position + 1..position + 1 + label_len)
+                        .get(..segment_end)
+                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
                         .ok_or("DNS label truncated")?;
 
                     expanded_wire_len = expanded_wire_len.saturating_add(1 + label_len);
@@ -913,10 +965,6 @@ impl DnsProcessor {
             .get(IPV6_HEADER_LEN..packet_length)
             .ok_or("Failed to parse IPv6 packet")?;
 
-        if header[6] != IP_PROTOCOL_UDP {
-            return Ok(None);
-        }
-
         let src_ip = IpAddr::V6(Ipv6Addr::from(
             <[u8; 16]>::try_from(&header[8..24]).unwrap(),
         ));
@@ -924,7 +972,60 @@ impl DnsProcessor {
             <[u8; 16]>::try_from(&header[24..40]).unwrap(),
         ));
 
-        Self::extract_udp_dns_from_transport(payload, src_ip, dst_ip, l3_offset + IPV6_HEADER_LEN)
+        let mut next_header = header[6];
+        let mut cursor = 0;
+        loop {
+            if next_header == IP_PROTOCOL_UDP {
+                return Self::extract_udp_dns_from_transport(
+                    &payload[cursor..],
+                    src_ip,
+                    dst_ip,
+                    l3_offset + IPV6_HEADER_LEN + cursor,
+                );
+            }
+
+            let minimum_length = match next_header {
+                IPV6_HOP_BY_HOP if cursor != 0 => {
+                    return Err("IPv6 Hop-by-Hop header must follow IPv6 header");
+                }
+                IPV6_HOP_BY_HOP | IPV6_ROUTING | IPV6_DESTINATION_OPTIONS | IPV6_FRAGMENT => 8,
+                IP_AUTHENTICATION => 12,
+                // Other transport protocols, ESP and No Next Header contain no
+                // directly decodable UDP payload at this extraction boundary.
+                _ => return Ok(None),
+            };
+            let extension = payload
+                .get(cursor..)
+                .filter(|remaining| remaining.len() >= minimum_length)
+                .ok_or("IPv6 extension header truncated")?;
+            let extension_length = match next_header {
+                IPV6_FRAGMENT => {
+                    let offset_and_flags = u16::from_be_bytes([extension[2], extension[3]]);
+                    if offset_and_flags & IPV6_FRAGMENT_OFFSET_AND_MORE != 0 {
+                        // An atomic fragment needs no reassembly; other fragments do.
+                        return Ok(None);
+                    }
+                    8
+                }
+                IP_AUTHENTICATION => {
+                    // AH counts 32-bit words excluding the first two words,
+                    // while other extension lengths count 8-octet units.
+                    let length = (usize::from(extension[1]) + 2) * 4;
+                    if length < minimum_length || length % 8 != 0 {
+                        return Err("Invalid IPv6 Authentication header length");
+                    }
+                    length
+                }
+                _ => (usize::from(extension[1]) + 1) * 8,
+            };
+            extension
+                .get(..extension_length)
+                .ok_or("IPv6 extension header truncated")?;
+            next_header = extension[0];
+            // Every accepted extension consumes at least eight bytes, so even
+            // repeated headers are bounded by the declared IPv6 Payload Length.
+            cursor += extension_length;
+        }
     }
 
     fn extract_udp_dns_from_transport(
@@ -954,18 +1055,26 @@ impl DnsProcessor {
         if dns_data.len() < DNS_HEADER_LEN {
             return Err("DNS data too short");
         }
+        let is_response = dns_data[2] & 0x80 != 0;
+        if (is_response && src_port != DNS_PORT) || (!is_response && dst_port != DNS_PORT) {
+            return Ok(None);
+        }
 
         let dns_offset = l4_offset
             .checked_add(UDP_HEADER_LEN)
             .ok_or("Failed to parse UDP packet")?;
 
         Ok(Some(ParsedUdpDnsMeta {
-            flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port),
-            dns_offset: u16::try_from(dns_offset)
-                .map_err(|_| "UDP DNS offset exceeds supported range")?,
+            flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port, is_response),
+            dns_offset_delta: u16::try_from(
+                dns_offset
+                    .checked_sub(MIN_DNS_OFFSET)
+                    .ok_or("UDP DNS offset precedes minimum header length")?,
+            )
+            .map_err(|_| "UDP DNS offset exceeds supported range")?,
             dns_len: u16::try_from(dns_data.len())
                 .map_err(|_| "UDP DNS payload exceeds supported range")?,
-            is_response: src_port == DNS_PORT,
+            is_response,
         }))
     }
 
@@ -974,8 +1083,9 @@ impl DnsProcessor {
         dst_ip: IpAddr,
         src_port: u16,
         dst_port: u16,
+        is_response: bool,
     ) -> CanonicalFlowKey {
-        if src_port == DNS_PORT {
+        if is_response {
             CanonicalFlowKey {
                 client_ip: dst_ip,
                 client_port: dst_port,
@@ -988,5 +1098,331 @@ impl DnsProcessor {
                 resolver_ip: dst_ip,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_regression_tests {
+    use super::*;
+    use crate::test_support::{encode_dns_header, make_udp_dns_packet_with_payload};
+
+    fn processors() -> [DnsProcessor; 2] {
+        [
+            DnsProcessor::new(None).unwrap(),
+            DnsProcessor::new_with_dns_wire_fast_path(None, true).unwrap(),
+        ]
+    }
+
+    fn question(flags: u16, query_class: u16) -> Vec<u8> {
+        let mut dns = encode_dns_header(0xbeef, flags, 1);
+        dns.extend_from_slice(b"\x07example\x03com\0\0\x01");
+        dns.extend_from_slice(&query_class.to_be_bytes());
+        dns
+    }
+
+    fn ipv4(dns: &[u8], response: bool, client_port: u16) -> Vec<u8> {
+        let (src, dst, src_port, dst_port) = if response {
+            ([8, 8, 8, 8], [10, 0, 0, 1], 53, client_port)
+        } else {
+            ([10, 0, 0, 1], [8, 8, 8, 8], client_port, 53)
+        };
+        make_udp_dns_packet_with_payload(src, dst, src_port, dst_port, dns)
+    }
+
+    fn ipv6(dns: &[u8], extensions: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (index, (_, extension)) in extensions.iter().enumerate() {
+            let mut extension = extension.clone();
+            extension[0] = extensions.get(index + 1).map_or(17, |next| next.0);
+            payload.extend_from_slice(&extension);
+        }
+        payload.extend_from_slice(&53000_u16.to_be_bytes());
+        payload.extend_from_slice(&53_u16.to_be_bytes());
+        payload.extend_from_slice(&u16::try_from(8 + dns.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(dns);
+
+        let mut packet = vec![0; ETHERNET_HEADER_LEN + IPV6_HEADER_LEN];
+        packet[12..14].copy_from_slice(&ETHER_TYPE_IPV6.to_be_bytes());
+        packet[14] = 0x60;
+        packet[18..20].copy_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        packet[20] = extensions.first().map_or(17, |first| first.0);
+        packet[21] = 64;
+        packet[22..38].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        packet[38..54].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
+    #[test]
+    fn qr_routes_port_53_query_and_response_to_same_flow() {
+        let query = ipv4(&question(0x0100, 1), false, 53);
+        let response = ipv4(&question(0x8180, 1), true, 53);
+        let query_meta = DnsProcessor::packet_routing_meta(&query).unwrap();
+        let response_meta = DnsProcessor::packet_routing_meta(&response).unwrap();
+        assert!(!query_meta.is_response);
+        assert!(response_meta.is_response);
+        assert_eq!(query_meta.flow_key, response_meta.flow_key);
+        assert_eq!(query_meta.flow_key.client_ip, IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(query_meta.flow_key.client_port, 53);
+
+        for processor in processors() {
+            let queries = processor.process_packet_batch(&query, 0).unwrap();
+            let responses = processor.process_packet_batch(&response, 100).unwrap();
+            assert_eq!(queries.len(), 1);
+            assert_eq!(responses.len(), 1);
+            assert!(queries[0].is_query);
+            assert!(!responses[0].is_query);
+            assert_eq!(queries[0].src_ip, responses[0].dst_ip);
+        }
+    }
+
+    #[test]
+    fn qr_does_not_create_candidates_on_wrong_server_port() {
+        for packet in [
+            ipv4(&question(0x8180, 1), false, 53000),
+            ipv4(&question(0x0100, 1), true, 53000),
+        ] {
+            assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+        }
+    }
+
+    #[test]
+    fn both_decoders_preserve_query_class_and_every_opcode() {
+        for opcode in 0..16 {
+            for query_class in [1, 3, 4, 65535] {
+                let packet = ipv4(
+                    &question(0x0100 | (opcode << 11), query_class),
+                    false,
+                    53000,
+                );
+                for processor in processors() {
+                    let records = processor.process_packet_batch(&packet, 0).unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].query_class, query_class);
+                    assert_eq!(records[0].opcode, opcode as u8);
+                }
+            }
+        }
+    }
+
+    fn tsig_response(error: u16, other_len: u16, other_data: &[u8]) -> Vec<u8> {
+        let mut dns = question(if error == 0 { 0x8180 } else { 0x8189 }, 1);
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        let mut rdata = b"\x0bhmac-sha256\0".to_vec();
+        rdata.extend_from_slice(&[0; 6]);
+        rdata.extend_from_slice(&300_u16.to_be_bytes());
+        rdata.extend_from_slice(&32_u16.to_be_bytes());
+        rdata.extend_from_slice(&[0; 32]);
+        rdata.extend_from_slice(&0xbeef_u16.to_be_bytes());
+        rdata.extend_from_slice(&error.to_be_bytes());
+        rdata.extend_from_slice(&other_len.to_be_bytes());
+        rdata.extend_from_slice(other_data);
+        dns.extend_from_slice(b"\x03key\x07example\0");
+        dns.extend_from_slice(&DNS_TSIG_RECORD_TYPE.to_be_bytes());
+        dns.extend_from_slice(&255_u16.to_be_bytes());
+        dns.extend_from_slice(&[0; 4]);
+        dns.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+        dns.extend_from_slice(&rdata);
+        dns
+    }
+
+    #[test]
+    fn tsig_badtime_accepts_required_server_time_other_data() {
+        for (error, other_data) in [(0, &[][..]), (18, &[0, 0, 1, 2, 3, 4][..])] {
+            let dns = tsig_response(error, other_data.len() as u16, other_data);
+            let packet = ipv4(&dns, true, 53000);
+            for processor in processors() {
+                let records = processor.process_packet_batch(&packet, 100).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].response_code.as_u16(), error);
+            }
+        }
+    }
+
+    #[test]
+    fn tsig_other_data_must_match_declared_length() {
+        for (other_len, other_data) in [(6, &[0; 5][..]), (0, &[0; 6][..]), (65535, &[][..])] {
+            let packet = ipv4(&tsig_response(18, other_len, other_data), true, 53000);
+            for processor in processors() {
+                assert!(processor.process_packet_batch(&packet, 100).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn forward_qname_pointer_is_rejected_by_both_decoders() {
+        let mut dns = encode_dns_header(0xbeef, 0x8180, 1);
+        dns[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        // QNAME at offset 12 illegally refers forward to the answer owner at 18.
+        dns.extend_from_slice(b"\xc0\x12\0\x01\0\x01\x07example\x03com\0");
+        dns.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        let packet = ipv4(&dns, true, 53000);
+        for processor in processors() {
+            assert!(processor.process_packet_batch(&packet, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn compression_rejects_overlapping_names_but_accepts_prior_questions() {
+        let overlap = [4, b'a', b'b', 0xc0, 0, 0];
+        assert!(DnsProcessor::read_wire_domain_name(&overlap, &mut 3).is_err());
+        assert!(Name::read(&mut BinDecoder::new(&overlap).clone(3)).is_err());
+
+        let mut dns = question(0x0100, 1);
+        dns[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        dns.extend_from_slice(b"\xc0\x0c\0\x1c\0\x01");
+        for processor in processors() {
+            let packet = ipv4(&dns, false, 53000);
+            let records = processor.process_packet_batch(&packet, 0).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].name, records[1].name);
+            assert_eq!(records[1].query_type, HickoryRecordType::AAAA);
+        }
+    }
+
+    #[test]
+    fn ipv6_walks_extension_chains_and_atomic_fragments() {
+        let hbh = (IPV6_HOP_BY_HOP, vec![0; 8]);
+        let dest = (IPV6_DESTINATION_OPTIONS, vec![0; 8]);
+        // An unrecognized Routing Type with Segments Left zero is skipped by IPv6.
+        let routing = (IPV6_ROUTING, vec![0, 0, 253, 0, 0, 0, 0, 0]);
+        let atomic = (IPV6_FRAGMENT, vec![0; 8]);
+        let mut ah = vec![0; 16];
+        ah[1] = 2;
+        let ah = (IP_AUTHENTICATION, ah);
+        let chains = [
+            vec![],
+            vec![hbh.clone()],
+            vec![dest.clone()],
+            vec![routing.clone()],
+            vec![atomic.clone()],
+            vec![ah.clone()],
+            vec![hbh, dest.clone(), routing, atomic, ah, dest],
+        ];
+        let dns = question(0x0100, 1);
+        for chain in chains {
+            let packet = ipv6(&dns, &chain);
+            let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+            assert_eq!(meta.dns_data(&packet).unwrap(), dns);
+            for processor in processors() {
+                let records = processor.process_packet_batch(&packet, 0).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].name.as_str(), "example.com");
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_skips_fragments_requiring_reassembly() {
+        for flags in [1_u16, 8, 9] {
+            let mut fragment = vec![0; 8];
+            fragment[2..4].copy_from_slice(&flags.to_be_bytes());
+            let packet = ipv6(&question(0x0100, 1), &[(IPV6_FRAGMENT, fragment)]);
+            assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+        }
+    }
+
+    #[test]
+    fn ipv6_extension_lengths_cannot_consume_capture_padding() {
+        let dns = question(0x0100, 1);
+        for extension_type in [
+            IPV6_HOP_BY_HOP,
+            IPV6_ROUTING,
+            IPV6_FRAGMENT,
+            IP_AUTHENTICATION,
+            IPV6_DESTINATION_OPTIONS,
+        ] {
+            let packet = ipv6(&dns, &[(extension_type, vec![0; 8])]);
+            for captured_extension_bytes in 0..8_u16 {
+                let mut truncated = packet.clone();
+                // Keep captured bytes intact while limiting the declared IP payload.
+                truncated[18..20].copy_from_slice(&captured_extension_bytes.to_be_bytes());
+                assert!(DnsProcessor::extract_udp_dns_meta(&truncated).is_err());
+            }
+        }
+        let mut oversized_extension = ipv6(&dns, &[(IPV6_DESTINATION_OPTIONS, vec![0; 8])]);
+        oversized_extension[55] = 255;
+        assert!(DnsProcessor::extract_udp_dns_meta(&oversized_extension).is_err());
+        for ah_length in [0, 1, 255] {
+            let mut ah = vec![0; 16];
+            ah[1] = ah_length;
+            let packet = ipv6(&dns, &[(IP_AUTHENTICATION, ah)]);
+            assert!(DnsProcessor::extract_udp_dns_meta(&packet).is_err());
+        }
+    }
+
+    #[test]
+    fn ipv6_dns_offset_can_exceed_u16_after_long_extension_chain() {
+        let dns = question(0x0100, 1);
+        let chain = vec![(IPV6_DESTINATION_OPTIONS, vec![0; 8]); 8186];
+        let packet = ipv6(&dns, &chain);
+        let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+        assert!(meta.dns_offset() > usize::from(u16::MAX));
+        assert_eq!(meta.dns_data(&packet).unwrap(), dns);
+        for processor in processors() {
+            assert_eq!(processor.process_packet_batch(&packet, 0).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn dns_offsets_cover_minimum_headers_and_maximum_ip_payloads() {
+        for is_ipv6 in [false, true] {
+            let ip_header_len = if is_ipv6 {
+                IPV6_HEADER_LEN
+            } else {
+                IPV4_MIN_HEADER_LEN
+            };
+            let dns_len =
+                usize::from(u16::MAX) - UDP_HEADER_LEN - if is_ipv6 { 0 } else { ip_header_len };
+            let mut dns = question(0x0100, 1);
+            dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+            // Fill the maximum UDP payload with a valid EDNS Padding option.
+            let padding_len = dns_len - dns.len() - 11 - 4;
+            dns.push(0);
+            dns.extend_from_slice(&DNS_OPT_RECORD_TYPE.to_be_bytes());
+            dns.extend_from_slice(&u16::MAX.to_be_bytes());
+            dns.extend_from_slice(&[0; 4]);
+            dns.extend_from_slice(&u16::try_from(4 + padding_len).unwrap().to_be_bytes());
+            dns.extend_from_slice(&12_u16.to_be_bytes());
+            dns.extend_from_slice(&u16::try_from(padding_len).unwrap().to_be_bytes());
+            dns.resize(dns_len, 0);
+            let packet = if is_ipv6 {
+                ipv6(&dns, &[])
+            } else {
+                ipv4(&dns, false, 53000)
+            };
+            let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+            assert_eq!(
+                meta.dns_offset(),
+                ETHERNET_HEADER_LEN + ip_header_len + UDP_HEADER_LEN
+            );
+            assert_eq!(usize::from(meta.dns_len), dns_len);
+            assert_eq!(meta.dns_data(&packet).unwrap(), dns);
+            if !is_ipv6 {
+                assert_eq!(meta.dns_offset_delta, 0);
+            }
+            for processor in processors() {
+                assert_eq!(processor.process_packet_batch(&packet, 0).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn relative_dns_offset_covers_largest_ipv6_frame_and_extension_prefix() {
+        let dns = encode_dns_header(0xbeef, 0x0100, 0);
+        // Extension lengths are multiples of eight; this is the largest prefix
+        // leaving room for UDP and the minimum 12-byte DNS message.
+        let chain = vec![(IPV6_DESTINATION_OPTIONS, vec![0; 8]); 8189];
+        let mut packet = ipv6(&dns, &chain);
+        packet.extend_from_slice(&[0; 3]);
+        packet[18..20].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            packet.len(),
+            ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + usize::from(u16::MAX)
+        );
+        let meta = DnsProcessor::packet_routing_meta(&packet).unwrap();
+        assert_eq!(meta.dns_offset(), 65574);
+        assert_eq!(meta.dns_data(&packet).unwrap(), dns);
     }
 }

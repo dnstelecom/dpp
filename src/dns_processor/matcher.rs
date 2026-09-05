@@ -52,7 +52,7 @@ impl DnsProcessor {
         response_timestamp_micros: i64,
         response_code: ProtoResponseCode,
     ) -> DnsRecord {
-        let (id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
+        let (id, name, client_ip, src_port, query_type, ..) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: Some(response_timestamp_micros),
@@ -70,7 +70,7 @@ impl DnsProcessor {
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
     ) -> DnsRecord {
-        let (id, name, client_ip, src_port, query_type, _resolver_ip) = query_identity;
+        let (id, name, client_ip, src_port, query_type, ..) = query_identity;
         DnsRecord {
             request_timestamp: query_key.timestamp_micros,
             response_timestamp: None,
@@ -103,28 +103,100 @@ impl DnsProcessor {
         &self,
         record: &ProcessedDnsRecord,
         state: &mut MatcherShardState,
-        output_records: &mut OutputRecordBatches,
-        dns_query_count: &mut usize,
-        duplicated_query_count: &mut usize,
-        matched_query_response_count: &mut usize,
-        matched_rtt_sum_micros: &mut u64,
+        result: &mut ShardProcessingResult,
     ) {
         let query_identity = self.query_identity_from_record(record);
         let query_key = self.timeline_key_from_record(record);
-        *dns_query_count += 1;
+        result.dns_query_count += 1;
 
         if let Some(pending_key) =
             self.pending_query_within_timeout(state, &query_identity, query_key.timestamp_micros)
         {
-            *duplicated_query_count += 1;
             if pending_key <= query_key {
+                result.duplicated_query_count += 1;
+                if !self.monotonic_capture {
+                    state
+                        .query_map
+                        .get_mut(&query_identity)
+                        .and_then(|timeline| timeline.get_mut(pending_key))
+                        .expect("pending retry handle must remain valid")
+                        .retain_retry(query_key);
+                }
                 return;
             }
 
-            self.remove_query_entry(state, &query_identity, pending_key)
-                .expect("pending retry handle must remain valid until replacement");
+            // An earlier attempt can split a retry group and move every later group
+            // boundary for this identity. Repartition unresolved attempts, never an
+            // already finalized transaction, using the same earliest-query window.
+            debug_assert!(!self.monotonic_capture);
+            let timeline = state
+                .query_map
+                .remove(&query_identity)
+                .expect("pending retry identity must remain valid");
+            let (queries, duplicate_increment) =
+                self.repartition_pending_queries(timeline, query_key);
+            result.duplicated_query_count += duplicate_increment;
+            for (key, payload) in queries {
+                self.match_or_insert_query(query_identity.clone(), key, payload, state, result);
+            }
+            return;
         }
 
+        self.match_or_insert_query(
+            query_identity,
+            query_key,
+            QueryEventPayload::default(),
+            state,
+            result,
+        );
+    }
+
+    fn repartition_pending_queries(
+        &self,
+        timeline: Timeline<QueryEventPayload>,
+        new_key: TimelineKey,
+    ) -> (Vec<(TimelineKey, QueryEventPayload)>, usize) {
+        let mut attempts = vec![new_key];
+        let mut previous_query_count = 0_usize;
+        timeline.into_entries(|key, payload| {
+            previous_query_count += 1;
+            attempts.push(key);
+            payload.append_retries_to(&mut attempts);
+        });
+        attempts.sort_unstable();
+
+        let mut queries: Vec<(TimelineKey, QueryEventPayload)> = Vec::new();
+        for key in attempts {
+            if let Some((canonical_key, payload)) = queries.last_mut()
+                && key.timestamp_micros
+                    <= canonical_key
+                        .timestamp_micros
+                        .saturating_add(self.match_timeout_micros)
+            {
+                payload.retain_retry(key);
+            } else {
+                queries.push((key, QueryEventPayload::default()));
+            }
+        }
+
+        // Greedy earliest-first windows use the minimum number of fixed-width
+        // intervals. Adding one attempt adds either zero or one canonical query;
+        // duplicate counts therefore need no retroactive decrement.
+        let duplicate_increment = (previous_query_count + 1)
+            .checked_sub(queries.len())
+            .expect("one inserted attempt cannot add multiple canonical queries");
+        debug_assert!(duplicate_increment <= 1);
+        (queries, duplicate_increment)
+    }
+
+    fn match_or_insert_query(
+        &self,
+        query_identity: QueryIdentityKey,
+        query_key: TimelineKey,
+        payload: QueryEventPayload,
+        state: &mut MatcherShardState,
+        result: &mut ShardProcessingResult,
+    ) {
         if let Some((_, response_handle)) = self.find_closest_response(
             state,
             &query_identity,
@@ -137,19 +209,21 @@ impl DnsProcessor {
             let response_payload = self
                 .remove_response_entry(state, &query_identity, response_handle)
                 .expect("matched response handle must remain valid until removal");
-            output_records.push(self.create_matched_record_from_query_parts(
-                &query_identity,
-                query_key,
-                response_handle.timestamp_micros,
-                response_payload.response_code,
-            ));
-            *matched_query_response_count += 1;
-            *matched_rtt_sum_micros += response_handle
+            result
+                .output_records
+                .push(self.create_matched_record_from_query_parts(
+                    &query_identity,
+                    query_key,
+                    response_handle.timestamp_micros,
+                    response_payload.response_code,
+                ));
+            result.matched_query_response_count += 1;
+            result.matched_rtt_sum_micros += response_handle
                 .timestamp_micros
                 .saturating_sub(query_key.timestamp_micros)
                 .max(0) as u64;
         } else {
-            self.insert_query_entry(state, query_identity, query_key);
+            self.insert_query_entry_with_payload(state, query_identity, query_key, payload);
         }
     }
 
@@ -293,17 +367,33 @@ impl DnsProcessor {
         self.evict_responses_before(state, threshold_timestamp_micros);
     }
 
+    #[cfg(test)]
     pub(super) fn insert_query_entry(
         &self,
         state: &mut MatcherShardState,
         identity: QueryIdentityKey,
         timeline_key: TimelineKey,
     ) {
+        self.insert_query_entry_with_payload(
+            state,
+            identity,
+            timeline_key,
+            QueryEventPayload::default(),
+        );
+    }
+
+    fn insert_query_entry_with_payload(
+        &self,
+        state: &mut MatcherShardState,
+        identity: QueryIdentityKey,
+        timeline_key: TimelineKey,
+        payload: QueryEventPayload,
+    ) {
         let replaced = state
             .query_map
             .entry(identity)
             .or_default()
-            .insert(timeline_key, QueryEventPayload);
+            .insert(timeline_key, payload);
 
         if replaced.is_some() {
             debug_assert!(
@@ -402,6 +492,8 @@ impl DnsProcessor {
             client_port,
             record.query_type,
             resolver_ip,
+            record.query_class,
+            record.opcode,
         )
     }
 
@@ -419,6 +511,8 @@ impl DnsProcessor {
             client_port,
             record.query_type,
             resolver_ip,
+            record.query_class,
+            record.opcode,
         )
     }
 
@@ -431,6 +525,8 @@ impl DnsProcessor {
             query.src_port,
             query.query_type,
             query.resolver_ip,
+            query.query_class,
+            query.opcode,
         )
     }
 
@@ -470,15 +566,7 @@ impl DnsProcessor {
                     &mut result.matched_rtt_sum_micros,
                 );
             } else {
-                self.process_query(
-                    &record,
-                    state,
-                    &mut result.output_records,
-                    &mut result.dns_query_count,
-                    &mut result.duplicated_query_count,
-                    &mut result.matched_query_response_count,
-                    &mut result.matched_rtt_sum_micros,
-                );
+                self.process_query(&record, state, &mut result);
             }
         }
 

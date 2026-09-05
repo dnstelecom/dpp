@@ -21,8 +21,9 @@ order within each shard and never backtracks. The key design choices:
    based). There is no shared mutable matcher state between shards.
 
 2. **Canonical flow routing.** Before full DNS decode, the routing stage extracts a cheap
-   `CanonicalFlowKey` (client IP, resolver IP, port pair — always ordered so that
-   `client < resolver`) and hashes it to a shard index. This guarantees that a query and its
+   `CanonicalFlowKey` (observed client IP, client port and resolver IP, oriented by DNS QR)
+   and hashes it to a shard index. This includes the valid case where both ports are 53 and
+   guarantees that a query and its
    matching response always land in the same shard.
 
 3. **Deterministic ordering.** Within a shard, packets are processed in strict
@@ -31,11 +32,21 @@ order within each shard and never backtracks. The key design choices:
 
 4. **Retry deduplication.** If a query with the same identity arrives while an earlier one is
    still pending inside the match-timeout window (1200 ms by default), the duplicate is counted
-   but doesn't create a second in-flight entry. One query → one terminal outcome (matched or
-   timeout), always.
+   but doesn't create a second canonical query. One canonical query → one terminal outcome
+   (matched or timeout), always. Default mode retains retry timestamps inside that pending query's
+   payload. If an earlier query arrives across batches, the matcher regroups the identity's
+   unresolved attempts into earliest-first timeout windows. For example, pending attempts observed
+   at 3s, 2s and then 1s with a 1.2s window leave canonicals at 1s and 3s, rather than losing the
+   latter through transitive deduplication. Finalized transactions are never reopened.
 
-   Match identity includes the DNS ID, observed name, client IP and port, resolver IP, and query
-   type. Resolver identity remains internal and is not added to the exported `DnsRecord` schema.
+   Retry history is allocated only when a duplicate is observed in default mode; monotonic mode
+   needs none. Regrouping costs `O(n log n)` in the affected identity's unresolved attempts and is
+   restricted to earlier-canonical replacements. The canonical query payload remains the sole owner
+   of retry history, with no secondary matcher map.
+
+   Match identity includes the DNS ID, observed name, client IP and port, resolver IP, query
+   type, query class and opcode. Resolver identity, query class and opcode remain internal and are
+   not added to the exported `DnsRecord` schema.
 
    The current Community Edition identity key preserves the observed presentation-form QNAME bytes
    and does not lowercase them before matching. This is a deliberate Community Edition trade-off,
@@ -61,7 +72,9 @@ order within each shard and never backtracks. The key design choices:
 These must hold for any valid implementation:
 
 - Each query reaches exactly one terminal outcome: matched once, or emitted once as a timeout.
-- For a fixed input PCAP and configuration, output is bit-for-bit deterministic.
+- For a fixed input PCAP and runtime configuration, finalized record values and order are
+  deterministic. Output container layout, such as Parquet row-group boundaries, need not be
+  byte-identical across runs.
 - Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never leaks into the exported
   `DnsRecord`.
 - Duplicate responses remain distinguishable in matcher state until matched or discarded.

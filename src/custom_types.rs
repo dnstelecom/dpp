@@ -8,6 +8,7 @@ use arrayvec::ArrayString;
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
 use hickory_proto::rr::RecordType as HickoryRecordType;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -63,8 +64,11 @@ impl From<ProtoRecordType> for HickoryRecordType {
 }
 
 impl ProtoRecordType {
-    pub fn as_str(&self) -> &'static str {
-        Into::<&str>::into(self.0)
+    pub fn as_str(&self) -> Cow<'static, str> {
+        match self.0 {
+            HickoryRecordType::Unknown(code) => Cow::Owned(format!("TYPE{code}")),
+            known => Cow::Borrowed(Into::<&str>::into(known)),
+        }
     }
 }
 
@@ -87,7 +91,7 @@ impl Serialize for ProtoRecordType {
     where
         S: Serializer,
     {
-        serializer.serialize_str(Into::<&str>::into(self.0))
+        serializer.serialize_str(&self.as_str())
     }
 }
 
@@ -97,9 +101,14 @@ impl<'de> Deserialize<'de> for ProtoRecordType {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        let record_type = value
-            .parse::<HickoryRecordType>()
-            .map_err(serde::de::Error::custom)?;
+        let record_type = if let Some(code) = value.strip_prefix("TYPE") {
+            HickoryRecordType::from(code.parse::<u16>().map_err(serde::de::Error::custom)?)
+        } else {
+            value
+                .to_ascii_uppercase()
+                .parse::<HickoryRecordType>()
+                .map_err(serde::de::Error::custom)?
+        };
         Ok(ProtoRecordType(record_type))
     }
 }
@@ -205,10 +214,13 @@ impl ProtoResponseCode {
         self.code
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> Cow<'static, str> {
         match (self.context, self.as_u16()) {
-            (ResponseCodeContext::EdnsOpt, 16) => "EDNS_BADVERS",
-            _ => Into::<HickoryResponseCode>::into(*self).to_str(),
+            (ResponseCodeContext::EdnsOpt, 16) => Cow::Borrowed("EDNS_BADVERS"),
+            _ => match Into::<HickoryResponseCode>::into(*self) {
+                HickoryResponseCode::Unknown(code) => Cow::Owned(code.to_string()),
+                known => Cow::Borrowed(known.to_str()),
+            },
         }
     }
 }
@@ -242,7 +254,7 @@ impl Serialize for ProtoResponseCode {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        serializer.serialize_str(&self.as_str())
     }
 }
 
@@ -594,9 +606,10 @@ impl<'de, const N: usize> Deserialize<'de> for FixedSizeString<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DNS_NAME_PRESENTATION_MAX_LENGTH, DnsNameBuf, FixedSizeString, HickoryResponseCode,
-        ProtoResponseCode,
+        DNS_NAME_PRESENTATION_MAX_LENGTH, DnsNameBuf, FixedSizeString, HickoryRecordType,
+        HickoryResponseCode, ProtoRecordType, ProtoResponseCode,
     };
+    use std::borrow::Cow;
     use std::mem::size_of;
 
     #[test]
@@ -606,6 +619,43 @@ mod tests {
         let parsed: HickoryResponseCode = code.into();
 
         assert_eq!(u16::from(parsed), 4095);
+    }
+
+    #[test]
+    fn unknown_protocol_values_preserve_numeric_identity_through_serde() {
+        for value in [65400, 65401, u16::MAX] {
+            let record_type = ProtoRecordType::from(HickoryRecordType::Unknown(value));
+            let encoded = serde_json::to_string(&record_type).expect("type serializes");
+            assert_eq!(encoded, format!("\"TYPE{value}\""));
+            let decoded: ProtoRecordType = serde_json::from_str(&encoded).expect("type parses");
+            assert_eq!(decoded, record_type);
+        }
+        for value in [64, 65, 4095, u16::MAX] {
+            let response_code = ProtoResponseCode::from(HickoryResponseCode::Unknown(value));
+            let encoded = serde_json::to_string(&response_code).expect("rcode serializes");
+            assert_eq!(encoded, format!("\"{value}\""));
+            let decoded: ProtoResponseCode = serde_json::from_str(&encoded).expect("rcode parses");
+            assert_eq!(decoded.as_u16(), value);
+        }
+    }
+
+    #[test]
+    fn known_protocol_labels_remain_borrowed() {
+        assert!(matches!(
+            ProtoRecordType::from(HickoryRecordType::A).as_str(),
+            Cow::Borrowed("A")
+        ));
+        assert!(matches!(
+            ProtoResponseCode::from(HickoryResponseCode::NoError).as_str(),
+            Cow::Borrowed("No Error")
+        ));
+    }
+
+    #[test]
+    fn generic_record_type_rejects_out_of_range_or_missing_code() {
+        for value in ["TYPE", "TYPE65536", "TYPE-1", "TYPEbad"] {
+            assert!(serde_json::from_str::<ProtoRecordType>(&format!("\"{value}\"")).is_err());
+        }
     }
 
     #[test]

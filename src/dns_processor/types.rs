@@ -26,8 +26,17 @@ const INLINE_TIMELINE_CAPACITY: usize = 1;
 // Edition intentionally does not canonicalize names here: byte-preserving matching aligns better
 // with the real behavior we target on offline caching-resolver workloads. As a result, a
 // query/response pair that differs only by case may fail to match even on otherwise valid DNS
-// traffic. Tuple order is id, name, client IP, client port, query type, resolver IP.
-pub(super) type MatcherIdentityKey = (u16, DnsNameBuf, IpAddr, u16, HickoryRecordType, IpAddr);
+// traffic. Tuple order is id, name, client IP, client port, query type, resolver IP, query class, opcode.
+pub(super) type MatcherIdentityKey = (
+    u16,
+    DnsNameBuf,
+    IpAddr,
+    u16,
+    HickoryRecordType,
+    IpAddr,
+    u16,
+    u8,
+);
 pub(super) type QueryIdentityKey = MatcherIdentityKey;
 pub(super) type ResponseIdentityKey = MatcherIdentityKey;
 
@@ -56,8 +65,46 @@ impl TimelineKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct QueryEventPayload;
+#[derive(Debug, Default)]
+pub(super) struct QueryEventPayload {
+    // Only non-monotonic captures need to retain pending retries. Keeping the optional
+    // allocation in the canonical query preserves a single owner for every attempt.
+    retries: Option<Box<QueryRetries>>,
+}
+
+#[derive(Debug)]
+struct QueryRetries {
+    // The common first retry needs only this box; additional retries allocate a vector.
+    first: TimelineKey,
+    later: Vec<TimelineKey>,
+}
+
+impl QueryEventPayload {
+    pub(super) fn retain_retry(&mut self, key: TimelineKey) {
+        if let Some(retries) = self.retries.as_mut() {
+            retries.later.push(key);
+        } else {
+            self.retries = Some(Box::new(QueryRetries {
+                first: key,
+                later: Vec::new(),
+            }));
+        }
+    }
+
+    pub(super) fn append_retries_to(self, attempts: &mut Vec<TimelineKey>) {
+        if let Some(retries) = self.retries {
+            attempts.push(retries.first);
+            attempts.extend(retries.later);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_retry_count(&self) -> usize {
+        self.retries
+            .as_ref()
+            .map_or(0, |retries| 1 + retries.later.len())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResponseEventPayload {
@@ -148,6 +195,18 @@ impl<Record> Timeline<Record> {
                 )
                 .next_back()
                 .map(|(key, record)| (*key, record)),
+        }
+    }
+
+    pub(super) fn get_mut(&mut self, key: TimelineKey) -> Option<&mut Record> {
+        match self {
+            Self::Inline(entries) => {
+                let index = entries
+                    .binary_search_by_key(&key, |(entry_key, _)| *entry_key)
+                    .ok()?;
+                Some(&mut entries[index].1)
+            }
+            Self::Tree(tree) => tree.get_mut(&key),
         }
     }
 
@@ -361,6 +420,8 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) is_query: bool,
     pub(super) name: DnsNameBuf,
     pub(super) query_type: HickoryRecordType,
+    pub(super) query_class: u16,
+    pub(super) opcode: u8,
     pub(super) response_code: ProtoResponseCode,
 }
 
@@ -376,6 +437,8 @@ pub(super) struct DnsQuery {
     pub(super) packet_ordinal: u64,
     pub(super) record_ordinal: u32,
     pub(super) query_type: HickoryRecordType,
+    pub(super) query_class: u16,
+    pub(super) opcode: u8,
 }
 
 #[cfg(test)]
@@ -391,6 +454,8 @@ pub(super) struct DnsResponse {
     pub(super) record_ordinal: u32,
     pub(super) response_code: ProtoResponseCode,
     pub(super) query_type: HickoryRecordType,
+    pub(super) query_class: u16,
+    pub(super) opcode: u8,
 }
 
 #[derive(Default)]

@@ -7,6 +7,8 @@ This directory is the canonical location for repeatable performance measurements
 - `benchmark.sh`: end-to-end benchmark harness for the `dpp` binary.
 - `allocator-benchmarking.md`: canonical build-and-measure protocol for global allocator
   comparisons.
+- `protocol-correctness-audit.md`: final validation, restored throughput and measured memory costs
+  of the 2026-09-05 protocol and matcher fixes, with earlier experiments identified separately.
 
 ## Safety Contract
 
