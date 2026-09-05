@@ -280,6 +280,10 @@ the absent `response_timestamp`; `response_code` is absent because no DNS respon
 extended RCODE `16` is exported as `EDNS_BADVERS`; `TSIG Failure` is used for code `16` only when a
 TSIG RR error field supplies that status.
 
+Unknown query types retain their wire number as `TYPE<number>` (for example, `TYPE65400`),
+and unknown response codes use their decimal number (for example, `64`). CSV and Parquet
+preserve these values instead of collapsing distinct codes into an `Unknown` label.
+
 With `--report-format json` or `DPP_REPORT_FORMAT=json`, DPP suppresses routine `info`/`warn`
 reporting and emits one final JSON summary object to `stdout`. This keeps CSV or Parquet output in
 its own file while making the end-of-run report easy to capture and parse.

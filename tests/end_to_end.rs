@@ -666,3 +666,96 @@ fn closed_stderr_does_not_abort_file_output() {
     fs::remove_file(&input_path).expect("remove input pcap");
     fs::remove_file(&output_path).expect("remove output csv");
 }
+
+#[test]
+fn unknown_protocol_values_round_trip_through_csv_and_parquet() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+
+    let input_path = temp_test_path("unknown-protocol-values", "pcap");
+    let mut frames = Vec::new();
+    for (id, query_type, response_code) in [(1_u16, 65400_u16, 64_u16), (2, 65401, 65)] {
+        let mut query = encode_dns_header(id, 0x0100, 1);
+        append_example_a_query(&mut query);
+        let type_offset = query.len() - 4;
+        query[type_offset..type_offset + 2].copy_from_slice(&query_type.to_be_bytes());
+        let mut response = query.clone();
+        response[2..4].copy_from_slice(&(0x8180 | (response_code & 0xf)).to_be_bytes());
+        response[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        append_opt_record(&mut response, (response_code >> 4) as u8, 0);
+        frames.push(make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53000,
+            53,
+            &query,
+        ));
+        frames.push(make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53000,
+            &response,
+        ));
+    }
+    let packets: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| (1, index as u32 * 10_000, frame.as_slice()))
+        .collect();
+    fs::write(&input_path, classic_pcap_bytes(&packets)).expect("writes capture");
+
+    for fast in [false, true] {
+        for format in ["csv", "parquet"] {
+            let output_path = temp_test_path("unknown-protocol-values", format);
+            let mut command = Command::new(dpp_binary());
+            command.args(["-s", "-f", format]);
+            if fast {
+                command.arg("--dns-wire-fast-path");
+            }
+            let output = command
+                .arg(&input_path)
+                .arg(&output_path)
+                .output()
+                .expect("runs dpp");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let values: Vec<(String, String)> = if format == "csv" {
+                csv::Reader::from_path(&output_path)
+                    .expect("opens csv")
+                    .records()
+                    .map(|row| {
+                        let row = row.expect("reads row");
+                        (row[6].to_owned(), row[7].to_owned())
+                    })
+                    .collect()
+            } else {
+                SerializedFileReader::new(fs::File::open(&output_path).expect("opens parquet"))
+                    .expect("reads parquet")
+                    .get_row_iter(None)
+                    .expect("reads rows")
+                    .map(|row| {
+                        let row = row.expect("reads row");
+                        (
+                            row.get_string(6).unwrap().clone(),
+                            row.get_string(7).unwrap().clone(),
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                values,
+                vec![
+                    ("TYPE65400".to_owned(), "64".to_owned()),
+                    ("TYPE65401".to_owned(), "65".to_owned())
+                ],
+                "fast={fast}, format={format}"
+            );
+            fs::remove_file(output_path).expect("removes output");
+        }
+    }
+    fs::remove_file(input_path).expect("removes input");
+}
