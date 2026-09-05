@@ -83,3 +83,41 @@ mode. A CPU sample located the limiting stage in packet routing and its streamin
 `build.rs` was also checked: it sets executable stack size and build metadata, and was unchanged
 by the correctness fixes. Optimization levels, LTO and codegen units remain owned by `Cargo.toml`;
 no compiler or linker settings were changed for this recovery work.
+
+The final routing optimization collects the unchanged tuple `Hash` writes in a 64-byte stack
+buffer, then calls the existing SeaHash buffer implementation once. Integer byte order, seeds,
+the complete digest and the shard modulo remain unchanged. Overflow replays the prefix into the
+original streaming hasher. Differential tests cover IPv4, IPv6, mixed families, ports, 4096
+deterministic flows, integer encodings, capacity boundaries and repeated `finish` calls.
+
+A separate experiment packed addresses and ports into a new network-order hash input. It passed
+targeted correctness tests but was slower than the digest-preserving adapter in both four-pair
+screens, so it was discarded. Matcher and CSV formatter experiments were also discarded.
+
+With relative offsets and buffered hashing together, ten position-balanced pairs against the
+pre-audit version (`3bb4539`) gave the following local results:
+
+| Configuration | Pre-audit median (s) | Final median (s) | Median paired speed ratio |
+|---|---:|---:|---:|
+| Default | 0.9807 | 0.9677 | 1.0134 |
+| Monotonic | 0.9580 | 0.9627 | 0.9962 |
+
+A separate ten-pair confirmation against correctness-fixed `2ef34a4` measured 1.0273 / 0.9758
+seconds (reference / final) in default mode and 0.9980 / 0.9723 seconds in monotonic mode.
+Median paired speed ratios were 1.0484 and 1.0290. Median peak RSS was 209.8 / 301.4 MiB and
+219.0 / 288.4 MiB respectively. Both series used an excluded warmup pair per mode and retained
+all subsequent samples.
+
+Default throughput is restored and slightly exceeds the old version in this series. The
+monotonic difference is within the observed run-to-run variation (paired ratios 0.9687–1.0394).
+These are macOS ARM64 results for this selected capture, not a guarantee for other workloads.
+Median peak RSS in the same comparison was 217.7 / 298.4 MiB (pre-audit / final) in default mode
+and 221.3 / 287.9 MiB in monotonic mode. The speed recovery therefore comes with higher observed
+RSS on this host; the existing queue bounds and ownership model remain unchanged.
+
+Full CSV output against the correctness-fixed version was byte-identical in both monotonic
+settings and with both DNS decoders: 854,848,168 bytes per output. SHA-256 was
+`02db37f51a60a84000b457c47339fb87bd725071c4e08899f3e8b90b430f9fc9` in default mode and
+`08f435bc3aa241615937e3c08b4c089570d5e3dbe9fb245a46c8e9bd3d680bc0` in monotonic mode.
+All packet/query/response/duplicate/match/timeout counters and average matched RTT agreed.
+The final workspace suite passes 254 tests, including all earlier protocol regressions.

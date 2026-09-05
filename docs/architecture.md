@@ -83,6 +83,12 @@ and uses the remaining CPU budget for shard workers. Routed DNS packets also car
 metadata into shard workers so the worker path can reuse the first L3/L4 parse instead of
 repeating it for full DNS question decoding.
 
+Flow routing buffers the existing tuple's `Hash` writes on the stack and runs SeaHash once over
+the resulting bytes. The integer encoding and digest remain identical to the streaming hasher,
+so shard assignment and output order are preserved. If a future tuple encoding exceeds the
+buffer, routing replays its bytes into the streaming hasher; this adds no persistent flow state
+or second encoding of canonical addresses and ports.
+
 ## Core Components
 
 - `src/packet_parser.rs`

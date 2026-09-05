@@ -5,6 +5,7 @@
  * Commercial licensing options: <carrier-support@dnstele.com>.
  */
 
+use arrayvec::ArrayVec;
 use crossbeam::channel::{Receiver, Sender};
 use rayon::prelude::*;
 use seahash::SeaHasher;
@@ -409,13 +410,103 @@ fn routed_shard_capacity_hint(packet_count: usize, shard_count: usize) -> usize 
     (packet_count / shard_count) + 1
 }
 
+// Buffer the tuple's existing Hash writes so routing runs SeaHash once per flow.
+// Streaming fallback keeps future Hash implementations correct if they exceed this capacity.
+enum BufferedFlowHasher {
+    Buffered(ArrayVec<u8, 64>),
+    Streaming(SeaHasher),
+}
+
+impl Default for BufferedFlowHasher {
+    fn default() -> Self {
+        Self::Buffered(ArrayVec::new())
+    }
+}
+
+impl Hasher for BufferedFlowHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        match self {
+            Self::Buffered(bytes) => seahash::hash(bytes.as_slice()),
+            Self::Streaming(hasher) => hasher.finish(),
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Buffered(buffer) => {
+                if buffer.try_extend_from_slice(bytes).is_err() {
+                    let mut hasher = SeaHasher::new();
+                    hasher.write(buffer.as_slice());
+                    hasher.write(bytes);
+                    *self = Self::Streaming(hasher);
+                }
+            }
+            Self::Streaming(hasher) => hasher.write(bytes),
+        }
+    }
+
+    // SeaHasher 4.1 encodes these integer writes as little endian. Its u128/i128
+    // methods use Hasher's native-endian defaults, which this adapter also inherits.
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.write(&value.to_le_bytes());
+    }
+}
+
 fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
     debug_assert!(shard_count > 0);
     if shard_count == 1 {
         return 0;
     }
 
-    let mut hasher = SeaHasher::new();
+    let mut hasher = BufferedFlowHasher::default();
     (
         flow_key.client_ip,
         flow_key.client_port,
@@ -1879,5 +1970,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..8).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod buffered_flow_hash_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn assert_flow_hash_matches_reference(flow: CanonicalFlowKey) {
+        let identity = (flow.client_ip, flow.client_port, flow.resolver_ip);
+        let mut reference = SeaHasher::new();
+        identity.hash(&mut reference);
+        let expected = reference.finish();
+        let mut buffered = BufferedFlowHasher::default();
+        identity.hash(&mut buffered);
+        assert_eq!(buffered.finish(), expected, "{flow:?}");
+        for shard_count in [1, 2, 3, 4, 7, 16, 64, 257, 1024] {
+            assert_eq!(
+                shard_map_index(flow, shard_count),
+                (expected as usize) % shard_count,
+                "{flow:?}, shard_count={shard_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_address_families_ports_and_shards() {
+        let addresses = [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::from(u128::MAX)),
+            IpAddr::V6(Ipv6Addr::from(
+                0x2001_0db8_0001_0203_0405_0607_0809_0a0b_u128,
+            )),
+            IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped()),
+        ];
+        for client_ip in addresses {
+            for resolver_ip in addresses {
+                for client_port in [0, 1, 53, 1023, 1024, 32768, 65535] {
+                    assert_flow_hash_matches_reference(CanonicalFlowKey {
+                        client_ip,
+                        client_port,
+                        resolver_ip,
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_matches_many_deterministic_flows() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state
+        }
+        let mut state = 0x0123_4567_89ab_cdef;
+        for index in 0..4096 {
+            let client_v4 = Ipv4Addr::from(next(&mut state) as u32);
+            let client_v6 =
+                Ipv6Addr::from((u128::from(next(&mut state)) << 64) | u128::from(next(&mut state)));
+            let resolver_v4 = Ipv4Addr::from(next(&mut state) as u32);
+            let resolver_v6 =
+                Ipv6Addr::from((u128::from(next(&mut state)) << 64) | u128::from(next(&mut state)));
+            assert_flow_hash_matches_reference(CanonicalFlowKey {
+                client_ip: if index & 1 == 0 {
+                    client_v4.into()
+                } else {
+                    client_v6.into()
+                },
+                client_port: next(&mut state) as u16,
+                resolver_ip: if index & 2 == 0 {
+                    resolver_v4.into()
+                } else {
+                    resolver_v6.into()
+                },
+            });
+        }
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_integer_write_encodings() {
+        macro_rules! check {
+            ($method:ident, $value:expr) => {
+                for prefix_len in [0, 63, 65] {
+                    let prefix = [0x37; 65];
+                    let mut reference = SeaHasher::new();
+                    let mut buffered = BufferedFlowHasher::default();
+                    reference.write(&prefix[..prefix_len]);
+                    buffered.write(&prefix[..prefix_len]);
+                    reference.$method($value);
+                    buffered.$method($value);
+                    assert_eq!(buffered.finish(), reference.finish(), stringify!($method));
+                }
+            };
+        }
+        check!(write_u8, 0xef);
+        check!(write_u16, 0x1234);
+        check!(write_u32, 0x1234_5678);
+        check!(write_u64, 0x1234_5678_9abc_def0);
+        check!(write_usize, 0x1234_5678);
+        check!(write_i8, -17);
+        check!(write_i16, -0x1234);
+        check!(write_i32, -0x1234_5678);
+        check!(write_i64, -0x1234_5678_9abc_def0);
+        check!(write_isize, -0x1234_5678);
+        check!(write_u128, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        check!(write_i128, -0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+    }
+
+    #[test]
+    fn buffered_flow_hash_preserves_streaming_overflow_and_finish_semantics() {
+        let bytes: Vec<u8> = (0..257).map(|index| (index * 73 + 19) as u8).collect();
+        for length in [
+            0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 66, 127, 128, 129, 256, 257,
+        ] {
+            for chunk_size in [1, 2, 3, 7, 8, 15, 16, 31, 63, 64, 65, 97, 257] {
+                let mut reference = SeaHasher::new();
+                let mut buffered = BufferedFlowHasher::default();
+                for chunk in bytes[..length].chunks(chunk_size) {
+                    reference.write(chunk);
+                    buffered.write(chunk);
+                    assert_eq!(buffered.finish(), reference.finish());
+                    // finish is nondestructive, and an empty write cannot alter the stream.
+                    buffered.write(&[]);
+                    assert_eq!(buffered.finish(), reference.finish());
+                }
+                assert_eq!(buffered.finish(), reference.finish());
+                reference.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+                buffered.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+                assert_eq!(buffered.finish(), reference.finish());
+            }
+        }
     }
 }
