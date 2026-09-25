@@ -151,6 +151,18 @@ fn display_parser_mode(args: &AppConfig) {
     }
 }
 
+fn display_fragment_mode(args: &AppConfig) {
+    if args.full_fragments {
+        info!(
+            "IPv4 fragment reassembly: enabled (incomplete responses may use first-fragment matching)"
+        );
+    } else if args.allow_fragments {
+        info!(
+            "IPv4 response fragment prefix matching: enabled (no reassembly; full UDP/DNS content unverified)"
+        );
+    }
+}
+
 fn display_match_timeout(args: &AppConfig) {
     info!("DNS match timeout: {} ms", args.match_timeout_ms);
 }
@@ -185,6 +197,8 @@ struct RunConfigSummary {
     match_timeout_ms: u64,
     monotonic_capture: bool,
     dns_wire_fast_path: bool,
+    allow_fragments: bool,
+    full_fragments: bool,
     anonymization_enabled: bool,
     anonymize_key_path: Option<String>,
     zstd: bool,
@@ -229,6 +243,7 @@ struct RunMetricsSummary {
     total_dns_queries_processed: usize,
     deduplicated_duplicate_queries: usize,
     total_dns_responses_processed: usize,
+    fragmented_response_prefix_count: usize,
     total_matched_query_response_pairs: usize,
     timed_out_queries: usize,
     timed_out_query_ratio: f64,
@@ -359,6 +374,8 @@ fn build_run_summary(
             match_timeout_ms: args.match_timeout_ms,
             monotonic_capture: args.monotonic_capture,
             dns_wire_fast_path: args.dns_wire_fast_path,
+            allow_fragments: args.allow_fragments,
+            full_fragments: args.full_fragments,
             anonymization_enabled: args.anonymize_key_path().is_some(),
             anonymize_key_path: args.anonymize_key_path().map(canonical_path_string),
             zstd: args.zstd,
@@ -383,6 +400,7 @@ fn build_run_summary(
             total_dns_queries_processed: counters.dns_query_count,
             deduplicated_duplicate_queries: counters.duplicated_query_count,
             total_dns_responses_processed: counters.dns_response_count,
+            fragmented_response_prefix_count: counters.fragmented_response_prefix_count,
             total_matched_query_response_pairs: counters.matched_query_response_count,
             timed_out_queries: counters.timeout_query_count,
             timed_out_query_ratio: timed_out_query_ratio(
@@ -439,6 +457,15 @@ fn display_text_summary(summary: &RunSummary) {
             .total_dns_responses_processed
             .to_formatted_string(&Locale::en)
     );
+    if summary.config.allow_fragments {
+        info!(
+            "Accepted first IPv4 response fragments: {}",
+            summary
+                .metrics
+                .fragmented_response_prefix_count
+                .to_formatted_string(&Locale::en)
+        );
+    }
     info!(
         "{}",
         oversized_qname_rejection_summary_line(
@@ -559,6 +586,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     display_parquet_format_information(&args);
     display_anonymization(&args);
     display_parser_mode(&args);
+    display_fragment_mode(&args);
     display_match_timeout(&args);
     display_monotonic_capture_mode(&args);
 
@@ -569,7 +597,9 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
             args.match_timeout_micros(),
             args.monotonic_capture,
         )
-        .map_err(|source| AppRunError::DnsProcessorInit { source })?,
+        .map_err(|source| AppRunError::DnsProcessorInit { source })?
+        .with_allow_fragments(args.allow_fragments)
+        .with_full_fragments(args.full_fragments),
     );
     let mut packet_parser = match PacketParser::new_with_shutdown(
         &args.input_source,
@@ -728,6 +758,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 
@@ -788,6 +820,31 @@ mod tests {
             config.get("output_record_batch_size"),
             Some(&serde_json::json!(crate::config::OUTPUT_RECORD_BATCH_SIZE))
         );
+    }
+
+    #[test]
+    fn run_summary_reports_accepted_ipv4_response_prefixes() {
+        let mut config = test_config();
+        config.allow_fragments = true;
+        config.full_fragments = true;
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters {
+                fragmented_response_prefix_count: 2,
+                ..ProcessingCounters::default()
+            },
+            RunWarningsSummary::default(),
+            0,
+            1.0,
+            0.5,
+            1.5,
+        );
+
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        assert_eq!(serialized["config"]["allow_fragments"], true);
+        assert_eq!(serialized["config"]["full_fragments"], true);
+        assert_eq!(serialized["metrics"]["fragmented_response_prefix_count"], 2);
     }
 
     #[test]
@@ -924,6 +981,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 

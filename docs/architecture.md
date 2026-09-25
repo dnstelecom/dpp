@@ -156,19 +156,36 @@ or second encoding of canonical addresses and ports.
   shard-local DNS decode, but that reuse must stay within the same ownership boundary so packet
   parsing does not gain a second source of truth for IP/port extraction. That metadata owns the
   exact DNS byte range validated against IPv4 Total Length or IPv6 Payload Length and then UDP
-  Length; capture padding and trailing IP payload cannot extend the DNS slice. A compact relative
+  Length; capture padding and trailing IP payload cannot extend the DNS slice. For an opted-in
+  first IPv4 response fragment, the DNS slice ends at that fragment's Total Length, and the UDP
+  Length is checked against the declared datagram size. A compact relative
   offset preserves DNS starts above 65535 without widening every packet's routing metadata: the
   offset is measured from the minimum Ethernet/IPv4/UDP header length, and construction checks
   that it fits. DNS QR determines
   direction and the canonical client/resolver flow, including exchanges with UDP port 53 on both
   ends. IPv6 Hop-by-Hop, Routing, Destination Options, AH and atomic Fragment headers are traversed
-  within the declared payload boundary. Non-atomic IPv6 and fragmented IPv4 datagrams are skipped
-  because this boundary has no IP reassembly stage. The optional runtime flag
+  within the declared payload boundary. Non-atomic IPv6 fragments and, by default, fragmented
+  IPv4 datagrams are skipped. With
+  `--allow-fragments`, only a first IPv4 response fragment with a complete DNS header and question
+  can enter the matcher as an inferred response; later fragments and fragmented queries remain
+  skipped. Its response code is present only when there are no additional records or all declared
+  DNS records fit in that prefix.
+  `--full-fragments` additionally enables IPv4 reassembly across packet batches and implies
+  `--allow-fragments`. The DNS processor owns the reassembly state: a complete datagram enters the
+  existing UDP/DNS validation path only after the first and last fragments establish its bounds
+  and every byte is present. Incomplete responses may use the first-fragment inference on capacity
+  eviction or end of input; with monotonic capture, entries can also expire after the match
+  timeout. Fragmented queries require a complete datagram. A complete datagram
+  uses the final fragment's (`MF=0`) capture timestamp, while inferred responses use the first
+  fragment's timestamp. Reassembly state must
+  remain bounded in memory, and IPv6 fragments remain unsupported. A fragmented UDP datagram must
+  have an IP payload length equal to its UDP Length; mismatched fragment sets are rejected.
+  The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
   pointers must target prior, nonoverlapping names; enabling the fast path must not weaken that
   validation. For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
-  RFC 9619. A response cannot claim answer or authority records that are absent from its DNS
+  RFC 9619. A complete response cannot claim answer or authority records that are absent from its DNS
   payload, whether or not it has additional records. TSIG status extraction consumes and
   bounds-checks the declared Other Data, including the six-byte server time in BADTIME responses.
   Both paths accept

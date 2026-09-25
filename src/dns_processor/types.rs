@@ -108,7 +108,8 @@ impl QueryEventPayload {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResponseEventPayload {
-    pub(super) response_code: ProtoResponseCode,
+    /// None means a response was inferred from its first IPv4 fragment.
+    pub(super) response_code: Option<ProtoResponseCode>,
 }
 
 pub(super) enum Timeline<Record> {
@@ -401,6 +402,7 @@ pub(super) struct ShardProcessingResult {
     pub(super) dns_query_count: usize,
     pub(super) duplicated_query_count: usize,
     pub(super) dns_response_count: usize,
+    pub(super) fragmented_response_prefix_count: usize,
     pub(super) matched_query_response_count: usize,
     pub(super) timeout_query_count: usize,
     pub(super) matched_rtt_sum_micros: u64,
@@ -423,6 +425,9 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) query_class: u16,
     pub(super) opcode: u8,
     pub(super) response_code: ProtoResponseCode,
+    pub(super) partial_first_ipv4_fragment: bool,
+    /// Known only when all records needed to determine the response code are in the prefix.
+    pub(super) partial_response_code: Option<ProtoResponseCode>,
 }
 
 #[cfg(test)]

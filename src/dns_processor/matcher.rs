@@ -50,7 +50,7 @@ impl DnsProcessor {
         query_identity: &QueryIdentityKey,
         query_key: TimelineKey,
         response_timestamp_micros: i64,
-        response_code: ProtoResponseCode,
+        response_code: Option<ProtoResponseCode>,
     ) -> DnsRecord {
         let (id, name, client_ip, src_port, query_type, ..) = query_identity;
         DnsRecord {
@@ -61,7 +61,7 @@ impl DnsProcessor {
             id: *id,
             name: name.clone(),
             query_type: ProtoRecordType::from(*query_type),
-            response_code: Some(response_code),
+            response_code,
         }
     }
 
@@ -238,6 +238,11 @@ impl DnsProcessor {
     ) {
         let response_identity = self.response_identity_from_record(record);
         let response_key = self.timeline_key_from_record(record);
+        let response_code = if record.partial_first_ipv4_fragment {
+            record.partial_response_code
+        } else {
+            Some(record.response_code)
+        };
         *dns_response_count += 1;
 
         if let Some((_, query_handle)) = self.find_closest_query(
@@ -255,7 +260,7 @@ impl DnsProcessor {
                 &response_identity,
                 query_handle,
                 response_key.timestamp_micros,
-                record.response_code,
+                response_code,
             ));
             *matched_query_response_count += 1;
             *matched_rtt_sum_micros += response_key
@@ -263,12 +268,7 @@ impl DnsProcessor {
                 .saturating_sub(query_handle.timestamp_micros)
                 .max(0) as u64;
         } else {
-            self.insert_response_entry(
-                state,
-                response_identity,
-                response_key,
-                record.response_code,
-            );
+            self.insert_response_entry(state, response_identity, response_key, response_code);
         }
     }
 
@@ -408,7 +408,7 @@ impl DnsProcessor {
         state: &mut MatcherShardState,
         identity: ResponseIdentityKey,
         timeline_key: TimelineKey,
-        response_code: ProtoResponseCode,
+        response_code: Option<ProtoResponseCode>,
     ) {
         let payload = ResponseEventPayload { response_code };
 
@@ -557,6 +557,9 @@ impl DnsProcessor {
                 }),
             );
             if !record.is_query {
+                if record.partial_first_ipv4_fragment {
+                    result.fragmented_response_prefix_count += 1;
+                }
                 self.process_response(
                     &record,
                     state,

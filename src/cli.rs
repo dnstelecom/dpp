@@ -30,6 +30,8 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_v2 = parse_env_bool("DPP_V2");
     let env_affinity = parse_env_bool("DPP_AFFINITY");
     let env_dns_wire_fast_path = parse_env_bool("DPP_DNS_WIRE_FAST_PATH");
+    let env_allow_fragments = parse_env_bool("DPP_ALLOW_FRAGMENTS");
+    let env_full_fragments = parse_env_bool("DPP_FULL_FRAGMENTS");
     let env_monotonic_capture = parse_env_bool("DPP_MONOTONIC_CAPTURE");
     let env_threads = env::var("DPP_THREADS")
         .ok()
@@ -90,6 +92,8 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let silent = resolve_silent_mode(&matches, env_silent, output_target);
     let affinity = matches.get_flag("affinity") || env_affinity;
     let dns_wire_fast_path = matches.get_flag("dns_wire_fast_path") || env_dns_wire_fast_path;
+    let (allow_fragments, full_fragments) =
+        resolve_fragment_flags(&matches, env_allow_fragments, env_full_fragments);
     let monotonic_capture = matches.get_flag("monotonic_capture") || env_monotonic_capture;
 
     validate_parquet_only_flags(format, zstd, v2)?;
@@ -110,6 +114,8 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         bonded,
         anonymize,
         dns_wire_fast_path,
+        allow_fragments,
+        full_fragments,
     })
 }
 
@@ -126,6 +132,8 @@ fn build_cli(version: &'static str) -> Command {
   DPP_AFFINITY          Set to 'true' to apply CPU affinity to processing threads
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
+  DPP_ALLOW_FRAGMENTS   Set to 'true' to match queries with observable first IPv4 response fragments without reassembly
+  DPP_FULL_FRAGMENTS    Set to 'true' to reassemble IPv4 fragments and enable first-fragment response matching
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
   DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
@@ -234,6 +242,18 @@ LICENSE INFORMATION:
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("allow_fragments")
+                .long("allow-fragments")
+                .help("Match queries with observable first IPv4 response fragments without reassembly; full UDP/DNS content remains unverified")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("full_fragments")
+                .long("full-fragments")
+                .help("Reassemble IPv4 fragments into complete datagrams; also enables --allow-fragments")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("anonymize")
                 .long("anonymize")
                 .help("Name of the key file")
@@ -272,6 +292,12 @@ fn parse_env_bool(key: &str) -> bool {
             || value.eq_ignore_ascii_case("on")
             || value == "1"
     })
+}
+
+fn resolve_fragment_flags(matches: &ArgMatches, env_allow: bool, env_full: bool) -> (bool, bool) {
+    let full_fragments = matches.get_flag("full_fragments") || env_full;
+    let allow_fragments = matches.get_flag("allow_fragments") || env_allow || full_fragments;
+    (allow_fragments, full_fragments)
 }
 
 fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Result<u64> {
@@ -647,6 +673,39 @@ mod tests {
             .expect("cli parses");
 
         assert!(matches.get_flag("monotonic_capture"));
+    }
+
+    #[test]
+    fn cli_allow_fragments_flag_is_opt_in() {
+        let default_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(!default_matches.get_flag("allow_fragments"));
+
+        let enabled_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--allow-fragments", "input.pcap"])
+            .expect("cli parses");
+        assert!(enabled_matches.get_flag("allow_fragments"));
+    }
+
+    #[test]
+    fn full_fragments_implies_allow_fragments() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--full-fragments", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(resolve_fragment_flags(&matches, false, false), (true, true));
+
+        let default_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_fragment_flags(&default_matches, false, true),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_fragment_flags(&default_matches, false, false),
+            (false, false)
+        );
     }
 
     #[test]

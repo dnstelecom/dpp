@@ -465,7 +465,7 @@ fn insert_response(
         response.packet_ordinal,
         response.record_ordinal,
     );
-    processor.insert_response_entry(state, identity, key, response.response_code);
+    processor.insert_response_entry(state, identity, key, Some(response.response_code));
 }
 
 fn make_query_record(packet_ordinal: u64, record_ordinal: u32) -> ProcessedDnsRecord {
@@ -492,6 +492,8 @@ fn make_query_record_with_timestamp(
         query_class: 1,
         opcode: 0,
         response_code: HickoryResponseCode::ServFail.into(),
+        partial_first_ipv4_fragment: false,
+        partial_response_code: None,
     }
 }
 
@@ -515,6 +517,8 @@ fn make_response_record_with_timestamp(
         query_class: 1,
         opcode: 0,
         response_code: HickoryResponseCode::NoError.into(),
+        partial_first_ipv4_fragment: false,
+        partial_response_code: None,
     }
 }
 

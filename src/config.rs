@@ -166,6 +166,8 @@ pub(crate) struct AppConfig {
     pub(crate) bonded: usize,
     pub(crate) anonymize: Option<PathBuf>,
     pub(crate) dns_wire_fast_path: bool,
+    pub(crate) allow_fragments: bool,
+    pub(crate) full_fragments: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -283,6 +285,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 

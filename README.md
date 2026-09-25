@@ -204,6 +204,8 @@ Notes:
 | `--v2`                            | Use Parquet Version 2                                                                                               |
 | `-a, --affinity`                  | Apply CPU affinity to processing threads                                                                            |
 | `--dns-wire-fast-path`            | Enable the optional question-only DNS wire fast path with `hickory` fallback                                        |
+| `--allow-fragments`               | Opt in to matching complete queries with first IPv4 response fragments when the DNS header and question are present; no reassembly |
+| `--full-fragments`                | Reassemble IPv4 fragments into complete UDP datagrams; also enables `--allow-fragments` for incomplete responses |
 | `--anonymize <path>`              | Path to the pseudonymization key file                                                                               |
 | `-h, --help`                      | Print help                                                                                                          |
 | `-V, --version`                   | Print version                                                                                                       |
@@ -424,6 +426,8 @@ What this tells you:
 - the first query for example.com A was matched with a response about 20.736 ms later;
 - the second query for example.org A had no matching response within the timeout window;
 - empty response_timestamp and response_code mean timeout.
+- a response_timestamp with an empty response_code means a first-fragment response prefix matched,
+  but the complete response code was unavailable.
 
 ### A simple AWK analysis to measure DNS traffic latency
 ```bash
@@ -502,15 +506,22 @@ Additional notes:
 - DPP auto-sizes its execution budget from all available CPUs.
 - Historical `--threads` and `DPP_THREADS` inputs are accepted only as deprecated compatibility no-ops and emit a warning if used.
 - The parser fast path is opt-in through `--dns-wire-fast-path` or `DPP_DNS_WIRE_FAST_PATH=1`; without that flag DPP uses the legacy `hickory` question decoder.
+- `--allow-fragments` or `DPP_ALLOW_FRAGMENTS=1` optionally pairs a query with the observable first IPv4 fragment of a response when its DNS header and complete question are present. `response_code` is populated when there are no additional records or every declared DNS record fits in the first fragment; otherwise it is empty. The JSON metric `fragmented_response_prefix_count` (text: `Accepted first IPv4 response fragments`) counts accepted prefixes, including ones without a matching query.
+- `--full-fragments` or `DPP_FULL_FRAGMENTS=1` enables IPv4 reassembly and implicitly enables `--allow-fragments`. Complete fragmented UDP datagrams enter the existing DNS parser with the timestamp of their final IPv4 fragment (`MF=0`). An incomplete first response fragment falls back to the prefix heuristic on capacity eviction or end of input; with `--monotonic-capture`, it can also expire after the configured match timeout. The fallback keeps the first fragment's timestamp. Fragmented queries require complete reassembly. Overlapping, inconsistent, or UDP-length-mismatched fragment sets are rejected.
 - For captures normalized with `reordercap`, `--monotonic-capture` can reduce in-flight matcher state by enabling batched timeout eviction. If a timestamp regression is detected, DPP fails the run instead of silently weakening matching semantics.
 - Global allocator choice is a build-time concern. See [docs/allocator-guide.md](docs/allocator-guide.md) for the supported allocator matrix and [benches/allocator-benchmarking.md](benches/allocator-benchmarking.md) for the comparison protocol.
 
 ## Limitations
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
-- DPP does not reassemble IPv4 or IPv6 fragments. IPv6 Hop-by-Hop, Routing, Destination Options,
-  Authentication and atomic Fragment headers are traversed before UDP; fragments requiring
-  reassembly, ESP and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
+- By default, IPv4 fragments are skipped. `--allow-fragments` uses only an observed first IPv4
+  response fragment when its DNS header and complete question are available. This heuristic cannot
+  confirm that later fragments arrived or validate the full UDP/DNS contents; the response code
+  may be unknown if needed records are beyond the first fragment. `--full-fragments` reconstructs
+  complete IPv4 datagrams before the existing UDP/DNS checks and falls back to the first-response
+  heuristic for incomplete sets. Neither mode reassembles IPv6 fragments. IPv6 Hop-by-Hop, Routing,
+  Destination Options, Authentication and atomic Fragment headers are traversed before UDP; ESP
+  and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
 - If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
   from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.

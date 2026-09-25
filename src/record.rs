@@ -11,8 +11,9 @@ use std::net::IpAddr;
 
 /// Canonical exported DNS record contract shared by CSV and Parquet writers.
 ///
-/// Timeout records leave response fields absent, which encodes "no matching response was observed
-/// inside the configured timeout window".
+/// Timeout records leave both response fields absent. A response timestamp with no response code
+/// means a query was paired with an observed first IPv4 response fragment, but the DNS response
+/// code could not be determined from the available prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DnsRecord {
     pub(crate) request_timestamp: i64,

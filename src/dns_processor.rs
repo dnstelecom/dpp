@@ -9,6 +9,7 @@ mod anonymizer;
 mod matcher;
 mod parser;
 mod pipeline;
+mod reassembly;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -25,6 +26,8 @@ pub struct DnsProcessor {
     dns_wire_fast_path: bool,
     match_timeout_micros: i64,
     monotonic_capture: bool,
+    allow_fragments: bool,
+    full_fragments: bool,
 }
 
 impl DnsProcessor {
@@ -65,7 +68,20 @@ impl DnsProcessor {
             dns_wire_fast_path,
             match_timeout_micros,
             monotonic_capture,
+            allow_fragments: false,
+            full_fragments: false,
         })
+    }
+
+    pub fn with_allow_fragments(mut self, allow_fragments: bool) -> Self {
+        self.allow_fragments = allow_fragments;
+        self
+    }
+
+    pub fn with_full_fragments(mut self, full_fragments: bool) -> Self {
+        self.full_fragments = full_fragments;
+        self.allow_fragments |= full_fragments;
+        self
     }
 
     fn anonymize_ip(&self, ip: &IpAddr) -> IpAddr {

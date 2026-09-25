@@ -35,7 +35,7 @@ use std::os::fd::AsFd;
 pub struct PacketPayload(Box<[u8]>);
 
 impl PacketPayload {
-    fn owned(data: Box<[u8]>) -> Self {
+    pub(crate) fn owned(data: Box<[u8]>) -> Self {
         Self(data)
     }
 

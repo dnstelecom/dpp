@@ -19,6 +19,7 @@ use std::thread;
 
 use super::DnsProcessor;
 use super::parser::{CanonicalFlowKey, PacketProcessingOutcome, ParsedUdpDnsMeta};
+use super::reassembly::Ipv4FragmentReassembler;
 use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::{OutputMessage, OutputRecordBatches};
@@ -45,6 +46,7 @@ fn staged_aggregator_affinity_slot(worker_count: usize) -> usize {
 
 struct PipelineCounters {
     oversized_qname_message_count: usize,
+    fragmented_response_prefix_count: usize,
     dns_query_count: usize,
     duplicated_query_count: usize,
     dns_response_count: usize,
@@ -59,6 +61,7 @@ impl Default for PipelineCounters {
     fn default() -> Self {
         Self {
             oversized_qname_message_count: 0,
+            fragmented_response_prefix_count: 0,
             dns_query_count: 0,
             duplicated_query_count: 0,
             dns_response_count: 0,
@@ -76,6 +79,7 @@ pub(crate) struct ProcessingCounters {
     pub(crate) total_packets_processed: usize,
     /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
     pub(crate) oversized_qname_message_count: usize,
+    pub(crate) fragmented_response_prefix_count: usize,
     pub(crate) dns_query_count: usize,
     pub(crate) duplicated_query_count: usize,
     pub(crate) dns_response_count: usize,
@@ -92,6 +96,7 @@ impl PipelineCounters {
         output_closed: &AtomicBool,
     ) -> bool {
         self.oversized_qname_message_count += shard_result.oversized_qname_message_count;
+        self.fragmented_response_prefix_count += shard_result.fragmented_response_prefix_count;
         self.dns_query_count += shard_result.dns_query_count;
         self.duplicated_query_count += shard_result.duplicated_query_count;
         self.dns_response_count += shard_result.dns_response_count;
@@ -118,6 +123,7 @@ impl PipelineCounters {
         ProcessingCounters {
             total_packets_processed,
             oversized_qname_message_count: self.oversized_qname_message_count,
+            fragmented_response_prefix_count: self.fragmented_response_prefix_count,
             dns_query_count: self.dns_query_count,
             duplicated_query_count: self.duplicated_query_count,
             dns_response_count: self.dns_response_count,
@@ -395,6 +401,7 @@ impl ShardRoutingPlan {
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
     merged.oversized_qname_message_count += shard_result.oversized_qname_message_count;
+    merged.fragmented_response_prefix_count += shard_result.fragmented_response_prefix_count;
     merged.dns_query_count += shard_result.dns_query_count;
     merged.duplicated_query_count += shard_result.duplicated_query_count;
     merged.dns_response_count += shard_result.dns_response_count;
@@ -519,6 +526,7 @@ fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
 fn route_batch_to_worker_batches(
     mut packet_batch: PacketBatch,
     routing_plan: &ShardRoutingPlan,
+    allow_fragments: bool,
 ) -> RoutedWorkerBatches {
     let shard_count = routing_plan.shard_count();
     debug_assert!(shard_count > 0);
@@ -541,8 +549,10 @@ fn route_batch_to_worker_batches(
         .collect();
 
     for packet_data in packet_batch {
-        let Some(udp_dns_meta) = DnsProcessor::packet_routing_meta(packet_data.data.as_slice())
-        else {
+        let Some(udp_dns_meta) = DnsProcessor::packet_routing_meta_with_fragments(
+            packet_data.data.as_slice(),
+            allow_fragments,
+        ) else {
             continue;
         };
 
@@ -556,6 +566,23 @@ fn route_batch_to_worker_batches(
         batch_max_timestamp_micros,
         worker_batches,
     }
+}
+
+fn route_batch_with_reassembly(
+    packet_batch: PacketBatch,
+    routing_plan: &ShardRoutingPlan,
+    reassembler: &mut Ipv4FragmentReassembler,
+) -> RoutedWorkerBatches {
+    let input_max_timestamp_micros = packet_batch
+        .iter()
+        .map(|packet| packet.timestamp_micros)
+        .max();
+    let (packets, oldest_pending_timestamp_micros) = reassembler.process_batch(packet_batch);
+    let mut routed = route_batch_to_worker_batches(packets, routing_plan, true);
+    routed.batch_max_timestamp_micros = input_max_timestamp_micros.map(|timestamp| {
+        oldest_pending_timestamp_micros.map_or(timestamp, |pending| timestamp.min(pending))
+    });
+    routed
 }
 
 fn parse_shard_packets(
@@ -605,17 +632,49 @@ fn run_phase_processing_worker(
         vec![MatcherShardState::default()]
     };
     let routing_plan = ShardRoutingPlan::new(shard_count, shard_count);
+    let mut reassembler = dns_processor.full_fragments.then(|| {
+        Ipv4FragmentReassembler::new(
+            dns_processor.match_timeout_micros,
+            dns_processor.monotonic_capture,
+        )
+    });
 
     let mut counters = PipelineCounters::default();
-    while let Ok(packet_batch) = batch_rx.recv() {
+    loop {
+        let received = batch_rx.recv();
+        let final_flush = received.is_err();
         if output_closed.load(AtomicOrdering::Relaxed) {
             break;
         }
 
+        let routed = match received {
+            Ok(packet_batch) => {
+                if let Some(reassembler) = reassembler.as_mut() {
+                    route_batch_with_reassembly(packet_batch, &routing_plan, reassembler)
+                } else {
+                    route_batch_to_worker_batches(
+                        packet_batch,
+                        &routing_plan,
+                        dns_processor.allow_fragments,
+                    )
+                }
+            }
+            Err(_) => {
+                let Some(reassembler) = reassembler.as_mut() else {
+                    break;
+                };
+                let remaining = reassembler.finish();
+                if remaining.is_empty() {
+                    break;
+                }
+                route_batch_to_worker_batches(remaining, &routing_plan, true)
+            }
+        };
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches: shard_batches,
-        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
+        } = routed;
 
         let mut shard_results: Vec<(usize, ShardProcessingResult)> = shard_batches
             .into_par_iter()
@@ -640,6 +699,9 @@ fn run_phase_processing_worker(
             if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
                 return Ok(counters);
             }
+        }
+        if final_flush {
+            break;
         }
     }
 
@@ -669,18 +731,46 @@ fn run_parser_stage(
     worker_txs: Vec<Sender<MatcherBatchWork>>,
     routing_plan: ShardRoutingPlan,
     output_closed: Arc<AtomicBool>,
+    allow_fragments: bool,
+    full_fragments: bool,
+    match_timeout_micros: i64,
+    monotonic_capture: bool,
 ) -> anyhow::Result<()> {
     let mut batch_seq = 0_u64;
+    let mut reassembler = full_fragments
+        .then(|| Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture));
 
-    while let Ok(packet_batch) = batch_rx.recv() {
+    loop {
+        let received = batch_rx.recv();
+        let final_flush = received.is_err();
         if output_closed.load(AtomicOrdering::Relaxed) {
             break;
         }
 
+        let routed = match received {
+            Ok(packet_batch) => {
+                if let Some(reassembler) = reassembler.as_mut() {
+                    route_batch_with_reassembly(packet_batch, &routing_plan, reassembler)
+                } else {
+                    route_batch_to_worker_batches(packet_batch, &routing_plan, allow_fragments)
+                }
+            }
+            Err(_) => {
+                let Some(reassembler) = reassembler.as_mut() else {
+                    break;
+                };
+                let remaining = reassembler.finish();
+                if remaining.is_empty() {
+                    break;
+                }
+                route_batch_to_worker_batches(remaining, &routing_plan, true)
+            }
+        };
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
+        } = routed;
 
         for (worker_idx, shard_packets) in worker_batches.into_iter().enumerate() {
             worker_txs[worker_idx]
@@ -706,6 +796,9 @@ fn run_parser_stage(
         }
 
         batch_seq = batch_seq.wrapping_add(1);
+        if final_flush {
+            break;
+        }
     }
 
     Ok(())
@@ -915,13 +1008,26 @@ fn run_staged_processing_pipeline(
         .name("DPP_Parser".to_string())
         .spawn({
             let output_closed = Arc::clone(&output_closed);
+            let allow_fragments = dns_processor.allow_fragments;
+            let full_fragments = dns_processor.full_fragments;
+            let match_timeout_micros = dns_processor.match_timeout_micros;
+            let monotonic_capture = dns_processor.monotonic_capture;
             let affinity_plan = affinity_plan.clone();
             move || {
                 affinity_plan.apply_to_current_thread(
                     staged_parser_affinity_slot(worker_count),
                     "staged parser",
                 );
-                run_parser_stage(batch_rx, worker_txs, routing_plan, output_closed)
+                run_parser_stage(
+                    batch_rx,
+                    worker_txs,
+                    routing_plan,
+                    output_closed,
+                    allow_fragments,
+                    full_fragments,
+                    match_timeout_micros,
+                    monotonic_capture,
+                )
             }
         })?;
 
@@ -1609,6 +1715,140 @@ mod tests {
     }
 
     #[test]
+    fn full_ipv4_reassembly_crosses_packet_batch_boundary_in_both_pipeline_models() {
+        let path = temp_test_path("pipeline-cross-batch-ipv4-fragments", "pcap");
+        let mut query_payload = encode_dns_header(0x3456, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        // The OPT record changes the full RCODE to EDNS_BADVERS and is split
+        // between the two IP fragments.
+        response_payload.extend_from_slice(&[0, 0, 41, 4, 208, 1, 0, 0, 0, 0, 0]);
+
+        let query = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let padding = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+        let first_end = 14 + 20 + 40;
+        let mut first_fragment = response[..first_end].to_vec();
+        first_fragment[16..18].copy_from_slice(&60_u16.to_be_bytes());
+        first_fragment[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        first_fragment[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+        let mut final_fragment = response[..34].to_vec();
+        final_fragment[16..18]
+            .copy_from_slice(&(20_u16 + (response.len() - first_end) as u16).to_be_bytes());
+        final_fragment[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        final_fragment[20..22].copy_from_slice(&5_u16.to_be_bytes());
+        final_fragment.extend_from_slice(&response[first_end..]);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE + 1);
+        packets.push((1, 0, query.as_slice()));
+        packets.push((1, 100_000, first_fragment.as_slice()));
+        packets.extend(std::iter::repeat_n(
+            (1, 150_000, padding.as_slice()),
+            PACKET_BATCH_SIZE - packets.len(),
+        ));
+        packets.push((1, 200_000, final_fragment.as_slice()));
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+
+        // A pending first fragment holds the monotonic matcher watermark at
+        // its timestamp even when later unrelated packets fill the batch.
+        let mut cap_parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let first_batch = cap_parser
+            .next_batch(PACKET_BATCH_SIZE)
+            .expect("batch reads")
+            .expect("first batch exists");
+        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
+        let routed = route_batch_with_reassembly(
+            first_batch,
+            &ShardRoutingPlan::new(1, 1),
+            &mut reassembler,
+        );
+        assert_eq!(routed.batch_max_timestamp_micros, Some(1_100_000));
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(
+                    DnsProcessor::new_with_runtime_options(None, true, 1_200_000, true)
+                        .expect("processor initializes")
+                        .with_full_fragments(true),
+                ),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                ExecutionBudget::from_available_cpus(available_cpus),
+                AffinityPlan::disabled(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+
+            assert_eq!(
+                counters.total_packets_processed,
+                PACKET_BATCH_SIZE + 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_response_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.matched_query_response_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.timeout_query_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(parser.non_monotonic_timestamp_count(), 0);
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    other => panic!("unexpected output message: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].request_timestamp, 1_000_000);
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            assert_eq!(
+                records[0].response_code.map(|code| code.to_string()),
+                Some("EDNS_BADVERS".to_string())
+            );
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
@@ -1630,7 +1870,7 @@ mod tests {
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1));
+        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1), false);
 
         let ordered_packets = worker_batches[0]
             .iter()
@@ -1764,6 +2004,7 @@ mod tests {
         } = route_batch_to_worker_batches(
             oversized_qname_batch("matcher-worker-oversized-qname"),
             &ShardRoutingPlan::new(1, 1),
+            false,
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1813,6 +2054,7 @@ mod tests {
         } = route_batch_to_worker_batches(
             unresolved_query_batch("matcher-worker-signal-shutdown"),
             &ShardRoutingPlan::new(1, 1),
+            false,
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);

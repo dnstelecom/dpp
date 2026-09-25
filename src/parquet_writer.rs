@@ -351,6 +351,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -389,6 +391,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -427,6 +431,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let writer = create_parquet_writer(
             SharedSink {
@@ -467,6 +473,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -506,6 +514,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -570,6 +580,8 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let mut writer = create_parquet_writer(file, &config).expect("creates parquet writer");

@@ -65,6 +65,35 @@ fn append_opt_record(dns_payload: &mut Vec<u8>, extended_high: u8, edns_version:
     dns_payload.extend_from_slice(&0_u16.to_be_bytes());
 }
 
+fn fragment_ipv4_udp_packet(packet: &[u8], first_payload_len: usize) -> (Vec<u8>, Vec<u8>) {
+    const IPV4_START: usize = 14;
+    const IPV4_HEADER_LEN: usize = 20;
+    assert_eq!(
+        first_payload_len % 8,
+        0,
+        "nonfinal fragment must be 8-byte aligned"
+    );
+    let first_end = IPV4_START + IPV4_HEADER_LEN + first_payload_len;
+    assert!(first_end < packet.len(), "fixture needs a later fragment");
+
+    let mut first_fragment = packet[..first_end].to_vec();
+    first_fragment[IPV4_START + 2..IPV4_START + 4]
+        .copy_from_slice(&((IPV4_HEADER_LEN + first_payload_len) as u16).to_be_bytes());
+    first_fragment[IPV4_START + 4..IPV4_START + 6].copy_from_slice(&0x4321_u16.to_be_bytes());
+    first_fragment[IPV4_START + 6..IPV4_START + 8].copy_from_slice(&0x2000_u16.to_be_bytes());
+
+    let remaining_payload = &packet[first_end..];
+    let mut later_fragment = packet[..IPV4_START + IPV4_HEADER_LEN].to_vec();
+    later_fragment[IPV4_START + 2..IPV4_START + 4]
+        .copy_from_slice(&((IPV4_HEADER_LEN + remaining_payload.len()) as u16).to_be_bytes());
+    later_fragment[IPV4_START + 4..IPV4_START + 6].copy_from_slice(&0x4321_u16.to_be_bytes());
+    later_fragment[IPV4_START + 6..IPV4_START + 8]
+        .copy_from_slice(&((first_payload_len / 8) as u16).to_be_bytes());
+    later_fragment.extend_from_slice(remaining_payload);
+
+    (first_fragment, later_fragment)
+}
+
 #[cfg(unix)]
 fn wait_for_child_exit(child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -267,6 +296,202 @@ fn matched_query_response_pair_round_trips_to_exact_csv_record() {
 
     fs::remove_file(&input_path).expect("remove input pcap");
     fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn ipv4_first_fragment_response_requires_opt_in_and_later_fragment_is_ignored() {
+    let input_path = temp_test_path("first-fragment-response", "pcap");
+    let default_output_path = temp_test_path("first-fragment-default", "csv");
+    let fragment_output_path = temp_test_path("first-fragment-enabled", "csv");
+
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut query_payload);
+
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    response_payload[6..8].copy_from_slice(&1_u16.to_be_bytes());
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut response_payload);
+    // The answer starts in the first fragment and ends in the second one.
+    response_payload.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+    // An OPT record beyond the first fragment can change the full RCODE.
+    append_opt_record(&mut response_payload, 0, 0);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let (first_fragment, later_fragment) = fragment_ipv4_udp_packet(&response_packet, 40);
+
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[
+            (1, 0, &query_packet),
+            (1, 200_000, &first_fragment),
+            (1, 200_001, &later_fragment),
+        ]),
+    )
+    .expect("fragmented test pcap written");
+
+    let default_result = Command::new(dpp_binary())
+        .arg("-s")
+        .arg(&input_path)
+        .arg(&default_output_path)
+        .output()
+        .expect("dpp executed without fragment mode");
+    assert!(
+        default_result.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&default_result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&default_output_path).expect("default CSV readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,,10.0.0.1,53000,4660,example.com,A,\n"
+        )
+    );
+
+    let fragment_result = Command::new(dpp_binary())
+        .arg("-s")
+        .arg("--allow-fragments")
+        .arg(&input_path)
+        .arg(&fragment_output_path)
+        .output()
+        .expect("dpp executed with fragment mode");
+    assert!(
+        fragment_result.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&fragment_result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fragment_output_path).expect("fragment CSV readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200000,10.0.0.1,53000,4660,example.com,A,\n"
+        )
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(default_output_path).expect("remove default output csv");
+    fs::remove_file(fragment_output_path).expect("remove fragment output csv");
+}
+
+#[test]
+fn full_ipv4_fragment_reassembly_recovers_extended_response_code_once() {
+    let input_path = temp_test_path("full-fragments-edns", "pcap");
+    let output_path = temp_test_path("full-fragments-edns", "csv");
+
+    let mut query_payload = encode_dns_header(0x2345, 0x0100, 1);
+    query_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut query_payload);
+    append_opt_record(&mut query_payload, 0, 0);
+
+    let mut response_payload = encode_dns_header(0x2345, 0x8180, 1);
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut response_payload);
+    append_opt_record(&mut response_payload, 1, 0);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    // The first fragment contains the DNS header and question, but only the
+    // beginning of the OPT record that carries the extended response code.
+    let (first_fragment, later_fragment) = fragment_ipv4_udp_packet(&response_packet, 40);
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[
+            (1, 0, &query_packet),
+            (1, 200_000, &first_fragment),
+            (1, 200_001, &later_fragment),
+        ]),
+    )
+    .expect("fragmented EDNS test pcap written");
+
+    let result = Command::new(dpp_binary())
+        .arg("-s")
+        .arg("--full-fragments")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed with full fragment reassembly");
+    assert!(
+        result.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("full fragment CSV readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200001,10.0.0.1,53000,9029,example.com,A,EDNS_BADVERS\n"
+        )
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(output_path).expect("remove output csv");
+}
+
+#[test]
+fn full_ipv4_fragment_mode_falls_back_to_first_fragment_at_eof() {
+    let input_path = temp_test_path("full-fragments-incomplete", "pcap");
+    let output_path = temp_test_path("full-fragments-incomplete", "csv");
+
+    let mut query_payload = encode_dns_header(0x2345, 0x0100, 1);
+    append_example_a_query(&mut query_payload);
+    let mut response_payload = encode_dns_header(0x2345, 0x8180, 1);
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut response_payload);
+    append_opt_record(&mut response_payload, 1, 0);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let (first_fragment, _missing_later_fragment) = fragment_ipv4_udp_packet(&response_packet, 40);
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[(1, 0, &query_packet), (1, 200_000, &first_fragment)]),
+    )
+    .expect("incomplete fragment pcap written");
+
+    let result = Command::new(dpp_binary())
+        .arg("-s")
+        .arg("--full-fragments")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed with full fragment mode");
+    assert!(
+        result.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("incomplete fragment CSV readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200000,10.0.0.1,53000,9029,example.com,A,\n"
+        )
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(output_path).expect("remove output csv");
 }
 
 #[test]
