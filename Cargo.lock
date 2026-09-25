@@ -681,6 +681,7 @@ dependencies = [
  "itoa",
  "memchr",
  "mimalloc",
+ "nix",
  "num-format",
  "parquet",
  "pbkdf2",

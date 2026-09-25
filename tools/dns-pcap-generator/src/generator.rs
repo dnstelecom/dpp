@@ -92,6 +92,7 @@ struct GeneratorState<'a> {
     resolvers: Vec<Ipv4Addr>,
     next_packet_ordinal: u64,
     current_timestamp: Duration,
+    fractional_interarrival_nanoseconds: f64,
     summary: GenerationSummary,
 }
 
@@ -106,6 +107,7 @@ impl<'a> GeneratorState<'a> {
             resolvers: build_resolver_pool(config.resolvers),
             next_packet_ordinal: 0,
             current_timestamp: Duration::from_secs(config.start_epoch_seconds),
+            fractional_interarrival_nanoseconds: 0.0,
             summary: GenerationSummary::default(),
         }
     }
@@ -113,8 +115,11 @@ impl<'a> GeneratorState<'a> {
     fn run<W: Write>(&mut self, writer: &mut PcapWriter<W>) -> Result<()> {
         for _ in 0..self.config.transactions {
             self.summary.logical_transactions += 1;
-            let interarrival = self.sample_interarrival_duration();
-            self.current_timestamp += interarrival;
+            let interarrival = self.sample_interarrival_duration()?;
+            self.current_timestamp = self
+                .current_timestamp
+                .checked_add(interarrival)
+                .ok_or(Error::TimestampOutOfRange)?;
 
             self.flush_due_packets(writer, self.current_timestamp)?;
 
@@ -188,10 +193,23 @@ impl<'a> GeneratorState<'a> {
         Ok(())
     }
 
-    fn sample_interarrival_duration(&mut self) -> Duration {
+    fn sample_interarrival_duration(&mut self) -> Result<Duration> {
         let uniform = (1.0 - self.rng.next_f64()).clamp(f64::MIN_POSITIVE, 1.0);
         let seconds = -uniform.ln() / self.config.qps;
-        Duration::from_micros((seconds.mul_add(1_000_000.0, 0.0).round() as u64).max(1))
+        if !seconds.is_finite() || seconds >= u64::MAX as f64 {
+            return Err(Error::TimestampOutOfRange);
+        }
+        // Keep sub-microsecond inter-arrivals in the scheduler. Classic PCAP
+        // truncates timestamps to microseconds when packets are written, so
+        // multiple queries can legitimately share one capture timestamp.
+        let nanoseconds = seconds
+            .fract()
+            .mul_add(1_000_000_000.0, self.fractional_interarrival_nanoseconds);
+        let whole_nanoseconds = nanoseconds.floor();
+        self.fractional_interarrival_nanoseconds = nanoseconds - whole_nanoseconds;
+        Duration::from_secs(seconds.trunc() as u64)
+            .checked_add(Duration::from_nanos(whole_nanoseconds as u64))
+            .ok_or(Error::TimestampOutOfRange)
     }
 
     fn sample_duplicate_count(&mut self) -> u8 {
@@ -313,6 +331,9 @@ impl<'a> GeneratorState<'a> {
         timestamp: Duration,
         bytes: Vec<u8>,
     ) -> Result<()> {
+        if timestamp.as_secs() > u64::from(u32::MAX) {
+            return Err(Error::TimestampOutOfRange);
+        }
         self.summary.first_timestamp.get_or_insert(timestamp);
         self.summary.last_timestamp = Some(timestamp);
 

@@ -102,6 +102,10 @@ as large as 1003 bytes and remains valid input; DPP preserves it for matching an
 replacing it with an empty name.
 Both question decoders reject compression pointers that point forward or overlap the current name.
 The fast path's fallback must not become a way to accept a message the semantic decoder rejects.
+Ordinary QUERY messages (OPCODE 0) with QDCOUNT greater than one are malformed under RFC 9619 and
+are rejected by both decoders. Responses that declare answer or authority records must contain
+those complete records even when ARCOUNT is zero; the decoder checks their wire boundaries before
+the matcher sees the response.
 
 If any decompressed QNAME exceeds the wire limit, the entire DNS message is rejected before matcher
 or writer handoff. The processing counter `oversized_qname_message_count` increments exactly once

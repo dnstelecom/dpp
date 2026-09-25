@@ -80,6 +80,9 @@ The checked-in `server1-jul-2024` profile points its `catalog_path` at the works
 truth instead of being duplicated inside the profile directory. Runtime failures are reported
 through typed CLI errors, so invalid arguments and I/O failures surface with stable top-level
 messages and source chains.
+Catalog rows with zero weights or DNS names longer than 255 wire bytes are rejected, as are fitted
+profiles whose `duplicate_max` is below every configured retry count. Generation returns an error
+if a packet timestamp exceeds the classic PCAP 32-bit seconds range.
 
 ## Model
 
@@ -89,9 +92,12 @@ messages and source chains.
 - `--clients` is validated against the distinct address capacity of that client pool, which is
   4,161,536 synthetic client IPs.
 - Inter-arrival times are sampled from an exponential distribution around the configured `--qps`.
-- Duplicate retries use increasing retry delays so slow or unanswered lookups produce realistic
-  retry spacing; unanswered transactions keep long retransmit backoff, while answered retries stay
-  short enough not to distort matched RTT.
+  The generator schedules them at nanosecond precision with fractional carry. Classic PCAP stores
+  microsecond timestamps, so at high QPS multiple packets can share a timestamp without imposing
+  a one-microsecond minimum gap on the generated rate.
+- Duplicate retries use the profile's fitted delay for each retry step. These delays are not
+  necessarily increasing: the first unanswered steps have long backoff, while later fitted or
+  hypothesized steps can be much shorter. A response follows the last retry.
 - Matched response latency is calibrated from the local `server1_jul_2024.csv` distribution:
   most replies land in a few dozen microseconds, with a rare long tail and heavier `ServFail`
   delays.

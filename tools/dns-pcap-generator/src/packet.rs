@@ -13,6 +13,7 @@ use std::net::Ipv4Addr;
 pub(crate) const DNS_PORT: u16 = 53;
 pub(crate) const MAX_SYNTHETIC_CLIENTS: usize = 64 * 256 * 254;
 pub(crate) const MAX_SYNTHETIC_RESOLVERS: usize = 203 * 256;
+const MAX_DNS_NAME_WIRE_LEN: usize = 255;
 const IPV4_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
 pub(crate) const ROOT_NAME_SERVER_TARGETS: &[&str] = &[
@@ -256,7 +257,20 @@ fn synthetic_ptr_target_for_name(name: &str) -> String {
     format!("ptr-{:016x}.synthetic.example", value)
 }
 
+pub(crate) fn validate_dns_name(qname: &str) -> Result<()> {
+    visit_dns_labels(qname, |_| {})
+}
+
 fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
+    visit_dns_labels(qname, |label| {
+        buffer.push(label.len() as u8);
+        buffer.extend_from_slice(label);
+    })?;
+    buffer.push(0);
+    Ok(())
+}
+
+fn visit_dns_labels(qname: &str, mut visit: impl FnMut(&[u8])) -> Result<()> {
     if qname.is_empty() {
         return Err(Error::EmptyDnsName);
     }
@@ -268,10 +282,10 @@ fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
     };
 
     if canonical.is_empty() {
-        buffer.push(0);
         return Ok(());
     }
 
+    let mut wire_len = 1; // Final root label.
     for label in canonical.split('.') {
         if label.is_empty() {
             return Err(Error::EmptyDnsLabel {
@@ -283,11 +297,15 @@ fn append_dns_name(buffer: &mut Vec<u8>, qname: &str) -> Result<()> {
                 label: label.to_string(),
             });
         }
-        buffer.push(label.len() as u8);
-        buffer.extend_from_slice(label.as_bytes());
+        wire_len += 1 + label.len();
+        if wire_len > MAX_DNS_NAME_WIRE_LEN {
+            return Err(Error::DnsNameTooLong {
+                qname: qname.to_string(),
+            });
+        }
+        visit(label.as_bytes());
     }
 
-    buffer.push(0);
     Ok(())
 }
 

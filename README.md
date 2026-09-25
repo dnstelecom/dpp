@@ -254,6 +254,8 @@ history is needed or allocated.
 
 DNS QR determines query/response direction, including valid exchanges with UDP port 53 on both
 endpoints. QCLASS and OPCODE distinguish transactions internally and do not add output columns.
+Ordinary DNS QUERY messages with more than one question are rejected under RFC 9619. Responses
+whose declared answer or authority records are truncated are also rejected before matching.
 
 For QNAME matching, DPP preserves the observed presentation-form name bytes and does not lowercase
 them before building matcher identity keys. This is a deliberate Community Edition trade-off, not
@@ -297,7 +299,10 @@ its own file while making the end-of-run report easy to capture and parse.
 If DPP receives `SIGINT` or `SIGTERM`, it stops accepting new packet batches, drains already
 accepted work, skips synthetic timeout finalization for pending unmatched queries, discards any
 still-buffered output tail, and then exits. This applies to CSV and Parquet outputs alike. The
-final JSON summary reports this through the `warnings.graceful_signal_shutdown` field.
+final JSON summary reports this through the `warnings.graceful_signal_shutdown` field. When input
+comes from stdin, shutdown does not require the stream producer to close its end of the pipe.
+If a signal arrives before a capture header can be read, no output writer or final report is
+created.
 
 The final report now also includes basic processing and matching-quality metrics:
 

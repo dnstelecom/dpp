@@ -76,6 +76,16 @@ pub enum Error {
         source: std::num::ParseIntError,
     },
 
+    #[error("catalog weight at line {line} must be greater than 0")]
+    ZeroCatalogWeight { line: usize },
+
+    #[error("invalid DNS name in catalog at line {line}")]
+    InvalidCatalogName {
+        line: usize,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("failed to read catalog '{path}'")]
     CatalogRead {
         path: PathBuf,
@@ -132,6 +142,12 @@ pub enum Error {
 
     #[error("DNS label '{label}' exceeds 63 bytes")]
     DnsLabelTooLong { label: String },
+
+    #[error("DNS name '{qname}' exceeds 255 wire bytes")]
+    DnsNameTooLong { qname: String },
+
+    #[error("generated timestamp exceeds the classic PCAP 32-bit seconds range")]
+    TimestampOutOfRange,
 
     #[error("profile '{profile}' must expose at least {minimum} positive domains, found {found}")]
     ProfileTooFewPositiveDomains {
