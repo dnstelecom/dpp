@@ -15,6 +15,21 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::process::Stdio;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use nix::poll::{PollFd, PollFlags, poll};
+#[cfg(unix)]
+use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
+use nix::unistd::Pid;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::process::Child;
 
 fn dpp_binary() -> &'static str {
     env!("CARGO_BIN_EXE_dpp")
@@ -48,6 +63,149 @@ fn append_opt_record(dns_payload: &mut Vec<u8>, extended_high: u8, edns_version:
     dns_payload.extend_from_slice(&1232_u16.to_be_bytes());
     dns_payload.extend_from_slice(&[extended_high, edns_version, 0, 0]);
     dns_payload.extend_from_slice(&0_u16.to_be_bytes());
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("child status is available")
+            .is_some()
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stalled child is killed");
+            child.wait().expect("killed child is reaped");
+            panic!("DPP did not exit promptly after the termination signal");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_output_creation(child: &mut Child, path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            child
+                .try_wait()
+                .expect("child status is available")
+                .is_none(),
+            "DPP exited before its output writer was created"
+        );
+        if Instant::now() >= deadline {
+            child.kill().expect("stalled child is killed");
+            child.wait().expect("killed child is reaped");
+            panic!("DPP did not create its output writer");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_stdin_start_log(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut logs = Vec::new();
+    while !logs
+        .windows(b"Starting to process PCAP stream from stdin".len())
+        .any(|window| window == b"Starting to process PCAP stream from stdin")
+    {
+        if Instant::now() >= deadline {
+            child.kill().expect("stalled child is killed");
+            child.wait().expect("killed child is reaped");
+            panic!("DPP did not reach stdin initialization");
+        }
+        let ready = {
+            let stderr = child.stderr.as_ref().expect("stderr is piped");
+            let mut fds = [PollFd::new(stderr.as_fd(), PollFlags::POLLIN)];
+            poll(&mut fds, 100_u16).expect("stderr readiness is polled")
+        };
+        if ready != 0 {
+            let mut buf = [0_u8; 2048];
+            let read = child
+                .stderr
+                .as_mut()
+                .expect("stderr is piped")
+                .read(&mut buf)
+                .expect("startup log is readable");
+            assert_ne!(read, 0, "DPP exited before stdin initialization");
+            logs.extend_from_slice(&buf[..read]);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_open_stdin_signal_test(name: &str, bytes: &[u8], signal: Signal, has_header: bool) {
+    let output_path = temp_test_path(name, "csv");
+    let mut child = Command::new(dpp_binary())
+        .args([
+            "--report-format",
+            if has_header { "json" } else { "text" },
+            "-",
+        ])
+        .arg(&output_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("DPP starts");
+
+    if !has_header {
+        wait_for_stdin_start_log(&mut child);
+    }
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin.write_all(bytes).expect("capture bytes are written");
+    if has_header {
+        wait_for_output_creation(&mut child, &output_path);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child
+            .try_wait()
+            .expect("child status is available")
+            .is_none(),
+        "DPP must still be waiting on the open stdin pipe"
+    );
+
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).expect("PID fits i32")),
+        signal,
+    )
+    .expect("termination signal is sent");
+    wait_for_child_exit(&mut child);
+    let output = child.wait_with_output().expect("DPP output is collected");
+    assert!(
+        output.status.success(),
+        "DPP did not shut down cleanly: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    if has_header {
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON report parses");
+        assert_eq!(
+            report["warnings"]["graceful_signal_shutdown"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&output_path).expect("CSV writer closed and flushed"),
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n"
+        );
+        fs::remove_file(&output_path).expect("remove output csv");
+    } else {
+        assert!(
+            output.stdout.is_empty(),
+            "no summary exists before capture setup"
+        );
+        assert!(!output_path.exists(), "writer was not initialized");
+    }
+
+    // Keep the parent end of the pipe open until after DPP exits. A closed pipe
+    // would test EOF handling instead of signal cancellation.
+    drop(stdin);
 }
 
 #[test]
@@ -502,6 +660,58 @@ fn stdin_pcapng_stream_round_trips_to_exact_csv_record() {
     );
 
     fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_stops_classic_pcap_stdin_without_eof() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut dns_payload);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let bytes = classic_pcap_bytes(&[(1, 0, &packet)]);
+    run_open_stdin_signal_test("sigint-classic-open-pipe", &bytes, Signal::SIGINT, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_stops_pcapng_stdin_mid_block_without_eof() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut dns_payload);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let mut bytes = pcapng_bytes(&[(1_000_000, &packet)]);
+    // A complete next block prefix declares a body that never arrives. This
+    // exercises read_exact/read_to_end cancellation while stdin stays open.
+    bytes.extend_from_within(..12);
+    run_open_stdin_signal_test("sigint-pcapng-mid-block", &bytes, Signal::SIGINT, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_classic_pcap_stdin_mid_record_without_eof() {
+    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut dns_payload);
+    let packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
+    let mut bytes = classic_pcap_bytes(&[(1, 0, &packet)]);
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&64_u32.to_le_bytes());
+    bytes.extend_from_slice(&64_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0_u8; 3]);
+    run_open_stdin_signal_test("sigterm-classic-mid-record", &bytes, Signal::SIGTERM, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_stops_stdin_probe_before_capture_header_without_eof() {
+    run_open_stdin_signal_test(
+        "sigint-before-capture-header",
+        &[0xd4, 0xc3, 0xb2],
+        Signal::SIGINT,
+        false,
+    );
 }
 
 #[test]

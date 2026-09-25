@@ -571,8 +571,22 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         )
         .map_err(|source| AppRunError::DnsProcessorInit { source })?,
     );
-    let mut packet_parser = PacketParser::new(&args.input_source, args.monotonic_capture)
-        .map_err(|source| AppRunError::PacketParserInit { source })?;
+    let mut packet_parser = match PacketParser::new_with_shutdown(
+        &args.input_source,
+        args.monotonic_capture,
+        Arc::clone(&shutdown_requested),
+    ) {
+        Ok(parser) => parser,
+        Err(error)
+            if matches!(args.input_source, InputSource::Stdin)
+                && shutdown_requested.load(AtomicOrdering::SeqCst)
+                && crate::packet_parser::is_stdin_shutdown_error(&error) =>
+        {
+            // No capture header was parsed, so no output writer exists to shut down.
+            return Ok(());
+        }
+        Err(source) => return Err(AppRunError::PacketParserInit { source }),
+    };
 
     let (tx, rx) = channel::bounded(args.output_channel_message_capacity());
     let (max_memory_usage, memory_thread) = runtime::maybe_start_memory_monitoring(args.silent)?;

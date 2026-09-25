@@ -415,6 +415,12 @@ impl DnsProcessor {
         }
     }
 
+    #[inline]
+    fn invalid_question_count(opcode: u8, query_count: usize) -> bool {
+        // RFC 9619 limits standard QUERY messages to one question.
+        opcode == 0 && query_count > 1
+    }
+
     fn decode_dns_questions_fast(
         dns_data: &[u8],
         decode_extended_rcode: bool,
@@ -425,12 +431,16 @@ impl DnsProcessor {
 
         let id = Self::parse_u16_at(dns_data, 0, "Failed to parse DNS header")?;
         let flags = Self::parse_u16_at(dns_data, 2, "Failed to parse DNS header")?;
+        let opcode = ((flags >> 11) & 0x0f) as u8;
         let low_response_code = (flags & 0x000f) as u8;
         let query_count = usize::from(Self::parse_u16_at(
             dns_data,
             4,
             "Failed to parse DNS question count",
         )?);
+        if Self::invalid_question_count(opcode, query_count) {
+            return Err(DnsQuestionDecodeError::Invalid);
+        }
 
         let mut cursor = DNS_HEADER_LEN;
         let mut queries = Vec::with_capacity(query_count);
@@ -454,35 +464,38 @@ impl DnsProcessor {
         let mut response_code =
             ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
         if decode_extended_rcode {
-            let additional_count = usize::from(Self::parse_u16_at(
-                dns_data,
-                10,
-                "Failed to parse DNS additional count",
-            )?);
-            if additional_count > 0 {
-                response_code = Self::decode_response_code_with_additionals(
+            let section_counts = DnsSectionCounts {
+                answers: usize::from(Self::parse_u16_at(
+                    dns_data,
+                    6,
+                    "Failed to parse DNS answer count",
+                )?),
+                authorities: usize::from(Self::parse_u16_at(
+                    dns_data,
+                    8,
+                    "Failed to parse DNS authority count",
+                )?),
+                additionals: usize::from(Self::parse_u16_at(
+                    dns_data,
+                    10,
+                    "Failed to parse DNS additional count",
+                )?),
+            };
+            if section_counts.answers > 0
+                || section_counts.authorities > 0
+                || section_counts.additionals > 0
+            {
+                response_code = Self::decode_response_code_with_sections(
                     dns_data,
                     cursor,
-                    DnsSectionCounts {
-                        answers: usize::from(Self::parse_u16_at(
-                            dns_data,
-                            6,
-                            "Failed to parse DNS answer count",
-                        )?),
-                        authorities: usize::from(Self::parse_u16_at(
-                            dns_data,
-                            8,
-                            "Failed to parse DNS authority count",
-                        )?),
-                        additionals: additional_count,
-                    },
+                    section_counts,
                     low_response_code,
                 )?;
             }
         }
         let header = DecodedDnsHeader {
             id,
-            opcode: ((flags >> 11) & 0x0f) as u8,
+            opcode,
             response_code,
         };
 
@@ -495,11 +508,19 @@ impl DnsProcessor {
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         let mut decoder = BinDecoder::new(dns_data);
         let header = Header::read(&mut decoder).map_err(|_| DnsQuestionDecodeError::Invalid)?;
+        let opcode: u8 = header.op_code.into();
+        if Self::invalid_question_count(opcode, header.counts.queries as usize) {
+            return Err(DnsQuestionDecodeError::Invalid);
+        }
         let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
             .map_err(Self::classify_hickory_question_error)?;
         let mut response_code = ProtoResponseCode::from(header.response_code);
-        if decode_extended_rcode && header.counts.additionals > 0 {
-            response_code = Self::decode_response_code_with_additionals(
+        if decode_extended_rcode
+            && (header.counts.answers > 0
+                || header.counts.authorities > 0
+                || header.counts.additionals > 0)
+        {
+            response_code = Self::decode_response_code_with_sections(
                 dns_data,
                 decoder.index(),
                 DnsSectionCounts {
@@ -514,7 +535,7 @@ impl DnsProcessor {
         Ok((
             DecodedDnsHeader {
                 id: header.id,
-                opcode: header.op_code.into(),
+                opcode,
                 response_code,
             },
             queries
@@ -531,7 +552,7 @@ impl DnsProcessor {
         ))
     }
 
-    fn decode_response_code_with_additionals(
+    fn decode_response_code_with_sections(
         dns_data: &[u8],
         mut cursor: usize,
         section_counts: DnsSectionCounts,
@@ -1269,7 +1290,7 @@ mod protocol_regression_tests {
         assert!(DnsProcessor::read_wire_domain_name(&overlap, &mut 3).is_err());
         assert!(Name::read(&mut BinDecoder::new(&overlap).clone(3)).is_err());
 
-        let mut dns = question(0x0100, 1);
+        let mut dns = question(0x0900, 1);
         dns[4..6].copy_from_slice(&2_u16.to_be_bytes());
         dns.extend_from_slice(b"\xc0\x0c\0\x1c\0\x01");
         for processor in processors() {

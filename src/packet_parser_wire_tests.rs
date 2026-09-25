@@ -123,6 +123,7 @@ fn parser(bytes: Vec<u8>) -> PacketParser {
     PacketParser {
         backend: PacketBackend::from_stream(Box::new(Cursor::new(bytes)), "wire-fixture")
             .expect("stream opens"),
+        stdin_shutdown: None,
         enforce_monotonic_timestamps: false,
         packet_ordinal: 0,
         last_timestamp_micros: None,

@@ -16,10 +16,19 @@ use pcap_file::pcapng::{
 };
 use pcap_file::{DataLink, Endianness};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
+use std::io::{self, BufRead, BufReader, Cursor, ErrorKind, Read};
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
+
+#[cfg(unix)]
+use nix::errno::Errno;
+#[cfg(unix)]
+use nix::poll::{PollFd, PollFlags, poll};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
 /// Packet payload storage that remains valid after batch handoff to worker threads.
 #[derive(Clone, Debug)]
@@ -63,6 +72,7 @@ pub(crate) fn sort_packet_batch(packet_batch: &mut [PacketData]) {
 /// A parser for reading packets from an offline capture source.
 pub struct PacketParser {
     backend: PacketBackend,
+    stdin_shutdown: Option<Arc<AtomicBool>>,
     enforce_monotonic_timestamps: bool,
     packet_ordinal: u64,
     last_timestamp_micros: Option<i64>,
@@ -90,10 +100,13 @@ enum PacketBackend {
 }
 
 impl PacketBackend {
-    fn from_input_source(input_source: &InputSource) -> Result<Self> {
+    fn from_input_source(
+        input_source: &InputSource,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self> {
         match input_source {
             InputSource::File(path) => Self::from_file(path),
-            InputSource::Stdin => Self::from_stdin(),
+            InputSource::Stdin => Self::from_stdin(shutdown_requested),
         }
     }
 
@@ -118,13 +131,13 @@ impl PacketBackend {
         Ok(Self::Libpcap(capture))
     }
 
-    #[cfg(not(windows))]
-    fn from_stdin() -> Result<Self> {
-        Self::from_stream(Box::new(std::io::stdin()), "stdin")
+    #[cfg(unix)]
+    fn from_stdin(shutdown_requested: Arc<AtomicBool>) -> Result<Self> {
+        Self::from_stream(Box::new(StdinReader::new(shutdown_requested)), "stdin")
     }
 
-    #[cfg(windows)]
-    fn from_stdin() -> Result<Self> {
+    #[cfg(not(unix))]
+    fn from_stdin(_shutdown_requested: Arc<AtomicBool>) -> Result<Self> {
         anyhow::bail!("Reading the input capture from stdin is not supported on Windows.")
     }
 
@@ -187,9 +200,25 @@ impl PacketParser {
     ///
     /// Classic pcap files use a pure-Rust streaming reader. Other formats fall back to libpcap to
     /// preserve existing compatibility assumptions. Stdin uses parser-owned streaming readers.
+    #[cfg(test)]
     pub fn new(input_source: &InputSource, enforce_monotonic_timestamps: bool) -> Result<Self> {
+        Self::new_with_shutdown(
+            input_source,
+            enforce_monotonic_timestamps,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn new_with_shutdown(
+        input_source: &InputSource,
+        enforce_monotonic_timestamps: bool,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let stdin_shutdown =
+            matches!(input_source, InputSource::Stdin).then(|| Arc::clone(&shutdown_requested));
         Ok(Self {
-            backend: PacketBackend::from_input_source(input_source)?,
+            backend: PacketBackend::from_input_source(input_source, shutdown_requested)?,
+            stdin_shutdown,
             enforce_monotonic_timestamps,
             packet_ordinal: 0,
             last_timestamp_micros: None,
@@ -206,7 +235,20 @@ impl PacketParser {
         let mut packet_buffer: PacketBatch = Vec::with_capacity(chunk_size.min(PACKET_BATCH_SIZE));
 
         while packet_buffer.len() < chunk_size {
-            match self.backend.next_packet_data()? {
+            if self.stdin_shutdown_requested() {
+                return Ok(None);
+            }
+
+            let next_packet = match self.backend.next_packet_data() {
+                Err(error)
+                    if self.stdin_shutdown_requested() && is_stdin_shutdown_error(&error) =>
+                {
+                    return Ok(None);
+                }
+                result => result?,
+            };
+
+            match next_packet {
                 Some(packet) => {
                     if let Some(previous_timestamp_micros) = self.last_timestamp_micros
                         && packet.timestamp_micros < previous_timestamp_micros
@@ -256,6 +298,86 @@ impl PacketParser {
 
     pub(crate) fn first_non_monotonic_timestamp(&self) -> Option<NonMonotonicTimestampSample> {
         self.first_non_monotonic_timestamp
+    }
+
+    fn stdin_shutdown_requested(&self) -> bool {
+        self.stdin_shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(AtomicOrdering::SeqCst))
+    }
+}
+
+#[derive(Debug)]
+struct StdinReadCancelled;
+
+impl std::fmt::Display for StdinReadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stdin read cancelled by termination signal")
+    }
+}
+
+impl std::error::Error for StdinReadCancelled {}
+
+pub(crate) fn is_stdin_shutdown_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<StdinReadCancelled>()
+            || cause
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<StdinReadCancelled>())
+    })
+}
+
+#[cfg(unix)]
+struct StdinReader {
+    stdin: io::Stdin,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl StdinReader {
+    fn new(shutdown_requested: Arc<AtomicBool>) -> Self {
+        Self {
+            stdin: io::stdin(),
+            shutdown_requested,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.shutdown_requested.load(AtomicOrdering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Read for StdinReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.cancelled() {
+                return Err(io::Error::other(StdinReadCancelled));
+            }
+
+            // ctrlc installs SA_RESTART, so a blocking read cannot rely on EINTR for
+            // cancellation. Polling keeps the only stdin reader owned by this parser.
+            let mut fds = [PollFd::new(self.stdin.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, 50_u16) {
+                Ok(0) | Err(Errno::EINTR) => continue,
+                Ok(_) => {
+                    if self.cancelled() {
+                        return Err(io::Error::other(StdinReadCancelled));
+                    }
+                    match nix::unistd::read(&self.stdin, buf) {
+                        Ok(read) => return Ok(read),
+                        Err(Errno::EINTR) => continue,
+                        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+                    }
+                }
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+            }
+        }
     }
 }
 
@@ -652,6 +774,7 @@ mod tests {
         PacketParser {
             backend: PacketBackend::from_stream(Box::new(Cursor::new(bytes)), "test-stream")
                 .expect("stream parser opens"),
+            stdin_shutdown: None,
             enforce_monotonic_timestamps: false,
             packet_ordinal: 0,
             last_timestamp_micros: None,

@@ -588,7 +588,7 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
 
 #[test]
 fn packet_processing_appends_records_with_final_ordinals() {
-    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x0900, 2);
     append_example_query(&mut dns_payload);
     dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
     dns_payload.extend_from_slice(&28_u16.to_be_bytes());
@@ -628,7 +628,7 @@ fn packet_processing_appends_records_with_final_ordinals() {
 
 #[test]
 fn packet_processing_failure_does_not_append_partial_records() {
-    let mut oversized = encode_dns_header(0x1234, 0x8180, 2);
+    let mut oversized = encode_dns_header(0x1234, 0x8980, 2);
     append_example_query(&mut oversized);
     append_repeated_byte_question(
         &mut oversized,
@@ -636,7 +636,7 @@ fn packet_processing_failure_does_not_append_partial_records() {
         1,
     );
 
-    let mut malformed = encode_dns_header(0x1234, 0x0100, 2);
+    let mut malformed = encode_dns_header(0x1234, 0x0900, 2);
     append_example_query(&mut malformed);
     malformed.extend_from_slice(&[3, b'a']);
 
@@ -712,7 +712,7 @@ fn packet_processing_zero_questions_leaves_destination_unchanged() {
 
 #[test]
 fn packet_processing_response_appends_only_first_question() {
-    let mut dns_payload = encode_dns_header(0x1234, 0x8180, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x8980, 2);
     append_example_query(&mut dns_payload);
     dns_payload.extend_from_slice(&[3, b'w', b'w', b'w', 0xC0, 0x0C]);
     dns_payload.extend_from_slice(&28_u16.to_be_bytes());
@@ -1800,7 +1800,7 @@ fn parser_rejects_oversized_wire_qname_in_both_decoder_modes() {
 
 #[test]
 fn parser_rejects_oversized_compressed_qname_by_expanded_wire_length() {
-    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x0900, 2);
     append_repeated_byte_question(
         &mut dns_payload,
         &[(63, b'a'), (63, b'a'), (63, b'a'), (61, b'a')],
@@ -1831,7 +1831,7 @@ fn parser_rejects_oversized_compressed_qname_by_expanded_wire_length() {
 
 #[test]
 fn parser_accepts_compressed_qname_at_exact_expanded_wire_limit() {
-    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x0900, 2);
     append_repeated_byte_question(
         &mut dns_payload,
         &[(63, b'a'), (63, b'a'), (63, b'a'), (59, b'a')],
@@ -1921,7 +1921,7 @@ fn parser_does_not_count_malformed_forward_pointer_as_oversized_qname() {
 #[test]
 fn parser_decodes_multiple_wire_questions_including_compression() {
     let processor = test_processor_with_dns_wire_fast_path();
-    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x0900, 2);
     dns_payload.extend_from_slice(&[
         7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ]);
@@ -1946,6 +1946,30 @@ fn parser_decodes_multiple_wire_questions_including_compression() {
     assert_eq!(records[0].response_code, HickoryResponseCode::ServFail);
     assert_eq!(records[1].name.as_str(), "www.example.com");
     assert_eq!(records[1].query_type, HickoryRecordType::AAAA);
+}
+
+#[test]
+fn parser_rejects_multiple_questions_for_standard_query_opcode() {
+    for (flags, is_response) in [(0x0100, false), (0x8180, true)] {
+        let mut dns_payload = encode_dns_header(0x1234, flags, 2);
+        append_example_query(&mut dns_payload);
+        append_example_query(&mut dns_payload);
+        let packet = if is_response {
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns_payload)
+        } else {
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload)
+        };
+
+        for (fast_path, processor) in [
+            (false, test_processor()),
+            (true, test_processor_with_dns_wire_fast_path()),
+        ] {
+            assert!(
+                processor.process_packet_batch(&packet, 1_234_567).is_none(),
+                "is_response={is_response}, fast_path={fast_path}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1978,6 +2002,54 @@ fn parser_decodes_response_code_from_wire_header() {
             "fast_path={fast_path}"
         );
     }
+}
+
+#[test]
+fn parser_rejects_missing_declared_answer_or_authority_without_additionals() {
+    let mut base = encode_dns_header(0xBEEF, 0x8180, 1);
+    append_example_query(&mut base);
+
+    let mut missing_answer = base.clone();
+    missing_answer[6..8].copy_from_slice(&1_u16.to_be_bytes());
+
+    let mut missing_authority = base.clone();
+    missing_authority[8..10].copy_from_slice(&1_u16.to_be_bytes());
+
+    let mut truncated_answer = missing_answer.clone();
+    truncated_answer.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0]);
+
+    let mut missing_authority_after_answer = missing_answer.clone();
+    missing_authority_after_answer[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    append_a_resource_record(
+        &mut missing_authority_after_answer,
+        &[0xC0, 0x0C],
+        60,
+        [1, 2, 3, 4],
+    );
+
+    for (case, payload) in [
+        ("missing answer", missing_answer),
+        ("missing authority", missing_authority),
+        ("truncated answer", truncated_answer),
+        (
+            "missing authority after answer",
+            missing_authority_after_answer,
+        ),
+    ] {
+        assert_response_payload_rejected(case, &payload);
+    }
+}
+
+#[test]
+fn parser_accepts_declared_answer_and_authority_without_additionals() {
+    let mut dns_payload = encode_dns_header(0xBEEF, 0x8180, 1);
+    dns_payload[6..8].copy_from_slice(&1_u16.to_be_bytes());
+    dns_payload[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_query(&mut dns_payload);
+    append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 60, [1, 2, 3, 4]);
+    append_a_resource_record(&mut dns_payload, &[0xC0, 0x0C], 30, [5, 6, 7, 8]);
+
+    assert_response_code_from_payload(&dns_payload, 0, "No Error");
 }
 
 #[test]
@@ -2093,7 +2165,7 @@ fn parser_rejects_wire_name_compression_loops() {
 fn parser_fast_path_flag_preserves_legacy_packet_output() {
     let legacy_processor = test_processor();
     let fast_path_processor = test_processor_with_dns_wire_fast_path();
-    let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
+    let mut dns_payload = encode_dns_header(0x1234, 0x0900, 2);
     dns_payload.extend_from_slice(&[
         7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
     ]);

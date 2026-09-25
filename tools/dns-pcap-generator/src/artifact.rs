@@ -396,6 +396,15 @@ fn validate_fitted_profile(profile: &RawFittedGeneratorProfile, path: &Path) -> 
         "duplicate_model.retry_count_weights",
         &profile.duplicate_model.retry_count_weights,
     )?;
+    let minimum_retry_count = profile.duplicate_model.retry_count_weights[0].retry_count;
+    if profile.generation_defaults.duplicate_max < minimum_retry_count {
+        return Err(invalid_fitted_profile(
+            path,
+            format!(
+                "generation_defaults.duplicate_max must be at least the first duplicate_model.retry_count_weights retry_count ({minimum_retry_count})"
+            ),
+        ));
+    }
     validate_response_codes(path, &profile.response_codes)?;
     validate_response_delay(path, &profile.response_delay)?;
     validate_retry_steps(

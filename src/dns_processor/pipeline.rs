@@ -1139,12 +1139,7 @@ mod tests {
 
     fn oversized_qname_batch(test_name: &str) -> PacketBatch {
         let path = temp_test_path(test_name, "pcap");
-        let mut dns_payload = encode_dns_header(0x1234, 0x0100, 2);
-        dns_payload.extend_from_slice(&[
-            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
-        ]);
-        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
-        dns_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let mut dns_payload = encode_dns_header(0x1234, 0x0100, 1);
 
         for label_len in [63_usize, 63, 63, 62] {
             dns_payload.push(label_len as u8);

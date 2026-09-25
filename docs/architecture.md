@@ -103,6 +103,8 @@ or second encoding of canonical addresses and ports.
   final signed timestamp. It never invokes the dependency's stateful timestamp conversion.
   Buffers grow with received block bytes rather than untrusted declared lengths. Stdin probing
   needs no temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
+  Signal-driven shutdown can interrupt a blocked stdin read without waiting for the producer to
+  close the stream; capture reading remains parser-owned.
   The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file` `3.0.0-rc1` release
   candidate until a stable line with the required functionality is available.
   The parser can also enforce globally monotonic capture timestamps for the optional batched
@@ -165,8 +167,11 @@ or second encoding of canonical addresses and ports.
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
   pointers must target prior, nonoverlapping names; enabling the fast path must not weaken that
-  validation. TSIG status extraction consumes and bounds-checks the declared Other Data, including
-  the six-byte server time in BADTIME responses. Both paths accept
+  validation. For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
+  RFC 9619. A response cannot claim answer or authority records that are absent from its DNS
+  payload, whether or not it has additional records. TSIG status extraction consumes and
+  bounds-checks the declared Other Data, including the six-byte server time in BADTIME responses.
+  Both paths accept
   decompressed wire QNAMEs up to the RFC 1035 limit of 255 octets, including label-length octets and
   the terminating root octet. A valid name can expand to 1003 bytes in escaped presentation form
   and must remain distinct through matching and export. If any QNAME exceeds the wire limit, the

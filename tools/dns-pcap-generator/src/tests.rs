@@ -147,6 +147,57 @@ fn catalog_exposes_large_domain_set() {
 }
 
 #[test]
+fn catalog_rejects_zero_weights_and_names_longer_than_dns_wire_limit() {
+    assert!(matches!(
+        load_catalog("0\texample.com\n"),
+        Err(Error::ZeroCatalogWeight { line: 1 })
+    ));
+
+    let long_name = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(62)
+    );
+    let error = load_catalog(&format!("1\t{long_name}\n"))
+        .expect_err("256-byte wire name must be rejected at catalog load");
+    assert!(matches!(
+        error,
+        Error::InvalidCatalogName { line: 1, source }
+            if matches!(*source, Error::DnsNameTooLong { .. })
+    ));
+}
+
+#[test]
+fn dns_name_wire_limit_accepts_255_bytes_and_rejects_256_bytes() {
+    let labels = ["a".repeat(63), "b".repeat(63), "c".repeat(63)];
+    let valid_name = format!(
+        "{}.{}.{}.{}",
+        labels[0],
+        labels[1],
+        labels[2],
+        "d".repeat(61)
+    );
+    let query = build_dns_query_payload(0x1234, &valid_name, DnsQuestionType::A)
+        .expect("255-byte wire name must encode");
+    assert_eq!(query.len(), 12 + 255 + 4);
+    assert_eq!(query[12 + 254], 0);
+
+    let invalid_name = format!(
+        "{}.{}.{}.{}",
+        labels[0],
+        labels[1],
+        labels[2],
+        "d".repeat(62)
+    );
+    assert!(matches!(
+        build_dns_query_payload(0x1234, &invalid_name, DnsQuestionType::A),
+        Err(Error::DnsNameTooLong { .. })
+    ));
+}
+
+#[test]
 fn sanitized_profile_contains_no_disallowed_domains() {
     let profile =
         load_profile_dir_artifact(&checked_in_profile_dir()).expect("checked-in profile loads");
@@ -321,6 +372,38 @@ fn profile_dir_loader_rejects_catalog_hash_mismatch() {
 }
 
 #[test]
+fn profile_dir_loader_rejects_duplicate_max_below_first_retry_count() {
+    let dir = temp_profile_dir("duplicate-max-below-first-retry");
+    write_profile_fixture(&dir);
+
+    let fitted_path = dir.join("fitted-generator.toml");
+    let fitted = fs::read_to_string(&fitted_path).expect("fitted profile read");
+    fs::write(
+        &fitted_path,
+        fitted
+            .replace(
+                "retry_count = 1, weight = 800",
+                "retry_count = 2, weight = 800",
+            )
+            .replace(
+                "retry_count = 2, weight = 200",
+                "retry_count = 3, weight = 200",
+            )
+            .replace("duplicate_max = 2", "duplicate_max = 1"),
+    )
+    .expect("fitted profile rewritten");
+
+    let error = load_profile_dir_artifact(&dir).expect_err("invalid retry cap must fail");
+    assert!(matches!(
+        error,
+        Error::FittedProfileInvalid { message, .. }
+            if message.contains("duplicate_max must be at least")
+    ));
+
+    fs::remove_dir_all(dir).expect("temp profile dir removed");
+}
+
+#[test]
 fn runtime_profile_dir_loader_accepts_small_extracted_catalogs() {
     let dir = temp_profile_dir("runtime-small-catalog");
     write_profile_fixture(&dir);
@@ -423,6 +506,93 @@ fn generated_pcap_round_trips_packet_count_and_timestamp_order() {
     }
 
     assert_eq!(packet_count, summary.total_packets());
+
+    fs::remove_dir_all(dir).expect("temp profile dir removed");
+}
+
+#[test]
+fn million_qps_capture_preserves_rate_and_timestamp_order() {
+    let mut config = test_config();
+    config.transactions = 20_000;
+    config.qps = 1_000_000.0;
+    config.duplicate_rate = 0.0;
+    config.timeout_rate = 0.0;
+
+    let dir = temp_profile_dir("million-qps");
+    write_profile_fixture(&dir);
+    let profile = load_profile_dir_artifact(&dir).expect("fixture profile loads");
+    let (writer, summary) =
+        write_capture(Cursor::new(Vec::new()), &config, &profile).expect("capture writes");
+
+    let mut reader = PcapReader::new(Cursor::new(writer.into_inner())).expect("pcap reader opens");
+    let mut first_timestamp = None;
+    let mut previous_timestamp = Duration::ZERO;
+    let mut timestamp_ties = 0;
+    let mut packet_count = 0;
+    while let Some(packet) = reader.next_packet() {
+        let packet = packet.expect("packet decodes");
+        first_timestamp.get_or_insert(packet.timestamp);
+        assert!(packet.timestamp >= previous_timestamp);
+        if packet.timestamp == previous_timestamp {
+            timestamp_ties += 1;
+        }
+        previous_timestamp = packet.timestamp;
+        packet_count += 1;
+    }
+
+    assert_eq!(packet_count, summary.total_packets());
+    assert!(
+        timestamp_ties > 0,
+        "microsecond PCAP must allow timestamp ties"
+    );
+    let span = (previous_timestamp - first_timestamp.expect("capture is nonempty")).as_secs_f64();
+    assert!(
+        (0.018..0.022).contains(&span),
+        "20,000 transactions at 1M QPS should span about 0.02s, got {span}s"
+    );
+
+    fs::remove_dir_all(dir).expect("temp profile dir removed");
+}
+
+#[test]
+fn extremely_low_qps_reports_timestamp_range_error_without_panicking() {
+    let mut config = test_config();
+    config.transactions = 1;
+    config.qps = f64::MIN_POSITIVE;
+
+    let dir = temp_profile_dir("tiny-qps");
+    write_profile_fixture(&dir);
+    let profile = load_profile_dir_artifact(&dir).expect("fixture profile loads");
+    let error = write_capture(Cursor::new(Vec::new()), &config, &profile)
+        .expect_err("unrepresentable capture timestamp must fail");
+    assert!(matches!(error, Error::TimestampOutOfRange));
+
+    fs::remove_dir_all(dir).expect("temp profile dir removed");
+}
+
+#[test]
+fn delayed_response_beyond_classic_pcap_range_reports_timestamp_error() {
+    let mut config = test_config();
+    config.transactions = 1;
+    config.qps = 1_000_000_000.0;
+    config.duplicate_rate = 0.0;
+    config.timeout_rate = 0.0;
+    config.start_epoch_seconds = u64::from(u32::MAX);
+
+    let dir = temp_profile_dir("response-timestamp-range");
+    write_profile_fixture(&dir);
+    let mut profile = load_profile_dir_artifact(&dir).expect("fixture profile loads");
+    let one_second_delay = crate::model::DelayBucket {
+        weight: 1,
+        min_us: 1_000_000,
+        max_us: 1_000_000,
+    };
+    profile.normal_response_delay_buckets = vec![one_second_delay];
+    profile.servfail_response_delay_buckets = vec![one_second_delay];
+
+    let error = write_capture(Cursor::new(Vec::new()), &config, &profile)
+        .expect_err("response timestamp after 2106 must fail");
+    assert!(matches!(error, Error::TimestampOutOfRange));
 
     fs::remove_dir_all(dir).expect("temp profile dir removed");
 }

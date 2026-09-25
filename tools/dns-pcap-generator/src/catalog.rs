@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::WeightedDomain;
+use crate::packet::validate_dns_name;
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
@@ -26,6 +27,15 @@ pub(crate) fn load_catalog(tsv: &str) -> Result<Vec<WeightedDomain>> {
                 line: line_number + 1,
                 source,
             })?;
+        if weight == 0 {
+            return Err(Error::ZeroCatalogWeight {
+                line: line_number + 1,
+            });
+        }
+        validate_dns_name(name).map_err(|source| Error::InvalidCatalogName {
+            line: line_number + 1,
+            source: Box::new(source),
+        })?;
         domains.push(WeightedDomain {
             name: Cow::Owned(name.to_string()),
             weight,
