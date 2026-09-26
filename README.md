@@ -428,7 +428,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.076  INFO Monotonic capture mode: enabled (batched timeout eviction active; timestamp regressions abort the run)
 04:15:01.076  INFO PID: 501755
 04:15:01.147  INFO Results will be written to: /mnt/mirror/src/dpp/dns_output.csv
-04:15:01.150  INFO Execution budget: auto using 4 CPUs, phase-parallel pipeline selected for low-core host, Rayon worker budget: 4
+04:15:01.150  INFO Execution budget: 4 CPUs, phase-parallel pipeline selected for low-core budget, Rayon worker budget: 4
 04:15:16.718  INFO Total packets processed: 40,000,000
 04:15:16.718  INFO Total DNS queries processed: 19,670,037
 04:15:16.718  INFO Deduplicated duplicate queries: 23,947
