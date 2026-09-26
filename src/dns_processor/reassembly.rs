@@ -13,6 +13,7 @@
 //! the existing `--allow-fragments` parser then decides whether its DNS prefix is usable.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::packet_parser::{PacketBatch, PacketData, PacketPayload};
 
@@ -32,6 +33,10 @@ const MAX_PENDING_DATAGRAMS: usize = 8_192;
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const ENTRY_OVERHEAD_ESTIMATE: usize = 256;
 const SEGMENT_OVERHEAD_ESTIMATE: usize = 64;
+const MAX_RECENT_COMPLETIONS: usize = 4_096;
+const MAX_RECENT_BYTES: usize = 16 * 1024 * 1024;
+const RECENT_ENTRY_OVERHEAD_ESTIMATE: usize = 128;
+const MIN_RECENT_RETENTION_MICROS: i64 = 5_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FragmentKey {
@@ -54,6 +59,18 @@ struct FragmentSegment {
     more_fragments: bool,
 }
 
+struct CompletedDatagram {
+    payload: Arc<[u8]>,
+    observed_timestamp: i64,
+    arrival_order: u64,
+}
+
+impl CompletedDatagram {
+    fn memory_bytes(&self) -> usize {
+        RECENT_ENTRY_OVERHEAD_ESTIMATE + self.payload.len()
+    }
+}
+
 enum FragmentInput {
     Ordinary,
     Skip,
@@ -70,11 +87,13 @@ struct PendingDatagram {
     final_payload_length: Option<usize>,
     final_fragment_event: Option<(i64, u64)>,
     segments: BTreeMap<usize, FragmentSegment>,
+    /// Present while every observed fragment matches a recently completed datagram.
+    recent_payload: Option<Arc<[u8]>>,
     rejected: bool,
 }
 
 impl PendingDatagram {
-    fn new(arrival_order: u64, timestamp: i64) -> Self {
+    fn new(arrival_order: u64, timestamp: i64, recent_payload: Option<Arc<[u8]>>) -> Self {
         Self {
             arrival_order,
             first_seen_timestamp: timestamp,
@@ -84,6 +103,7 @@ impl PendingDatagram {
             final_payload_length: None,
             final_fragment_event: None,
             segments: BTreeMap::new(),
+            recent_payload,
             rejected: false,
         }
     }
@@ -96,6 +116,10 @@ impl PendingDatagram {
                 .values()
                 .map(|segment| segment.payload.len() + SEGMENT_OVERHEAD_ESTIMATE)
                 .sum::<usize>()
+            + self
+                .recent_payload
+                .as_ref()
+                .map_or(0, |payload| payload.len())
     }
 
     fn reject(&mut self) {
@@ -105,12 +129,30 @@ impl PendingDatagram {
         self.final_payload_length = None;
         self.final_fragment_event = None;
         self.segments.clear();
+        self.recent_payload = None;
         self.rejected = true;
+    }
+
+    fn into_fallback(self) -> Option<PacketData> {
+        // A prefix whose observed bytes still match a completed datagram is a
+        // possible capture duplicate, not a second inferred DNS response.
+        if self.recent_payload.is_some() {
+            None
+        } else {
+            self.first
+        }
     }
 
     fn insert(&mut self, part: FragmentPart, packet: PacketData) -> Result<bool, ()> {
         if self.rejected {
             return Err(());
+        }
+        if self
+            .recent_payload
+            .as_ref()
+            .is_some_and(|payload| !fragment_matches_payload(&part, payload))
+        {
+            self.recent_payload = None;
         }
         let event = (packet.timestamp_micros, packet.packet_ordinal);
         let end = part.offset.checked_add(part.payload.len()).ok_or(())?;
@@ -269,6 +311,15 @@ impl PendingDatagram {
     }
 }
 
+fn fragment_matches_payload(part: &FragmentPart, payload: &[u8]) -> bool {
+    let Some(end) = part.offset.checked_add(part.payload.len()) else {
+        return false;
+    };
+    end <= payload.len()
+        && part.more_fragments == (end < payload.len())
+        && part.payload.as_ref() == &payload[part.offset..end]
+}
+
 fn ipv4_header_checksum(header: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for word in header.chunks_exact(2) {
@@ -286,6 +337,10 @@ pub(super) struct Ipv4FragmentReassembler {
     arrival_order: BTreeMap<u64, FragmentKey>,
     pending_bytes: usize,
     next_arrival_order: u64,
+    recently_completed: HashMap<FragmentKey, CompletedDatagram>,
+    completed_order: BTreeMap<u64, FragmentKey>,
+    completed_bytes: usize,
+    next_completed_order: u64,
     max_seen_timestamp: Option<i64>,
     timeout_micros: i64,
     monotonic_capture: bool,
@@ -298,6 +353,10 @@ impl Ipv4FragmentReassembler {
             arrival_order: BTreeMap::new(),
             pending_bytes: 0,
             next_arrival_order: 0,
+            recently_completed: HashMap::new(),
+            completed_order: BTreeMap::new(),
+            completed_bytes: 0,
+            next_completed_order: 0,
             max_seen_timestamp: None,
             timeout_micros: match_timeout_micros.max(1),
             monotonic_capture,
@@ -319,6 +378,7 @@ impl Ipv4FragmentReassembler {
                 FragmentInput::Ordinary => output.push(packet),
                 FragmentInput::Skip => {}
                 FragmentInput::Part(part) => {
+                    self.expire_completed_key_at(&part.key, packet.timestamp_micros);
                     self.expire_key_at(&part.key, packet.timestamp_micros, &mut output);
                     self.accept_part(part, packet, &mut output);
                     // One input batch may contain many large fragments. Enforce the
@@ -328,6 +388,7 @@ impl Ipv4FragmentReassembler {
             }
         }
         self.expire_old(&mut output);
+        self.expire_recent_completions();
         self.enforce_limits(&mut output);
         let oldest_pending_timestamp = self
             .pending
@@ -347,7 +408,7 @@ impl Ipv4FragmentReassembler {
                 Some(order)
             );
             if let Some(entry) = self.take_entry(&key)
-                && let Some(first) = entry.first
+                && let Some(first) = entry.into_fallback()
             {
                 output.push(first);
             }
@@ -357,15 +418,49 @@ impl Ipv4FragmentReassembler {
 
     fn accept_part(&mut self, part: FragmentPart, packet: PacketData, output: &mut PacketBatch) {
         let key = part.key;
-        let mut entry = self.take_entry(&key).unwrap_or_else(|| {
+        let observed_timestamp = packet.timestamp_micros;
+        let mut existing = self.take_entry(&key);
+        if existing.as_ref().is_some_and(|entry| {
+            entry.recent_payload.is_some()
+                && entry.first.is_some()
+                && part.offset == 0
+                && !fragment_matches_payload(
+                    &part,
+                    entry.recent_payload.as_ref().expect("checked above"),
+                )
+        }) {
+            // A different first fragment starts a new generation of this IPv4 ID.
+            // The old candidate matched a completed datagram and needs no fallback.
+            existing = None;
+        }
+        let recent_payload = self
+            .recently_completed
+            .get(&key)
+            .map(|entry| Arc::clone(&entry.payload));
+        let mut entry = existing.unwrap_or_else(|| {
             let arrival_order = self.next_arrival_order;
             self.next_arrival_order = self.next_arrival_order.wrapping_add(1);
-            PendingDatagram::new(arrival_order, packet.timestamp_micros)
+            PendingDatagram::new(arrival_order, observed_timestamp, recent_payload)
         });
         match entry.insert(part, packet) {
             Ok(true) => {
+                let previous_payload = entry.recent_payload.clone();
+                let header_len = entry
+                    .first_header_len
+                    .expect("complete datagram has first header");
                 if let Some(packet) = entry.into_packet() {
-                    output.push(packet);
+                    let payload = &packet.data[ETHERNET_HEADER_LEN + header_len..];
+                    if !previous_payload
+                        .as_ref()
+                        .is_some_and(|previous| previous.as_ref() == payload)
+                    {
+                        self.remember_completion(
+                            key,
+                            Arc::<[u8]>::from(payload),
+                            observed_timestamp,
+                        );
+                        output.push(packet);
+                    }
                 }
             }
             Ok(false) => self.insert_entry(key, entry),
@@ -391,6 +486,79 @@ impl Ipv4FragmentReassembler {
         Some(entry)
     }
 
+    fn remember_completion(
+        &mut self,
+        key: FragmentKey,
+        payload: Arc<[u8]>,
+        observed_timestamp: i64,
+    ) {
+        self.take_completion(&key);
+        let arrival_order = self.next_completed_order;
+        self.next_completed_order = self.next_completed_order.wrapping_add(1);
+        let completed = CompletedDatagram {
+            payload,
+            observed_timestamp,
+            arrival_order,
+        };
+        self.completed_bytes += completed.memory_bytes();
+        self.completed_order.insert(arrival_order, key);
+        self.recently_completed.insert(key, completed);
+        while self.recently_completed.len() > MAX_RECENT_COMPLETIONS
+            || self.completed_bytes > MAX_RECENT_BYTES
+        {
+            let Some((_, &oldest_key)) = self.completed_order.first_key_value() else {
+                break;
+            };
+            self.take_completion(&oldest_key);
+        }
+    }
+
+    fn take_completion(&mut self, key: &FragmentKey) -> Option<CompletedDatagram> {
+        let completed = self.recently_completed.remove(key)?;
+        self.completed_bytes -= completed.memory_bytes();
+        self.completed_order.remove(&completed.arrival_order);
+        Some(completed)
+    }
+
+    fn recent_retention_micros(&self) -> i64 {
+        self.timeout_micros.max(MIN_RECENT_RETENTION_MICROS)
+    }
+
+    fn expire_completed_key_at(&mut self, key: &FragmentKey, timestamp: i64) {
+        if !self.monotonic_capture {
+            // Capture timestamps may regress arbitrarily in normal mode. The
+            // entry and byte caps bound this history instead.
+            return;
+        }
+        let expired = self.recently_completed.get(key).is_some_and(|entry| {
+            timestamp.saturating_sub(entry.observed_timestamp) > self.recent_retention_micros()
+        });
+        if expired {
+            self.take_completion(key);
+        }
+    }
+
+    fn expire_recent_completions(&mut self) {
+        if !self.monotonic_capture {
+            return;
+        }
+        let Some(frontier) = self.max_seen_timestamp else {
+            return;
+        };
+        while let Some((_, &key)) = self.completed_order.first_key_value() {
+            let completed = self
+                .recently_completed
+                .get(&key)
+                .expect("completion order references a cached datagram");
+            if frontier.saturating_sub(completed.observed_timestamp)
+                <= self.recent_retention_micros()
+            {
+                break;
+            }
+            self.take_completion(&key);
+        }
+    }
+
     fn expire_old(&mut self, output: &mut PacketBatch) {
         if !self.monotonic_capture {
             // A timestamp regression can otherwise expire adjacent capture fragments.
@@ -411,7 +579,7 @@ impl Ipv4FragmentReassembler {
         // Hash iteration does not define output order; sorting is always explicit.
         for key in stale {
             if let Some(entry) = self.take_entry(&key)
-                && let Some(first) = entry.first
+                && let Some(first) = entry.into_fallback()
             {
                 output.push(first);
             }
@@ -424,7 +592,7 @@ impl Ipv4FragmentReassembler {
         });
         if expired
             && let Some(entry) = self.take_entry(key)
-            && let Some(first) = entry.first
+            && let Some(first) = entry.into_fallback()
         {
             output.push(first);
         }
@@ -436,7 +604,7 @@ impl Ipv4FragmentReassembler {
                 break;
             };
             if let Some(entry) = self.take_entry(&key)
-                && let Some(first) = entry.first
+                && let Some(first) = entry.into_fallback()
             {
                 output.push(first);
             }
@@ -570,6 +738,145 @@ mod tests {
         assert_eq!(&frame.data[20..22], &[0, 0]);
         assert_eq!(ipv4_header_checksum(&frame.data[14..34]), 0);
         assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn completed_datagram_does_not_fallback_duplicate_first_fragment() {
+        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
+        let (complete, pending) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(complete.len(), 1);
+        assert_eq!(pending, None);
+
+        let (duplicate, pending) = reassembler.process_batch(vec![packet(0, true, 3, 102)]);
+        assert!(duplicate.is_empty());
+        assert_eq!(pending, Some(102));
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn completed_datagram_is_not_emitted_again_from_duplicate_fragments() {
+        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
+        let (output, _) = reassembler.process_batch(vec![
+            packet(0, true, 1, 100),
+            packet(24, false, 2, 101),
+            packet(24, false, 3, 102),
+            packet(0, true, 4, 103),
+            packet(0, true, 5, 104),
+            packet(24, false, 6, 105),
+        ]);
+        assert_eq!(output.len(), 1);
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn reused_ipv4_id_with_different_payload_still_assembles() {
+        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
+        let (original, _) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(original.len(), 1);
+
+        let mut changed_last = packet(24, false, 4, 103);
+        let mut bytes = changed_last.data.as_slice().to_vec();
+        *bytes.last_mut().expect("fragment has payload") ^= 1;
+        changed_last.data = PacketPayload::owned(bytes.into_boxed_slice());
+        let (different_last, _) =
+            reassembler.process_batch(vec![packet(0, true, 3, 102), changed_last]);
+        assert_eq!(different_last.len(), 1);
+        assert_ne!(
+            different_last[0].data.as_slice(),
+            original[0].data.as_slice()
+        );
+
+        let mut changed_first = packet(0, true, 5, 104);
+        let mut bytes = changed_first.data.as_slice().to_vec();
+        bytes[ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN] ^= 1;
+        changed_first.data = PacketPayload::owned(bytes.into_boxed_slice());
+        let (different_first, _) =
+            reassembler.process_batch(vec![changed_first, packet(24, false, 6, 105)]);
+        assert_eq!(different_first.len(), 1);
+        assert_ne!(
+            different_first[0].data.as_slice(),
+            different_last[0].data.as_slice()
+        );
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn reused_ipv4_id_with_new_first_assembles_after_identical_orphan_last() {
+        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
+        let (original, _) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(original.len(), 1);
+
+        let mut changed_first = packet(0, true, 4, 103);
+        let mut bytes = changed_first.data.as_slice().to_vec();
+        bytes[ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN] ^= 1;
+        changed_first.data = PacketPayload::owned(bytes.into_boxed_slice());
+        let (new_datagram, pending) =
+            reassembler.process_batch(vec![packet(24, false, 3, 102), changed_first]);
+        assert_eq!(new_datagram.len(), 1);
+        assert_eq!(new_datagram[0].timestamp_micros, 102);
+        assert_eq!(pending, None);
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn timestamp_regression_does_not_forget_recent_completion() {
+        let mut reassembler = Ipv4FragmentReassembler::new(100, false);
+        let (complete, _) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(complete.len(), 1);
+        let (duplicate, _) = reassembler.process_batch(vec![packet(0, true, 3, -10_000_000)]);
+        assert!(duplicate.is_empty());
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn duplicate_first_fragment_does_not_fallback_on_timeout() {
+        let mut reassembler = Ipv4FragmentReassembler::new(100, true);
+        let (complete, _) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(complete.len(), 1);
+        reassembler.process_batch(vec![packet(0, true, 3, 102)]);
+
+        let ordinary = PacketData {
+            data: PacketPayload::owned(vec![0_u8; ETHERNET_HEADER_LEN].into_boxed_slice()),
+            timestamp_micros: 203,
+            packet_ordinal: 4,
+        };
+        let (output, pending) = reassembler.process_batch(vec![ordinary]);
+        assert_eq!(output.len(), 1);
+        assert_eq!(pending, None);
+        assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn recent_completion_window_expires_and_is_bounded() {
+        let mut reassembler = Ipv4FragmentReassembler::new(100, true);
+        let (first, _) =
+            reassembler.process_batch(vec![packet(0, true, 1, 100), packet(24, false, 2, 101)]);
+        assert_eq!(first.len(), 1);
+
+        let (later, _) = reassembler.process_batch(vec![
+            packet(0, true, 3, 5_000_102),
+            packet(24, false, 4, 5_000_103),
+        ]);
+        assert_eq!(later.len(), 1);
+
+        for id in 0..=MAX_RECENT_COMPLETIONS {
+            reassembler.remember_completion(
+                FragmentKey {
+                    source: [192, 0, 2, 1],
+                    destination: [192, 0, 2, 53],
+                    identification: id as u16,
+                },
+                Arc::<[u8]>::from(&b"payload"[..]),
+                5_000_103,
+            );
+        }
+        assert!(reassembler.recently_completed.len() <= MAX_RECENT_COMPLETIONS);
+        assert!(reassembler.completed_bytes <= MAX_RECENT_BYTES);
     }
 
     #[test]

@@ -177,8 +177,13 @@ or second encoding of canonical addresses and ports.
   eviction or end of input; with monotonic capture, entries can also expire after the match
   timeout. Fragmented queries require a complete datagram. A complete datagram
   uses the final fragment's (`MF=0`) capture timestamp, while inferred responses use the first
-  fragment's timestamp. Reassembly state must
-  remain bounded in memory, and IPv6 fragments remain unsupported. A fragmented UDP datagram must
+  fragment's timestamp. The reassembler retains a bounded history of completed datagrams and
+  compares the fragment key and UDP payload bytes before suppressing repeated complete datagrams
+  or prefix fallback from fragments matching a recent completion. A reused IPv4 ID with different
+  content can still produce a new datagram, even when its first fragment is identical. An incomplete
+  new datagram whose observed fragments match a recent completion is indistinguishable from a
+  duplicate and may be suppressed; the same holds for a fully identical new datagram. Reassembly
+  state must remain bounded in memory, and IPv6 fragments remain unsupported. A fragmented UDP datagram must
   have an IP payload length equal to its UDP Length; mismatched fragment sets are rejected.
   The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains

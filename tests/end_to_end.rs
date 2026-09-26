@@ -443,6 +443,72 @@ fn full_ipv4_fragment_reassembly_recovers_extended_response_code_once() {
 }
 
 #[test]
+fn full_ipv4_reassembly_ignores_first_fragment_duplicate_after_completion() {
+    let input_path = temp_test_path("full-fragments-duplicate-first", "pcap");
+    let output_path = temp_test_path("full-fragments-duplicate-first", "csv");
+
+    let mut query_payload = encode_dns_header(0x2345, 0x0100, 1);
+    append_example_a_query(&mut query_payload);
+    let mut response_payload = encode_dns_header(0x2345, 0x8180, 1);
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_example_a_query(&mut response_payload);
+    append_opt_record(&mut response_payload, 1, 0);
+
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let (first_fragment, final_fragment) = fragment_ipv4_udp_packet(&response_packet, 40);
+    fs::write(
+        &input_path,
+        classic_pcap_bytes(&[
+            (1, 0, &query_packet),
+            (1, 200_000, &first_fragment),
+            (1, 200_001, &final_fragment),
+            // The first transaction is already matched. A second query makes
+            // an inferred response from the duplicate visible in the CSV.
+            (1, 300_000, &query_packet),
+            (1, 400_000, &first_fragment),
+        ]),
+    )
+    .expect("fragmented duplicate test pcap written");
+
+    let result = Command::new(dpp_binary())
+        .args(["-s", "--full-fragments", "--report-format", "json"])
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed with full fragment reassembly");
+    assert!(
+        result.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("duplicate fragment CSV readable"),
+        concat!(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+            "1000000,1200001,10.0.0.1,53000,9029,example.com,A,EDNS_BADVERS\n",
+            "1300000,,10.0.0.1,53000,9029,example.com,A,\n"
+        )
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&result.stdout).expect("JSON report parses");
+    assert_eq!(report["metrics"]["total_dns_responses_processed"], 1);
+    assert_eq!(report["metrics"]["fragmented_response_prefix_count"], 0);
+    assert_eq!(report["metrics"]["total_matched_query_response_pairs"], 1);
+    assert_eq!(report["metrics"]["timed_out_queries"], 1);
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(output_path).expect("remove output csv");
+}
+
+#[test]
 fn full_ipv4_fragment_mode_falls_back_to_first_fragment_at_eof() {
     let input_path = temp_test_path("full-fragments-incomplete", "pcap");
     let output_path = temp_test_path("full-fragments-incomplete", "csv");
