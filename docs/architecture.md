@@ -192,7 +192,9 @@ or second encoding of canonical addresses and ports.
   A first non-DNS UDP fragment removes any earlier tails for its datagram key. A separate bounded
   history drops later non-DNS tails without evicting the completed-DNS history; a new DNS first
   fragment with a reused IPv4 ID removes that non-DNS mark. Ethernet VLAN tags are part of the
-  fragment key so traffic from different tagged segments is not assembled together.
+  fragment key so traffic from different tagged segments is not assembled together. A new DNS tail
+  that arrives before its first fragment while the old non-DNS mark is active is indistinguishable
+  from an old non-DNS tail and may be dropped.
   The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
