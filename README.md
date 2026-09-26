@@ -177,9 +177,13 @@ Notes:
 - The key file must contain a non-empty UTF-8 passphrase. Leading and trailing whitespace is ignored.
 - Rotating the key changes the resulting pseudonymized IP addresses for the same input capture.
 - Matching and deduplication use the original client IP. Pseudonymization is applied only to the
-  `source_ip` field of finalized output records, so pseudonym collisions cannot merge clients.
+  `source_ip` field of finalized output records. IPv4 pseudonymization is a keyed permutation, so
+  distinct IPv4 client addresses remain distinct in the output; network prefixes are not preserved.
 - DPP intentionally uses a fixed PBKDF2 salt for deterministic pseudonymization. The passphrase is
   still the operator-controlled secret; changing it rotates the derived pseudonyms.
+- The IPv4 Feistel mapping replaces the previous truncated-AES mapping. Even with the same
+  passphrase, exports produced before and after this change cannot be joined by pseudonymized IPv4
+  `source_ip`. IPv6 pseudonyms remain unchanged.
 - If `--anonymize` or `DPP_ANONYMIZE` is configured and the key file is missing, unreadable, or
   invalid, DPP exits with an error. It does not silently fall back to pass-through IP addresses.
 

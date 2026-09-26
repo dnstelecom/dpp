@@ -388,7 +388,10 @@ The required boundary is:
 - Writers remain asynchronous. Logical record order can still be deterministic even when output
   container layout, such as Parquet row-group boundaries, is not byte-identical across runs.
 - IP rewriting is deterministic pseudonymization. It reduces direct exposure of source addresses,
-  but identical inputs still map to identical outputs.
+  but identical inputs still map to identical outputs. IPv4 uses an eight-round, 32-bit Feistel
+  permutation with an independently derived AES key, so distinct IPv4 addresses cannot collide.
+  IPv6 retains its original AES block mapping. The IPv4 mapping changed with this algorithm;
+  exports from before and after the change cannot be joined by pseudonymized IPv4 address.
 - The pseudonymization key derivation uses a fixed PBKDF2 salt by design so the same passphrase
   yields stable output across runs and hosts. The operator-provided passphrase remains the secret
   rotation boundary.

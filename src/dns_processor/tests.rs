@@ -1243,16 +1243,16 @@ fn resolver_flows_in_the_same_shard_match_independently() {
 }
 
 #[test]
-fn anonymization_collision_does_not_merge_client_identities() {
+fn anonymization_preserves_distinct_client_identities() {
     let processor = test_processor_with_anonymization_key("secret\n");
 
     let query_client = IpAddr::V4(Ipv4Addr::new(0, 0, 56, 87));
     let other_client = IpAddr::V4(Ipv4Addr::new(0, 0, 201, 251));
     let pseudonymized_client = processor.anonymize_ip(&query_client);
-    assert_eq!(
+    assert_ne!(
         pseudonymized_client,
         processor.anonymize_ip(&other_client),
-        "fixture must retain its known IPv4 pseudonym collision"
+        "distinct IPv4 clients must have distinct pseudonyms"
     );
 
     let mut query = make_query_record_with_timestamp(1_000, 1, 0);

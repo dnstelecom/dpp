@@ -21,32 +21,39 @@ static SALT: [u8; 32] = [
     199, 76, 160, 70, 220, 85, 167, 75, 67, 93, 117, 51, 223, 17, 109, 52, 125, 192, 43, 44, 172,
     36, 193, 95, 137, 81, 216, 92, 201, 141, 252, 241,
 ];
+const IPV4_FEISTEL_ROUNDS: u8 = 8;
+const IPV4_KEY_LABEL: &[u8] = b"dpp-ipv4-feistel-v1";
+
+struct AnonymizationCiphers {
+    ipv4: Aes256,
+    ipv6: Aes256,
+}
 
 pub(super) struct Anonymizer {
-    cipher: Option<Aes256>,
+    ciphers: Option<AnonymizationCiphers>,
 }
 
 impl Anonymizer {
     pub(super) fn new(anonymize_key_path: Option<&Path>) -> io::Result<Self> {
-        let cipher = match anonymize_key_path {
+        let ciphers = match anonymize_key_path {
             Some(path) => {
                 let passphrase = Self::read_key_from_file(path)?;
-                Some(Self::derive_cipher(&passphrase)?)
+                Some(Self::derive_ciphers(&passphrase)?)
             }
             None => None,
         };
 
-        Ok(Self { cipher })
+        Ok(Self { ciphers })
     }
 
     pub(super) fn anonymize_ip(&self, ip: &IpAddr) -> IpAddr {
-        let Some(cipher) = &self.cipher else {
+        let Some(ciphers) = &self.ciphers else {
             return *ip;
         };
 
         match ip {
-            IpAddr::V4(ipv4) => IpAddr::V4(Self::encrypt_ipv4(cipher, ipv4)),
-            IpAddr::V6(ipv6) => IpAddr::V6(Self::encrypt_ipv6(cipher, ipv6)),
+            IpAddr::V4(ipv4) => IpAddr::V4(Self::encrypt_ipv4(&ciphers.ipv4, ipv4)),
+            IpAddr::V6(ipv6) => IpAddr::V6(Self::encrypt_ipv6(&ciphers.ipv6, ipv6)),
         }
     }
 
@@ -65,9 +72,17 @@ impl Anonymizer {
         Ok(passphrase.into())
     }
 
-    fn derive_cipher(passphrase: &str) -> Result<Aes256, io::Error> {
-        let key = Self::derive_key_from_passphrase(passphrase, &SALT)?;
-        Ok(Aes256::new((&key).into()))
+    fn derive_ciphers(passphrase: &str) -> Result<AnonymizationCiphers, io::Error> {
+        // Keep the original key for IPv6 so existing IPv6 pseudonyms remain stable.
+        let ipv6_key = Self::derive_key_from_passphrase(passphrase, &SALT)?;
+        let mut ipv4_salt = SALT.to_vec();
+        ipv4_salt.extend_from_slice(IPV4_KEY_LABEL);
+        let ipv4_key = Self::derive_key_from_passphrase(passphrase, &ipv4_salt)?;
+
+        Ok(AnonymizationCiphers {
+            ipv4: Aes256::new((&ipv4_key).into()),
+            ipv6: Aes256::new((&ipv6_key).into()),
+        })
     }
 
     fn derive_key_from_passphrase(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], io::Error> {
@@ -79,19 +94,28 @@ impl Anonymizer {
     }
 
     fn encrypt_ipv4(cipher: &Aes256, ipv4: &Ipv4Addr) -> Ipv4Addr {
-        let mut block = [0u8; 16];
-        block[..4].copy_from_slice(&ipv4.octets());
+        let octets = ipv4.octets();
+        let mut left = u16::from_be_bytes([octets[0], octets[1]]);
+        let mut right = u16::from_be_bytes([octets[2], octets[3]]);
 
-        let mut encrypted_block = Block::<Aes256>::default();
-        encrypted_block.copy_from_slice(&block);
-        cipher.encrypt_block(&mut encrypted_block);
+        // Each Feistel round is invertible regardless of collisions in its round function.
+        for round in 0..IPV4_FEISTEL_ROUNDS {
+            (left, right) = (right, left ^ Self::ipv4_round(cipher, round, right));
+        }
 
-        Ipv4Addr::new(
-            encrypted_block[0],
-            encrypted_block[1],
-            encrypted_block[2],
-            encrypted_block[3],
-        )
+        let mut output = [0u8; 4];
+        output[..2].copy_from_slice(&left.to_be_bytes());
+        output[2..].copy_from_slice(&right.to_be_bytes());
+        Ipv4Addr::from(output)
+    }
+
+    fn ipv4_round(cipher: &Aes256, round: u8, right: u16) -> u16 {
+        let mut block = Block::<Aes256>::default();
+        block[..12].copy_from_slice(b"dpp-ipv4-v1:");
+        block[12] = round;
+        block[14..].copy_from_slice(&right.to_be_bytes());
+        cipher.encrypt_block(&mut block);
+        u16::from_be_bytes([block[0], block[1]])
     }
 
     fn encrypt_ipv6(cipher: &Aes256, ipv6: &Ipv6Addr) -> Ipv6Addr {
@@ -108,6 +132,7 @@ impl Anonymizer {
 #[cfg(test)]
 mod tests {
     use super::Anonymizer;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::ErrorKind;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -145,8 +170,32 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, ip);
+        assert_eq!(
+            first,
+            IpAddr::V6(Ipv6Addr::new(
+                0x4733, 0xfbc0, 0xdf1c, 0xdc0e, 0x97e5, 0x4929, 0x9f74, 0x5421
+            )),
+            "existing IPv6 pseudonyms must remain stable"
+        );
+        assert_eq!(
+            anonymizer.anonymize_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            IpAddr::V4(Ipv4Addr::new(54, 5, 4, 44)),
+            "IPv4 pseudonyms must remain stable across runs and hosts"
+        );
 
         fs::remove_file(key_path).expect("removes temp key file");
+    }
+
+    #[test]
+    fn ipv4_pseudonyms_are_unique_for_distinct_addresses() {
+        let ciphers = Anonymizer::derive_ciphers("secret").expect("derives ciphers");
+        let mut seen = HashSet::with_capacity(100_000);
+
+        for address in 0..100_000u32 {
+            let input = Ipv4Addr::from(address.to_be_bytes());
+            let output = Anonymizer::encrypt_ipv4(&ciphers.ipv4, &input);
+            assert!(seen.insert(output), "IPv4 collision for {input}");
+        }
     }
 
     #[test]
