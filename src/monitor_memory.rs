@@ -6,10 +6,10 @@
  */
 
 use std::error::Error;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use sysinfo::{ProcessesToUpdate, System};
 use tracing::info;
 
@@ -39,13 +39,48 @@ use tracing::info;
 /// memory_thread.join().expect("Memory monitoring thread panicked");
 /// ```
 pub struct MemoryMonitorHandle {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     join_handle: Option<JoinHandle<()>>,
+}
+
+struct StopSignal {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            stopped: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn lock_stopped(&self) -> MutexGuard<'_, bool> {
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn stop(&self) {
+        *self.lock_stopped() = true;
+        self.wake.notify_one();
+    }
+
+    fn is_stopped(&self) -> bool {
+        *self.lock_stopped()
+    }
+
+    fn wait_for_next_sample(&self, interval: Duration) -> bool {
+        let (stopped, _) = self
+            .wake
+            .wait_timeout_while(self.lock_stopped(), interval, |stopped| !*stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        *stopped
+    }
 }
 
 impl MemoryMonitorHandle {
     pub fn stop(&self) {
-        self.stop.store(true, AtomicOrdering::SeqCst);
+        self.stop.stop();
     }
 
     pub fn join(mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -64,7 +99,7 @@ impl MemoryMonitorHandle {
 
 impl Drop for MemoryMonitorHandle {
     fn drop(&mut self) {
-        self.stop.store(true, AtomicOrdering::SeqCst);
+        self.stop();
 
         if let Some(join_handle) = self.join_handle.take()
             && let Err(err) = join_handle.join()
@@ -81,7 +116,7 @@ pub fn start_tracking()
 
     // Clone the Arc to move into the monitoring thread.
     let memory_usage_clone = Arc::clone(&max_memory_usage);
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(StopSignal::new());
     let stop_clone = Arc::clone(&stop);
 
     // Spawn a new thread dedicated to monitoring memory usage.
@@ -106,7 +141,7 @@ pub fn start_tracking()
             // Create a list containing only the current PID to limit monitoring scope.
             let pid_list = vec![pid];
 
-            while !stop_clone.load(AtomicOrdering::SeqCst) {
+            while !stop_clone.is_stopped() {
                 // Specify that only the processes in `pid_list` should be refreshed.
                 let processes_to_update = ProcessesToUpdate::Some(&pid_list);
 
@@ -122,8 +157,10 @@ pub fn start_tracking()
                     memory_usage_clone.fetch_max(current_rss_kib, AtomicOrdering::SeqCst);
                 }
 
-                // Sleep for 100 milliseconds before the next check to reduce CPU usage.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Wait between samples, but wake immediately when shutdown is requested.
+                if stop_clone.wait_for_next_sample(Duration::from_millis(100)) {
+                    break;
+                }
             }
         })?;
 
@@ -140,11 +177,30 @@ pub fn start_tracking()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
 
     #[test]
     fn memory_monitor_can_stop_and_join() {
         let (_usage, monitor) = start_tracking().expect("monitor starts");
         monitor.stop();
         monitor.join().expect("monitor joins");
+    }
+
+    #[test]
+    fn stop_wakes_waiter_before_sampling_timeout() {
+        let stop = Arc::new(StopSignal::new());
+        let waiter_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).expect("waiter is ready");
+            waiter_stop.wait_for_next_sample(Duration::from_secs(5))
+        });
+
+        ready_rx.recv().expect("waiter starts");
+        let started = Instant::now();
+        stop.stop();
+        assert!(waiter.join().expect("waiter joins"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

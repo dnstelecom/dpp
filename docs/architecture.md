@@ -142,8 +142,9 @@ or second encoding of canonical addresses and ports.
   as a downstream-close outcome; regular file-write failures remain fatal.
 
 - `src/monitor_memory.rs`
-  Optional RSS tracking helper with an explicit stop/join lifecycle. The monitor must not detach
-  indefinitely from top-level process shutdown.
+  Optional RSS tracking helper with an explicit stop/join lifecycle. The monitor's 100 ms sampling
+  wait is interruptible by stop, so join need not wait for the next sample. An in-progress RSS
+  refresh must still finish before the monitor thread exits.
 
 - `src/dns_processor.rs` and `src/dns_processor/*`
   The DNS processor facade owns packet-to-matcher orchestration and delegates to focused
