@@ -167,7 +167,12 @@ fn wait_for_stdin_start_log(child: &mut Child) {
 }
 
 #[cfg(unix)]
-fn run_open_stdin_signal_test(name: &str, bytes: &[u8], signal: Signal, has_header: bool) {
+fn run_open_stdin_signal_test(
+    name: &str,
+    bytes: &[u8],
+    signal: Signal,
+    has_header: bool,
+) -> Option<serde_json::Value> {
     let output_path = temp_test_path(name, "csv");
     let mut child = Command::new(dpp_binary())
         .args([
@@ -212,7 +217,7 @@ fn run_open_stdin_signal_test(name: &str, bytes: &[u8], signal: Signal, has_head
         String::from_utf8_lossy(&output.stderr)
     );
 
-    if has_header {
+    let report = if has_header {
         let report: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("JSON report parses");
         assert_eq!(
@@ -224,17 +229,20 @@ fn run_open_stdin_signal_test(name: &str, bytes: &[u8], signal: Signal, has_head
             "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n"
         );
         fs::remove_file(&output_path).expect("remove output csv");
+        Some(report)
     } else {
         assert!(
             output.stdout.is_empty(),
             "no summary exists before capture setup"
         );
         assert!(!output_path.exists(), "writer was not initialized");
-    }
+        None
+    };
 
     // Keep the parent end of the pipe open until after DPP exits. A closed pipe
     // would test EOF handling instead of signal cancellation.
     drop(stdin);
+    report
 }
 
 #[test]
@@ -961,7 +969,34 @@ fn sigint_stops_classic_pcap_stdin_without_eof() {
     let packet =
         make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &dns_payload);
     let bytes = classic_pcap_bytes(&[(1, 0, &packet)]);
-    run_open_stdin_signal_test("sigint-classic-open-pipe", &bytes, Signal::SIGINT, true);
+    let _ = run_open_stdin_signal_test("sigint-classic-open-pipe", &bytes, Signal::SIGINT, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_processes_completed_packets_in_partial_stdin_batch() {
+    let mut query_payload = encode_dns_header(0x1234, 0x0100, 1);
+    append_example_a_query(&mut query_payload);
+    let mut response_payload = encode_dns_header(0x1234, 0x8180, 1);
+    append_example_a_query(&mut response_payload);
+    let query =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+    let response = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let bytes = classic_pcap_bytes(&[(1, 0, &query), (1, 200_000, &response)]);
+
+    let report =
+        run_open_stdin_signal_test("sigint-partial-stdin-batch", &bytes, Signal::SIGINT, true)
+            .expect("signal report exists");
+    assert_eq!(report["metrics"]["total_packets_processed"], 2);
+    assert_eq!(report["metrics"]["total_dns_queries_processed"], 1);
+    assert_eq!(report["metrics"]["total_dns_responses_processed"], 1);
+    assert_eq!(report["metrics"]["total_matched_query_response_pairs"], 1);
 }
 
 #[cfg(unix)]
@@ -975,7 +1010,7 @@ fn sigint_stops_pcapng_stdin_mid_block_without_eof() {
     // A complete next block prefix declares a body that never arrives. This
     // exercises read_exact/read_to_end cancellation while stdin stays open.
     bytes.extend_from_within(..12);
-    run_open_stdin_signal_test("sigint-pcapng-mid-block", &bytes, Signal::SIGINT, true);
+    let _ = run_open_stdin_signal_test("sigint-pcapng-mid-block", &bytes, Signal::SIGINT, true);
 }
 
 #[cfg(unix)]
@@ -991,13 +1026,13 @@ fn sigterm_stops_classic_pcap_stdin_mid_record_without_eof() {
     bytes.extend_from_slice(&64_u32.to_le_bytes());
     bytes.extend_from_slice(&64_u32.to_le_bytes());
     bytes.extend_from_slice(&[0_u8; 3]);
-    run_open_stdin_signal_test("sigterm-classic-mid-record", &bytes, Signal::SIGTERM, true);
+    let _ = run_open_stdin_signal_test("sigterm-classic-mid-record", &bytes, Signal::SIGTERM, true);
 }
 
 #[cfg(unix)]
 #[test]
 fn sigint_stops_stdin_probe_before_capture_header_without_eof() {
-    run_open_stdin_signal_test(
+    let _ = run_open_stdin_signal_test(
         "sigint-before-capture-header",
         &[0xd4, 0xc3, 0xb2],
         Signal::SIGINT,

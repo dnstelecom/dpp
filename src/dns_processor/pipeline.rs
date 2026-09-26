@@ -1141,7 +1141,7 @@ impl DnsProcessor {
                     break;
                 };
 
-                if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                if output_closed.load(AtomicOrdering::Relaxed) {
                     break;
                 }
 

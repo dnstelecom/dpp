@@ -236,14 +236,14 @@ impl PacketParser {
 
         while packet_buffer.len() < chunk_size {
             if self.stdin_shutdown_requested() {
-                return Ok(None);
+                break;
             }
 
             let next_packet = match self.backend.next_packet_data() {
                 Err(error)
                     if self.stdin_shutdown_requested() && is_stdin_shutdown_error(&error) =>
                 {
-                    return Ok(None);
+                    break;
                 }
                 result => result?,
             };
@@ -762,6 +762,48 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
 
+    #[derive(Clone, Copy)]
+    enum ShutdownTiming {
+        AfterPacket,
+        OnNextRead,
+    }
+
+    struct CancellingStream {
+        bytes: Vec<u8>,
+        offset: usize,
+        shutdown: Arc<AtomicBool>,
+        timing: ShutdownTiming,
+    }
+
+    impl Read for CancellingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.offset == self.bytes.len() {
+                self.shutdown.store(true, AtomicOrdering::SeqCst);
+                return Err(io::Error::other(StdinReadCancelled));
+            }
+
+            // Keep the capture header separate so opening the parser cannot prefetch the packet.
+            let chunk_end = if self.offset < 4 {
+                4
+            } else if self.offset < 24 {
+                24
+            } else {
+                self.bytes.len()
+            };
+            let len = (chunk_end - self.offset).min(buf.len());
+            buf[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            if self.offset == self.bytes.len() && matches!(self.timing, ShutdownTiming::AfterPacket)
+            {
+                self.shutdown.store(true, AtomicOrdering::SeqCst);
+            }
+            Ok(len)
+        }
+    }
+
     fn packet(timestamp_micros: i64, sequence: u64) -> PacketData {
         PacketData {
             data: PacketPayload::owned(Box::from([])),
@@ -771,10 +813,17 @@ mod tests {
     }
 
     fn parser_from_stream(bytes: Vec<u8>) -> PacketParser {
+        parser_from_reader(Box::new(Cursor::new(bytes)), None)
+    }
+
+    fn parser_from_reader(
+        reader: StreamReader,
+        stdin_shutdown: Option<Arc<AtomicBool>>,
+    ) -> PacketParser {
         PacketParser {
-            backend: PacketBackend::from_stream(Box::new(Cursor::new(bytes)), "test-stream")
+            backend: PacketBackend::from_stream(reader, "test-stream")
                 .expect("stream parser opens"),
-            stdin_shutdown: None,
+            stdin_shutdown,
             enforce_monotonic_timestamps: false,
             packet_ordinal: 0,
             last_timestamp_micros: None,
@@ -873,6 +922,35 @@ mod tests {
         assert_eq!(packet.timestamp_micros, 1_000_002);
         assert_eq!(packet.packet_ordinal, 0);
         assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn stdin_shutdown_returns_packets_already_read_into_batch() {
+        for timing in [ShutdownTiming::AfterPacket, ShutdownTiming::OnNextRead] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let reader = CancellingStream {
+                bytes: classic_pcap_bytes(&[(1, 2, &[1, 2, 3, 4])]),
+                offset: 0,
+                shutdown: Arc::clone(&shutdown),
+                timing,
+            };
+            let mut parser = parser_from_reader(Box::new(reader), Some(Arc::clone(&shutdown)));
+
+            let batch = parser
+                .next_batch(8)
+                .expect("cancelled read is not a parse error")
+                .expect("already-read packet is returned");
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].data.as_slice(), &[1, 2, 3, 4]);
+            assert_eq!(batch[0].packet_ordinal, 0);
+            assert!(shutdown.load(AtomicOrdering::SeqCst));
+            assert!(
+                parser
+                    .next_batch(8)
+                    .expect("shutdown is complete")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -104,7 +104,9 @@ or second encoding of canonical addresses and ports.
   Buffers grow with received block bytes rather than untrusted declared lengths. Stdin probing
   needs no temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
   Signal-driven shutdown can interrupt a blocked stdin read without waiting for the producer to
-  close the stream; capture reading remains parser-owned.
+  close the stream; capture reading remains parser-owned. Packets already read into a nonempty
+  batch are handed to the processing pipeline before intake stops. The signal shutdown policy can
+  still discard records buffered by the output writer.
   The pure-Rust classic-PCAP reader still relies on the upstream `pcap-file` `3.0.0-rc1` release
   candidate until a stable line with the required functionality is available.
   The parser can also enforce globally monotonic capture timestamps for the optional batched
