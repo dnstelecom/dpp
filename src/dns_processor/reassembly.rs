@@ -568,16 +568,17 @@ impl Ipv4FragmentReassembler {
         let Some(frontier) = self.max_seen_timestamp else {
             return;
         };
-        let stale: Vec<FragmentKey> = self
+        let mut stale: Vec<(u64, FragmentKey)> = self
             .pending
             .iter()
             .filter_map(|(key, entry)| {
                 (frontier.saturating_sub(entry.first_seen_timestamp) > self.timeout_micros)
-                    .then_some(*key)
+                    .then_some((entry.arrival_order, *key))
             })
             .collect();
-        // Hash iteration does not define output order; sorting is always explicit.
-        for key in stale {
+        stale.sort_unstable_by_key(|(arrival_order, _)| *arrival_order);
+        // Match the arrival order used by EOF and capacity eviction.
+        for (_, key) in stale {
             if let Some(entry) = self.take_entry(&key)
                 && let Some(first) = entry.into_fallback()
             {
@@ -929,6 +930,39 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert_eq!(pending, None);
         assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn expired_first_fragments_follow_arrival_order() {
+        let mut reassembler = Ipv4FragmentReassembler::new(100, true);
+        let first_fragments = (1_u16..=8)
+            .map(|id| {
+                let mut first = packet(0, true, u64::from(id), 100 + i64::from(id));
+                let mut bytes = first.data.as_slice().to_vec();
+                bytes[ETHERNET_HEADER_LEN + 4..ETHERNET_HEADER_LEN + 6]
+                    .copy_from_slice(&id.to_be_bytes());
+                first.data = PacketPayload::owned(bytes.into_boxed_slice());
+                first
+            })
+            .collect();
+        let (output, pending) = reassembler.process_batch(first_fragments);
+        assert!(output.is_empty());
+        assert_eq!(pending, Some(101));
+
+        let ordinary = PacketData {
+            data: PacketPayload::owned(vec![0_u8; ETHERNET_HEADER_LEN].into_boxed_slice()),
+            timestamp_micros: 300,
+            packet_ordinal: 9,
+        };
+        let (output, pending) = reassembler.process_batch(vec![ordinary]);
+        assert_eq!(pending, None);
+        assert_eq!(
+            output
+                .iter()
+                .map(|packet| packet.packet_ordinal)
+                .collect::<Vec<_>>(),
+            vec![9, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 
     #[test]
