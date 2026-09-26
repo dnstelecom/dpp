@@ -27,6 +27,9 @@ const DNS_HEADER_LEN: usize = 12;
 const MIN_DNS_OFFSET: usize = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
+const ETHER_TYPE_VLAN: u16 = 0x8100;
+const ETHER_TYPE_PROVIDER_BRIDGING: u16 = 0x88a8;
+const ETHER_TYPE_LEGACY_QINQ: u16 = 0x9100;
 const IP_PROTOCOL_UDP: u8 = 17;
 const IPV6_HOP_BY_HOP: u8 = 0;
 const IPV6_ROUTING: u8 = 43;
@@ -46,6 +49,31 @@ const DNS_COMPRESSION_JUMP_LIMIT: usize = 32;
 const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
 const DNS_TSIG_RECORD_TYPE: u16 = 250;
+
+/// Return the encapsulated EtherType and the start of its payload. Reassembly uses the
+/// same VLAN traversal so fragment classification and DNS routing agree on the L3 offset.
+pub(super) fn ethernet_ethertype_and_payload_offset(
+    data: &[u8],
+) -> Result<(u16, usize), &'static str> {
+    let ethernet = data
+        .get(..ETHERNET_HEADER_LEN)
+        .ok_or("Failed to parse Ethernet packet")?;
+    let mut ethertype = u16::from_be_bytes([ethernet[12], ethernet[13]]);
+    let mut payload_offset = ETHERNET_HEADER_LEN;
+
+    while matches!(
+        ethertype,
+        ETHER_TYPE_VLAN | ETHER_TYPE_PROVIDER_BRIDGING | ETHER_TYPE_LEGACY_QINQ
+    ) {
+        let tag = data
+            .get(payload_offset..payload_offset + 4)
+            .ok_or("Failed to parse Ethernet VLAN tag")?;
+        ethertype = u16::from_be_bytes([tag[2], tag[3]]);
+        payload_offset += 4;
+    }
+
+    Ok((ethertype, payload_offset))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalFlowKey {
@@ -1036,19 +1064,16 @@ impl DnsProcessor {
         data: &[u8],
         allow_first_ipv4_response_fragment: bool,
     ) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
-        let ethernet = data
-            .get(..ETHERNET_HEADER_LEN)
-            .ok_or("Failed to parse Ethernet packet")?;
-        let ethertype = u16::from_be_bytes([ethernet[12], ethernet[13]]);
-        let payload = &data[ETHERNET_HEADER_LEN..];
+        let (ethertype, l3_offset) = ethernet_ethertype_and_payload_offset(data)?;
+        let payload = &data[l3_offset..];
 
         match ethertype {
             ETHER_TYPE_IPV4 => Self::extract_udp_dns_from_ipv4(
                 payload,
-                ETHERNET_HEADER_LEN,
+                l3_offset,
                 allow_first_ipv4_response_fragment,
             ),
-            ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, ETHERNET_HEADER_LEN),
+            ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, l3_offset),
             _ => Ok(None),
         }
     }
@@ -1329,6 +1354,17 @@ mod protocol_regression_tests {
         make_udp_dns_packet_with_payload(src, dst, src_port, dst_port, dns)
     }
 
+    fn with_vlan_tags(packet: &[u8], tags: &[(u16, u16)]) -> Vec<u8> {
+        let mut tagged = Vec::with_capacity(packet.len() + tags.len() * 4);
+        tagged.extend_from_slice(&packet[..12]);
+        for &(ethertype, tci) in tags {
+            tagged.extend_from_slice(&ethertype.to_be_bytes());
+            tagged.extend_from_slice(&tci.to_be_bytes());
+        }
+        tagged.extend_from_slice(&packet[12..]);
+        tagged
+    }
+
     fn first_ipv4_fragment(mut packet: Vec<u8>, fragment_payload_len: usize) -> Vec<u8> {
         assert_eq!(fragment_payload_len % 8, 0);
         let fragment_len = IPV4_MIN_HEADER_LEN + fragment_payload_len;
@@ -1387,6 +1423,67 @@ mod protocol_regression_tests {
             assert!(!responses[0].is_query);
             assert_eq!(queries[0].src_ip, responses[0].dst_ip);
         }
+    }
+
+    #[test]
+    fn vlan_and_qinq_frames_route_and_decode_dns() {
+        let query_dns = question(0x0100, 1);
+        let response_dns = question(0x8180, 1);
+        let tags = [
+            vec![(ETHER_TYPE_VLAN, 100)],
+            vec![(ETHER_TYPE_PROVIDER_BRIDGING, 200), (ETHER_TYPE_VLAN, 100)],
+            vec![(ETHER_TYPE_LEGACY_QINQ, 200), (ETHER_TYPE_VLAN, 100)],
+        ];
+
+        for tag_stack in &tags {
+            let query = with_vlan_tags(&ipv4(&query_dns, false, 53000), tag_stack);
+            let response = with_vlan_tags(&ipv4(&response_dns, true, 53000), tag_stack);
+            let query_meta = DnsProcessor::packet_routing_meta(&query).expect("tagged query");
+            let response_meta =
+                DnsProcessor::packet_routing_meta(&response).expect("tagged response");
+            assert_eq!(query_meta.flow_key, response_meta.flow_key);
+            assert_eq!(query_meta.dns_data(&query), Ok(query_dns.as_slice()));
+            assert_eq!(
+                response_meta.dns_data(&response),
+                Ok(response_dns.as_slice())
+            );
+
+            for processor in processors() {
+                assert_eq!(processor.process_packet_batch(&query, 0).unwrap().len(), 1);
+                assert_eq!(
+                    processor
+                        .process_packet_batch(&response, 100)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+
+        let ipv6_query = with_vlan_tags(
+            &ipv6(&query_dns, &[]),
+            &[(ETHER_TYPE_PROVIDER_BRIDGING, 200), (ETHER_TYPE_VLAN, 100)],
+        );
+        let ipv6_meta = DnsProcessor::packet_routing_meta(&ipv6_query).expect("tagged IPv6");
+        assert_eq!(ipv6_meta.dns_data(&ipv6_query), Ok(query_dns.as_slice()));
+    }
+
+    #[test]
+    fn truncated_vlan_tag_is_rejected() {
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 4];
+        frame[12..14].copy_from_slice(&ETHER_TYPE_VLAN.to_be_bytes());
+        for len in ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + 4 {
+            assert_eq!(
+                ethernet_ethertype_and_payload_offset(&frame[..len]),
+                Err("Failed to parse Ethernet VLAN tag")
+            );
+        }
+
+        frame[16..18].copy_from_slice(&ETHER_TYPE_VLAN.to_be_bytes());
+        assert_eq!(
+            ethernet_ethertype_and_payload_offset(&frame),
+            Err("Failed to parse Ethernet VLAN tag")
+        );
     }
 
     #[test]

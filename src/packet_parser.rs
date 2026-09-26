@@ -538,6 +538,8 @@ fn ensure_libpcap_ethernet_linktype(
     Ok(())
 }
 
+const MAX_PCAPNG_BLOCK_LEN: u32 = 16 * 1024 * 1024;
+
 /// Owns stdin PCAPNG framing and its sole section-local interface table. The dependency's
 /// stateful reader converts timestamps incorrectly; even `next_raw_block` rejects valid
 /// resolutions while updating interfaces. Only its stateless block validation is used here.
@@ -570,8 +572,7 @@ impl PcapNgStreamReader {
         }
 
         // Read only the fixed prefix before trusting the declared block length. The body
-        // grows with bytes actually received, so a huge length in a truncated stream cannot
-        // force an equally huge allocation. Memory remains bounded by the largest read block.
+        // grows with bytes actually received, while the bound also covers nontruncated streams.
         let mut prefix = [0_u8; 12];
         self.input.read_exact(&mut prefix)?;
         if is_pcapng_magic(prefix[..4].try_into().expect("four-byte block type")) {
@@ -585,6 +586,10 @@ impl PcapNgStreamReader {
         anyhow::ensure!(
             block_len >= 12 && block_len.is_multiple_of(4),
             "Invalid pcapng block length {block_len}: expected a multiple of four, at least 12"
+        );
+        anyhow::ensure!(
+            block_len <= MAX_PCAPNG_BLOCK_LEN,
+            "Pcapng block length {block_len} exceeds maximum {MAX_PCAPNG_BLOCK_LEN} bytes"
         );
         self.block_bytes.clear();
         self.block_bytes.extend_from_slice(&prefix);
@@ -1049,6 +1054,58 @@ mod tests {
         assert_eq!(packet.timestamp_micros, 1_000_002);
         assert_eq!(packet.packet_ordinal, 0);
         assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_oversized_pcapng_section_before_reading_body() {
+        for (byte_order_magic, block_len) in [
+            (
+                [0x1a, 0x2b, 0x3c, 0x4d],
+                (MAX_PCAPNG_BLOCK_LEN + 4).to_be_bytes(),
+            ),
+            (
+                [0x4d, 0x3c, 0x2b, 0x1a],
+                (MAX_PCAPNG_BLOCK_LEN + 4).to_le_bytes(),
+            ),
+        ] {
+            let mut prefix = Vec::from([0x0a, 0x0d, 0x0d, 0x0a]);
+            prefix.extend_from_slice(&block_len);
+            prefix.extend_from_slice(&byte_order_magic);
+            let stream: StreamReader = Box::new(Cursor::new(prefix));
+            let error = PcapNgStreamReader::new(BufReader::new(CaptureInputReader::Stream(
+                ReplayReader::new(Vec::new(), stream),
+            )))
+            .err()
+            .expect("oversized section must fail");
+            assert!(
+                error.to_string().contains("exceeds maximum"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_pcapng_block_after_valid_section() {
+        let mut bytes = pcapng_bytes(&[]);
+        let first_block_len = match &bytes[8..12] {
+            [0x1a, 0x2b, 0x3c, 0x4d] => u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+            [0x4d, 0x3c, 0x2b, 0x1a] => u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            _ => panic!("invalid test pcapng byte order"),
+        } as usize;
+        let oversized_len = match &bytes[8..12] {
+            [0x1a, 0x2b, 0x3c, 0x4d] => (MAX_PCAPNG_BLOCK_LEN + 4).to_be_bytes(),
+            _ => (MAX_PCAPNG_BLOCK_LEN + 4).to_le_bytes(),
+        };
+        bytes[first_block_len + 4..first_block_len + 8].copy_from_slice(&oversized_len);
+
+        let mut parser = parser_from_stream(bytes);
+        let error = parser
+            .next_batch(1)
+            .expect_err("oversized interface block must fail");
+        assert!(
+            error.to_string().contains("exceeds maximum"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

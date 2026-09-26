@@ -2,9 +2,9 @@
 
 ## Goal
 
-This document explains how to convert a capture that contains VLAN, QinQ, MPLS, or similar outer
-encapsulation layers into a flat Ethernet plus IPv4 or IPv6 capture that the current community
-edition DPP can read directly.
+This document explains how to convert a capture that contains MPLS or another unsupported outer
+encapsulation layer into a flat Ethernet plus IPv4 or IPv6 capture that DPP can read directly.
+Ethernet VLAN and QinQ stacks with TPIDs `0x8100`, `0x88a8`, or `0x9100` are decoded natively.
 
 Target output shape:
 
@@ -19,14 +19,12 @@ If the input capture already has that shape, no conversion is needed.
 
 Use this guide when the original capture contains any of the following before the IP header:
 
-- 802.1Q VLAN
-- 802.1ad QinQ
 - MPLS label stacks
-- similar shim layers between Ethernet and IP
+- other unsupported shim layers between Ethernet and IP
 
 Typical symptom:
 
-- DPP runs, but query or response counts are lower than expected because tagged or labeled packets
+- DPP runs, but query or response counts are lower than expected because unsupported labeled packets
   are not being extracted by the current fast path.
 
 ## Linux Workflow
@@ -39,8 +37,8 @@ Use `tshark` to confirm whether the capture contains VLAN, QinQ, MPLS, or other 
 tshark -r input.pcap -q -z io,phs
 ```
 
-If you see protocol hierarchy entries such as `vlan`, `mpls`, or provider-bridging layers before
-`ip` or `ipv6`, continue with normalization.
+If you see `mpls` or another unsupported layer before `ip` or `ipv6`, continue with normalization.
+VLAN and provider-bridging layers alone do not require this step.
 
 ### 2. Install the Required Tools
 
@@ -188,18 +186,6 @@ Or for Parquet:
 target/release/dpp normalized.pcap normalized.pq --format pq
 ```
 
-## Optional Shortcut for Simple VLAN-Only Captures
-
-If the capture contains only simple VLAN tagging and you already use `tcprewrite`, you can strip
-VLAN tags with a smaller workflow such as:
-
-```bash
-tcprewrite --enet-vlan=del --infile=input.pcap --outfile=normalized.pcap
-```
-
-That shortcut is convenient, but it is not the preferred general-purpose recipe here because it is
-less explicit for mixed or MPLS-tagged captures.
-
 ## Validation Checklist
 
 After conversion, validate all of the following:
@@ -220,9 +206,7 @@ After conversion, validate all of the following:
 ## If Native Support Is Needed
 
 If normalization is not acceptable operationally and DPP must read those captures directly, native
-support should be added only inside:
-
-- [parser.rs](/Users/kam/RustroverProjects/dpp-public/src/dns_processor/parser.rs)
+support belongs in `src/dns_processor/parser.rs` and, for fragmented IPv4, `reassembly.rs`.
 
 That change must be accompanied by:
 
