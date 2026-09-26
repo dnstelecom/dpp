@@ -10,17 +10,16 @@ use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-// The community edition uses a fixed PBKDF2 salt on purpose so that the same passphrase yields the
-// same deterministic pseudonymization output across runs and hosts. The passphrase remains the
-// operator-controlled secret; rotating it rotates all derived pseudonyms.
+// Legacy text key files retain this salt so existing pseudonyms remain stable across runs and hosts.
 static SALT: [u8; 32] = [
     199, 76, 160, 70, 220, 85, 167, 75, 67, 93, 117, 51, 223, 17, 109, 52, 125, 192, 43, 44, 172,
     36, 193, 95, 137, 81, 216, 92, 201, 141, 252, 241,
 ];
+const SALTED_KEY_MAGIC: &[u8] = b"\x89DPP-ANON-KEY-v2\n";
 const IPV4_FEISTEL_ROUNDS: u8 = 8;
 const IPV4_KEY_LABEL: &[u8] = b"dpp-ipv4-feistel-v1";
 
@@ -37,8 +36,8 @@ impl Anonymizer {
     pub(super) fn new(anonymize_key_path: Option<&Path>) -> io::Result<Self> {
         let ciphers = match anonymize_key_path {
             Some(path) => {
-                let passphrase = Self::read_key_from_file(path)?;
-                Some(Self::derive_ciphers(&passphrase)?)
+                let (passphrase, salt) = Self::read_key_from_file(path)?;
+                Some(Self::derive_ciphers(&passphrase, &salt)?)
             }
             None => None,
         };
@@ -57,10 +56,47 @@ impl Anonymizer {
         }
     }
 
-    fn read_key_from_file(path: &Path) -> Result<Box<str>, io::Error> {
-        let mut file = fs::File::open(path)?;
-        let mut passphrase = String::new();
-        file.read_to_string(&mut passphrase)?;
+    fn read_key_from_file(path: &Path) -> io::Result<(Box<str>, [u8; 32])> {
+        let contents = fs::read(path)?;
+        let (passphrase, salt) = if let Some(body) = contents.strip_prefix(SALTED_KEY_MAGIC) {
+            let salt_line_end = body.iter().position(|byte| *byte == b'\n').ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "salted key file has no salt line",
+                )
+            })?;
+            let salt_hex = &body[..salt_line_end];
+            if salt_hex.len() != 64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "salted key file must contain exactly 64 hexadecimal salt digits",
+                ));
+            }
+            if !salt_hex.iter().all(u8::is_ascii_hexdigit) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid hexadecimal salt",
+                ));
+            }
+            let mut salt = [0u8; 32];
+            for (output, pair) in salt.iter_mut().zip(salt_hex.chunks_exact(2)) {
+                let digits = std::str::from_utf8(pair).expect("ASCII hex digits checked");
+                *output = u8::from_str_radix(digits, 16).expect("ASCII hex digits checked");
+            }
+            (
+                std::str::from_utf8(&body[salt_line_end + 1..]).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "passphrase must be valid UTF-8")
+                })?,
+                salt,
+            )
+        } else {
+            (
+                std::str::from_utf8(&contents).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "passphrase must be valid UTF-8")
+                })?,
+                SALT,
+            )
+        };
         let passphrase = passphrase.trim();
         if passphrase.is_empty() {
             return Err(io::Error::new(
@@ -69,13 +105,16 @@ impl Anonymizer {
             ));
         }
 
-        Ok(passphrase.into())
+        Ok((passphrase.into(), salt))
     }
 
-    fn derive_ciphers(passphrase: &str) -> Result<AnonymizationCiphers, io::Error> {
+    fn derive_ciphers(
+        passphrase: &str,
+        salt: &[u8; 32],
+    ) -> Result<AnonymizationCiphers, io::Error> {
         // Keep the original key for IPv6 so existing IPv6 pseudonyms remain stable.
-        let ipv6_key = Self::derive_key_from_passphrase(passphrase, &SALT)?;
-        let mut ipv4_salt = SALT.to_vec();
+        let ipv6_key = Self::derive_key_from_passphrase(passphrase, salt)?;
+        let mut ipv4_salt = salt.to_vec();
         ipv4_salt.extend_from_slice(IPV4_KEY_LABEL);
         let ipv4_key = Self::derive_key_from_passphrase(passphrase, &ipv4_salt)?;
 
@@ -131,7 +170,7 @@ impl Anonymizer {
 
 #[cfg(test)]
 mod tests {
-    use super::Anonymizer;
+    use super::{Anonymizer, SALT, SALTED_KEY_MAGIC};
     use std::collections::HashSet;
     use std::fs;
     use std::io::ErrorKind;
@@ -139,7 +178,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_key_file(contents: &str) -> PathBuf {
+    fn temp_key_file(contents: impl AsRef<[u8]>) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -187,8 +226,83 @@ mod tests {
     }
 
     #[test]
+    fn salted_key_changes_both_families_and_is_stable_across_reloads() {
+        let legacy_path = temp_key_file("secret-passphrase\n");
+        let mut salted_contents = SALTED_KEY_MAGIC.to_vec();
+        salted_contents.extend_from_slice(
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\nsecret-passphrase\n",
+        );
+        let salted_path = temp_key_file(salted_contents);
+
+        let legacy = Anonymizer::new(Some(&legacy_path)).expect("legacy key loads");
+        let salted = Anonymizer::new(Some(&salted_path)).expect("salted key loads");
+        let reloaded = Anonymizer::new(Some(&salted_path)).expect("salted key reloads");
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert_ne!(salted.anonymize_ip(&ip), legacy.anonymize_ip(&ip));
+            assert_eq!(salted.anonymize_ip(&ip), reloaded.anonymize_ip(&ip));
+        }
+
+        fs::remove_file(legacy_path).expect("removes legacy key file");
+        fs::remove_file(salted_path).expect("removes salted key file");
+    }
+
+    #[test]
+    fn malformed_salted_keys_are_rejected_without_legacy_fallback() {
+        for body in [
+            b"short\nsecret".as_slice(),
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeefg\nsecret",
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n  ",
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\xff",
+        ] {
+            let mut contents = SALTED_KEY_MAGIC.to_vec();
+            contents.extend_from_slice(body);
+            let key_path = temp_key_file(contents);
+            let error = Anonymizer::new(Some(&key_path))
+                .err()
+                .expect("malformed salted key must fail");
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::InvalidData | ErrorKind::InvalidInput
+                ),
+                "unexpected error: {error}"
+            );
+            fs::remove_file(key_path).expect("removes malformed key file");
+        }
+
+        let mut contents = SALTED_KEY_MAGIC.to_vec();
+        let mut body =
+            b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\nsecret".to_vec();
+        body[0] = b'+';
+        contents.extend_from_slice(&body);
+        let key_path = temp_key_file(contents);
+        assert_eq!(
+            Anonymizer::new(Some(&key_path))
+                .err()
+                .expect("plus sign is not a hex digit")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        fs::remove_file(key_path).expect("removes malformed key file");
+    }
+
+    #[test]
+    fn text_that_looks_like_a_key_header_remains_a_legacy_passphrase() {
+        let passphrase = "DPP-ANON-KEY-v2\n00112233445566778899aabbccddeeff";
+        let key_path = temp_key_file(passphrase);
+        let (loaded, salt) = Anonymizer::read_key_from_file(&key_path).expect("legacy key loads");
+        assert_eq!(&*loaded, passphrase);
+        assert_eq!(salt, SALT);
+        fs::remove_file(key_path).expect("removes legacy key file");
+    }
+
+    #[test]
     fn ipv4_pseudonyms_are_unique_for_distinct_addresses() {
-        let ciphers = Anonymizer::derive_ciphers("secret").expect("derives ciphers");
+        let ciphers = Anonymizer::derive_ciphers("secret", &SALT).expect("derives ciphers");
         let mut seen = HashSet::with_capacity(100_000);
 
         for address in 0..100_000u32 {

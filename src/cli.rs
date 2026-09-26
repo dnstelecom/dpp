@@ -33,9 +33,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_allow_fragments = parse_env_bool("DPP_ALLOW_FRAGMENTS");
     let env_full_fragments = parse_env_bool("DPP_FULL_FRAGMENTS");
     let env_monotonic_capture = parse_env_bool("DPP_MONOTONIC_CAPTURE");
-    let env_threads = env::var("DPP_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    let env_threads = env::var_os("DPP_THREADS");
     let env_bonded = env::var_os("DPP_BONDED");
 
     let matches = build_cli(version).get_matches();
@@ -69,10 +67,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .map(|parallelism| parallelism.get())
         .unwrap_or(1);
 
-    let requested_threads = matches
-        .get_one::<String>("threads")
-        .and_then(|value| value.parse::<usize>().ok())
-        .or(env_threads);
+    let requested_threads = resolve_thread_limit(&matches, env_threads.as_deref())?;
 
     let bonded = resolve_bonded(&matches, env_bonded.as_deref())?;
 
@@ -85,6 +80,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let output_target = output_target_for_path(&output_filename);
     validate_output_path(&output_filename)?;
     validate_distinct_input_output(&input_source, &output_filename)?;
+    validate_distinct_key_output(anonymize.as_deref(), &output_filename)?;
     validate_output_mode(output_target, format, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
@@ -136,6 +132,7 @@ fn build_cli(version: &'static str) -> Command {
   DPP_FULL_FRAGMENTS    Set to 'true' to reassemble IPv4 fragments and enable first-fragment response matching
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
+  DPP_THREADS           Maximum CPU execution budget (positive integer, capped to available CPUs; used if --threads is not specified)
   DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
   DPP_MATCH_TIMEOUT_MS  DNS match timeout in milliseconds; allowed range is 1..=5000, default is 1200
   DPP_BONDED=N          Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity
@@ -202,7 +199,7 @@ LICENSE INFORMATION:
             Arg::new("threads")
                 .long("threads")
                 .short('t')
-                .hide(true)
+                .help("Cap the CPU execution budget (positive integer, never exceeds available CPUs)")
                 .value_name("N")
                 .num_args(1),
         )
@@ -311,6 +308,23 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
     }
 }
 
+fn resolve_thread_limit(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<Option<usize>> {
+    let value = if let Some(cli_value) = matches.get_one::<String>("threads") {
+        cli_value.as_str()
+    } else if let Some(env_value) = env_value {
+        env_value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_THREADS must be valid UTF-8"))?
+    } else {
+        return Ok(None);
+    };
+    let limit = value
+        .parse::<usize>()
+        .with_context(|| format!("Failed to parse CPU thread limit from '{value}'"))?;
+    anyhow::ensure!(limit > 0, "CPU thread limit must be greater than 0.");
+    Ok(Some(limit))
+}
+
 fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usize> {
     if let Some(value) = matches.get_one::<usize>("bonded") {
         return Ok(*value);
@@ -405,6 +419,27 @@ fn validate_distinct_input_output(input_source: &InputSource, output_path: &Path
         );
     }
 
+    Ok(())
+}
+
+fn validate_distinct_key_output(key_path: Option<&Path>, output_path: &Path) -> Result<()> {
+    let Some(key_path) = key_path else {
+        return Ok(());
+    };
+    if matches!(output_target_for_path(output_path), OutputTarget::Stdout) || !output_path.exists()
+    {
+        return Ok(());
+    }
+
+    if same_file::is_same_file(key_path, output_path)
+        .context("Failed to compare anonymization key and output file identities")?
+    {
+        bail!(
+            "Error: Anonymization key '{}' and output path '{}' refer to the same file; refusing to overwrite the key.",
+            key_path.display(),
+            output_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -667,6 +702,57 @@ mod tests {
     }
 
     #[test]
+    fn thread_limit_uses_env_and_cli_takes_precedence() {
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_thread_limit(&env_only, Some(OsStr::new("4"))).unwrap(),
+            Some(4)
+        );
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "2", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_thread_limit(&cli, Some(OsStr::new("4"))).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn invalid_thread_limits_are_rejected() {
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for invalid in ["0", "bad", "184467440737095516160"] {
+            assert!(resolve_thread_limit(&env_only, Some(OsStr::new(invalid))).is_err());
+        }
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "0", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_thread_limit(&cli, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_thread_env_is_rejected_unless_cli_overrides_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0xff]);
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_thread_limit(&env_only, Some(invalid)).is_err());
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "2", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(resolve_thread_limit(&cli, Some(invalid)).unwrap(), Some(2));
+    }
+
+    #[test]
     fn cli_monotonic_capture_flag_is_recognized() {
         let matches = build_cli("test")
             .try_get_matches_from(["dpp", "--monotonic-capture", "input.pcap"])
@@ -749,6 +835,24 @@ mod tests {
             .expect("readable anonymization key is accepted");
 
         fs::remove_file(path).expect("removes temp anonymization key");
+    }
+
+    #[test]
+    fn anonymization_key_and_hard_link_cannot_be_output() {
+        let key_path = unique_temp_path("anonymize.key");
+        let alias_path = unique_temp_path("anonymize-output.csv");
+        fs::write(&key_path, b"secret").expect("writes temp anonymization key");
+        fs::hard_link(&key_path, &alias_path).expect("creates hard link to key");
+
+        for output_path in [&key_path, &alias_path] {
+            let error = validate_distinct_key_output(Some(&key_path), output_path)
+                .expect_err("key alias must not be used as output");
+            assert!(error.to_string().contains("refusing to overwrite the key"));
+        }
+        assert_eq!(fs::read(&key_path).expect("reads preserved key"), b"secret");
+
+        fs::remove_file(alias_path).expect("removes hard link");
+        fs::remove_file(key_path).expect("removes key file");
     }
 
     #[test]

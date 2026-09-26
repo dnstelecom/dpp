@@ -260,7 +260,10 @@ impl AppConfig {
     }
 
     pub(crate) fn execution_budget(&self) -> ExecutionBudget {
-        ExecutionBudget::from_available_cpus(self.num_cpus)
+        let budget_cpus = self
+            .requested_threads
+            .map_or(self.num_cpus, |limit| self.num_cpus.min(limit));
+        ExecutionBudget::from_available_cpus(budget_cpus)
     }
 }
 
@@ -355,5 +358,23 @@ mod tests {
         assert_eq!(budget.staged_reserved_service_threads, 2);
         assert_eq!(budget.staged_worker_budget, 14);
         assert!(budget.uses_staged_pipeline());
+    }
+
+    #[test]
+    fn thread_limit_caps_budget_without_exceeding_available_cpus() {
+        let mut config = test_config();
+        config.num_cpus = 16;
+        config.requested_threads = Some(3);
+
+        let capped = config.execution_budget();
+        assert_eq!(capped.available_cpus, 3);
+        assert_eq!(capped.model, ExecutionModel::PhaseParallel);
+        assert_eq!(capped.rayon_threads, Some(3));
+
+        config.requested_threads = Some(32);
+        let uncapped = config.execution_budget();
+        assert_eq!(uncapped.available_cpus, 16);
+        assert_eq!(uncapped.model, ExecutionModel::Staged);
+        assert_eq!(uncapped.staged_worker_budget, 14);
     }
 }

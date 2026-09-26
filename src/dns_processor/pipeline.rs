@@ -32,6 +32,25 @@ const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
 
+struct WorkerShutdownSignals {
+    shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
+    output_closed: Arc<AtomicBool>,
+}
+
+struct FragmentProcessingConfig {
+    allow_fragments: bool,
+    full_fragments: bool,
+    match_timeout_micros: i64,
+    monotonic_capture: bool,
+}
+
+pub(crate) struct PipelineExecutionConfig {
+    pub(crate) execution_budget: ExecutionBudget,
+    pub(crate) affinity_plan: AffinityPlan,
+    pub(crate) shard_parallelism_enabled: bool,
+}
+
 fn staged_matcher_affinity_slot(worker_idx: usize) -> usize {
     worker_idx
 }
@@ -620,10 +639,13 @@ fn run_phase_processing_worker(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     shard_parallelism_enabled: bool,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<PipelineCounters> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
         (0..shard_count)
             .map(|_| MatcherShardState::default())
@@ -731,11 +753,14 @@ fn run_parser_stage(
     worker_txs: Vec<Sender<MatcherBatchWork>>,
     routing_plan: ShardRoutingPlan,
     output_closed: Arc<AtomicBool>,
-    allow_fragments: bool,
-    full_fragments: bool,
-    match_timeout_micros: i64,
-    monotonic_capture: bool,
+    fragment_config: FragmentProcessingConfig,
 ) -> anyhow::Result<()> {
+    let FragmentProcessingConfig {
+        allow_fragments,
+        full_fragments,
+        match_timeout_micros,
+        monotonic_capture,
+    } = fragment_config;
     let mut batch_seq = 0_u64;
     let mut reassembler = full_fragments
         .then(|| Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture));
@@ -810,10 +835,13 @@ fn run_matcher_worker(
     shard_range: Range<usize>,
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<()> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
     let mut shard_states: Vec<MatcherShardState> = (0..logical_shard_count)
         .map(|_| MatcherShardState::default())
@@ -958,10 +986,13 @@ fn run_staged_processing_pipeline(
     shard_count: usize,
     worker_count: usize,
     affinity_plan: AffinityPlan,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<PipelineCounters> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
     let (result_tx, result_rx) =
         crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH * worker_count.max(1));
@@ -994,9 +1025,11 @@ fn run_staged_processing_pipeline(
                             shard_range,
                             worker_rx,
                             result_tx,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?,
@@ -1023,10 +1056,12 @@ fn run_staged_processing_pipeline(
                     worker_txs,
                     routing_plan,
                     output_closed,
-                    allow_fragments,
-                    full_fragments,
-                    match_timeout_micros,
-                    monotonic_capture,
+                    FragmentProcessingConfig {
+                        allow_fragments,
+                        full_fragments,
+                        match_timeout_micros,
+                        monotonic_capture,
+                    },
                 )
             }
         })?;
@@ -1057,12 +1092,15 @@ impl DnsProcessor {
         packet_parser: &mut PacketParser,
         packet_count: &Arc<AtomicUsize>,
         tx: &Sender<OutputMessage>,
-        execution_budget: ExecutionBudget,
-        affinity_plan: AffinityPlan,
-        shard_parallelism_enabled: bool,
+        config: PipelineExecutionConfig,
         shutdown_requested: Arc<AtomicBool>,
         output_closed: Arc<AtomicBool>,
     ) -> anyhow::Result<ProcessingCounters> {
+        let PipelineExecutionConfig {
+            execution_budget,
+            affinity_plan,
+            shard_parallelism_enabled,
+        } = config;
         let shard_count =
             logical_shard_count(execution_budget.available_cpus, shard_parallelism_enabled);
         let worker_count =
@@ -1072,14 +1110,14 @@ impl DnsProcessor {
 
         if execution_budget.uses_staged_pipeline() {
             tracing::info!(
-                "Execution budget: auto using {} CPUs, staged worker budget: {} shard workers, {} reserved service threads",
+                "Execution budget: {} CPUs, staged worker budget: {} shard workers, {} reserved service threads",
                 execution_budget.available_cpus,
                 worker_count,
                 execution_budget.staged_reserved_service_threads
             );
         } else {
             tracing::info!(
-                "Execution budget: auto using {} CPUs, phase-parallel pipeline selected for low-core host, Rayon worker budget: {}",
+                "Execution budget: {} CPUs, phase-parallel pipeline selected for low-core budget, Rayon worker budget: {}",
                 execution_budget.available_cpus,
                 execution_budget
                     .rayon_threads
@@ -1104,9 +1142,11 @@ impl DnsProcessor {
                             shard_count,
                             worker_count,
                             affinity_plan,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?
@@ -1126,9 +1166,11 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             shard_parallelism_enabled,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?
@@ -1212,6 +1254,14 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    fn test_worker_signals(shutdown_requested: bool) -> WorkerShutdownSignals {
+        WorkerShutdownSignals {
+            shutdown_requested: Arc::new(AtomicBool::new(shutdown_requested)),
+            intake_failed: Arc::new(AtomicBool::new(false)),
+            output_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
     fn shard_result(token: usize) -> ShardProcessingResult {
         ShardProcessingResult {
@@ -1385,9 +1435,11 @@ mod tests {
             &mut parser,
             &packet_count,
             &output_tx,
-            ExecutionBudget::from_available_cpus(5),
-            affinity_plan,
-            true,
+            PipelineExecutionConfig {
+                execution_budget: ExecutionBudget::from_available_cpus(5),
+                affinity_plan,
+                shard_parallelism_enabled: true,
+            },
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1527,9 +1579,11 @@ mod tests {
                 &mut parser,
                 &packet_count,
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             );
@@ -1573,9 +1627,11 @@ mod tests {
                 &mut parser,
                 &packet_count,
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1683,9 +1739,11 @@ mod tests {
                 &mut parser,
                 &Arc::new(AtomicUsize::new(0)),
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1797,9 +1855,11 @@ mod tests {
                 &mut parser,
                 &packet_count,
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1916,9 +1976,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("phase worker completes");
 
@@ -1954,9 +2012,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("phase worker completes");
 
@@ -1983,9 +2039,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(true),
         )
         .expect("phase worker completes");
 
@@ -2025,9 +2079,7 @@ mod tests {
             worker_range,
             batch_rx,
             result_tx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("matcher worker completes");
 
@@ -2075,9 +2127,7 @@ mod tests {
             worker_range,
             batch_rx,
             result_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(true),
         )
         .expect("matcher worker completes");
 

@@ -75,8 +75,8 @@ In the current multi-threaded implementation, those stages are realized as a bou
 reader, a lightweight routing stage, shard-owned workers, a deterministic aggregator, and
 asynchronous writers. The routing stage performs only cheap L3/L4 extraction, computes a canonical
 client/resolver flow key, and hands owned packet batches to the correct worker before full DNS
-decode begins. DPP derives its execution budget from all available CPUs; there is no supported
-runtime thread-count override. On low-core hosts, DPP falls back to the simpler phase-parallel
+decode begins. DPP derives its execution budget from available CPUs, capped by `--threads` or
+`DPP_THREADS` when specified. On low-core budgets, DPP falls back to the simpler phase-parallel
 pipeline so it does not spend too much of the machine on staged-pipeline service roles. In staged
 mode, the runtime reserves two non-worker service threads for routing/aggregation and parser work,
 and uses the remaining CPU budget for shard workers. Routed DNS packets also carry compact UDP/DNS
@@ -101,7 +101,8 @@ or second encoding of canonical addresses and ports.
   high/low timestamp words using the interface's full binary/decimal resolution and signed offset.
   Conversion scales the complete counter before rounding to microseconds and saturates only the
   final signed timestamp. It never invokes the dependency's stateful timestamp conversion.
-  Buffers grow with received block bytes rather than untrusted declared lengths. Stdin probing
+  Buffers grow with received block bytes rather than untrusted declared lengths, and stdin PCAPNG
+  blocks over 16 MiB are rejected before their body is read. Stdin probing
   needs no temp-file or second ingest owner. Unsupported stdin stream magic is rejected explicitly.
   Signal-driven shutdown can interrupt a blocked stdin read without waiting for the producer to
   close the stream; capture reading remains parser-owned. Packets already read into a nonempty
@@ -188,6 +189,10 @@ or second encoding of canonical addresses and ports.
   duplicate and may be suppressed; the same holds for a fully identical new datagram. Reassembly
   state must remain bounded in memory, and IPv6 fragments remain unsupported. A fragmented UDP datagram must
   have an IP payload length equal to its UDP Length; mismatched fragment sets are rejected.
+  A first non-DNS UDP fragment removes any earlier tails for its datagram key. A separate bounded
+  history drops later non-DNS tails without evicting the completed-DNS history; a new DNS first
+  fragment with a reused IPv4 ID removes that non-DNS mark. Ethernet VLAN tags are part of the
+  fragment key so traffic from different tagged segments is not assembled together.
   The optional runtime flag
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
@@ -247,8 +252,8 @@ or second encoding of canonical addresses and ports.
   pipeline execution (0006), and packet-storage allocation experiments (0007).
 
 - `docs/encapsulation-playbook.md`
-  Operational and engineering guidance for captures that contain VLAN, QinQ, MPLS, or other outer
-  encapsulation layers before the IP header.
+  Operational and engineering guidance for captures with unsupported MPLS or other outer
+  encapsulation layers before the IP header. Ethernet VLAN and QinQ are decoded natively.
 
 - `benches/README.md`
   Documents the benchmark contract, safety expectations, and result layout for repeatable runs.
@@ -394,8 +399,9 @@ The required boundary is:
   permutation with an independently derived AES key, so distinct IPv4 addresses cannot collide.
   IPv6 retains its original AES block mapping. The IPv4 mapping changed with this algorithm;
   exports from before and after the change cannot be joined by pseudonymized IPv4 address.
-- The pseudonymization key derivation uses a fixed PBKDF2 salt by design so the same passphrase
-  yields stable output across runs and hosts. The operator-provided passphrase remains the secret
-  rotation boundary.
+- Legacy text key files retain the fixed PBKDF2 salt so existing pseudonyms remain stable across
+  runs and hosts. The optional salted v2 key-file format supplies a 32-byte salt for both IPv4 and
+  IPv6 key derivation. Reusing the full file keeps its mapping stable; changing the salt or
+  passphrase rotates both mappings. Key loading and derivation are owned by `anonymizer.rs`.
 - `docs/rfc/` and `benches/` remain the canonical references for accepted architecture decisions
   and repeatable benchmark runs.

@@ -16,7 +16,7 @@ mod types;
 
 #[cfg(test)]
 use crate::config::DEFAULT_MATCH_TIMEOUT_MS;
-pub(crate) use pipeline::ProcessingCounters;
+pub(crate) use pipeline::{PipelineExecutionConfig, ProcessingCounters};
 use std::io;
 use std::net::IpAddr;
 use std::path::Path;

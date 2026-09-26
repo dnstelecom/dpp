@@ -623,6 +623,78 @@ fn maximum_wire_qname_round_trips_with_full_escaped_presentation() {
 }
 
 #[test]
+fn anonymization_key_is_not_overwritten_by_output_alias() {
+    let input_path = temp_test_path("key-output-alias", "pcap");
+    let key_path = temp_test_path("key-output-alias", "key");
+    let alias_path = temp_test_path("key-output-alias", "csv");
+    let distinct_output = temp_test_path("key-output-distinct", "csv");
+    fs::write(&input_path, classic_pcap_bytes(&[])).expect("empty pcap written");
+    fs::write(&key_path, b"secret-passphrase\n").expect("key written");
+    fs::hard_link(&key_path, &alias_path).expect("hard link to key created");
+
+    for output_path in [&key_path, &alias_path] {
+        let output = Command::new(dpp_binary())
+            .arg("--anonymize")
+            .arg(&key_path)
+            .arg(&input_path)
+            .arg(output_path)
+            .output()
+            .expect("dpp executed");
+        assert!(!output.status.success(), "key alias must be rejected");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to overwrite the key"));
+        assert_eq!(
+            fs::read(&key_path).expect("key remains readable"),
+            b"secret-passphrase\n"
+        );
+    }
+
+    let output = Command::new(dpp_binary())
+        .arg("--anonymize")
+        .arg(&key_path)
+        .arg(&input_path)
+        .arg(&distinct_output)
+        .output()
+        .expect("dpp executed with distinct output");
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_file(input_path).expect("remove input pcap");
+    fs::remove_file(alias_path).expect("remove key alias");
+    fs::remove_file(key_path).expect("remove key");
+    fs::remove_file(distinct_output).expect("remove distinct output");
+}
+
+#[test]
+fn thread_cap_changes_reported_execution_budget() {
+    let input_path = temp_test_path("thread-cap", "pcap");
+    let output_path = temp_test_path("thread-cap", "csv");
+    fs::write(&input_path, classic_pcap_bytes(&[])).expect("empty pcap written");
+
+    let output = Command::new(dpp_binary())
+        .args(["--threads", "1", "--report-format", "json"])
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("dpp executed");
+    assert!(
+        output.status.success(),
+        "dpp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON report parses");
+    assert_eq!(report["execution"]["available_cpus"], 1);
+    assert_eq!(report["execution"]["model"], "phase_parallel");
+    assert_eq!(report["execution"]["rayon_threads"], 1);
+
+    fs::remove_file(&input_path).expect("remove input pcap");
+    fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
 fn oversized_wire_qname_is_rejected_and_reported() {
     let input_path = temp_test_path("oversized-wire-qname", "pcap");
     let output_path = temp_test_path("oversized-wire-qname", "csv");

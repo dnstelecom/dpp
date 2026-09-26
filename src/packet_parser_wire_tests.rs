@@ -331,23 +331,28 @@ fn preserves_block_and_packet_length_validation() {
 }
 
 #[test]
-fn rejects_huge_truncated_blocks_without_reserving_the_declared_length() {
-    let mut capture = WireCapture::new(Order::Little);
-    capture.bytes.extend(6_u32.to_le_bytes());
-    capture.bytes.extend(0xffff_fffc_u32.to_le_bytes());
-    capture.bytes.extend([0; 4]);
-    let mut parser = parser(capture.bytes);
-    assert!(
-        parser
-            .next_batch(8)
-            .unwrap_err()
-            .to_string()
-            .contains("Truncated pcapng block")
-    );
-    let PacketBackend::PcapNg(reader) = &parser.backend else {
-        panic!("pcapng backend")
-    };
-    assert!(reader.block_bytes.capacity() < 1024 * 1024);
+fn rejects_oversized_or_truncated_blocks_without_reserving_the_declared_length() {
+    for (declared_len, expected_error) in [
+        (0xffff_fffc_u32, "exceeds maximum"),
+        (1024_u32, "Truncated pcapng block"),
+    ] {
+        let mut capture = WireCapture::new(Order::Little);
+        capture.bytes.extend(6_u32.to_le_bytes());
+        capture.bytes.extend(declared_len.to_le_bytes());
+        capture.bytes.extend([0; 4]);
+        let mut parser = parser(capture.bytes);
+        assert!(
+            parser
+                .next_batch(8)
+                .unwrap_err()
+                .to_string()
+                .contains(expected_error)
+        );
+        let PacketBackend::PcapNg(reader) = &parser.backend else {
+            panic!("pcapng backend")
+        };
+        assert!(reader.block_bytes.capacity() < 1024 * 1024);
+    }
 }
 
 #[test]
