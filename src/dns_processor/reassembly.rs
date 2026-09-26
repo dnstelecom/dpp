@@ -650,7 +650,7 @@ fn classify_fragment(packet: &PacketData) -> FragmentInput {
     };
     if payload.is_empty()
         || end > usize::from(u16::MAX) - IPV4_MIN_HEADER_LEN
-        || (more_fragments && payload.len() % 8 != 0)
+        || (more_fragments && !payload.len().is_multiple_of(8))
     {
         return FragmentInput::Skip;
     }
