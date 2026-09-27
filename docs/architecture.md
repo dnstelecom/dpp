@@ -189,6 +189,8 @@ or second encoding of canonical addresses and ports.
   duplicate and may be suppressed; the same holds for a fully identical new datagram. Reassembly
   state must remain bounded in memory, and IPv6 fragments remain unsupported. A fragmented UDP datagram must
   have an IP payload length equal to its UDP Length; mismatched fragment sets are rejected.
+  When the first fragment arrives after tails, its UDP Length also bounds every retained tail;
+  a nonfinal fragment cannot reach or exceed that boundary, regardless of arrival order.
   A first non-DNS UDP fragment removes any earlier tails for its datagram key. A separate bounded
   history drops later non-DNS tails without evicting the completed-DNS history; a new DNS first
   fragment with a reused IPv4 ID removes that non-DNS mark. Ethernet VLAN tags are part of the

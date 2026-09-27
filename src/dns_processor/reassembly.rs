@@ -208,6 +208,13 @@ impl PendingDatagram {
                 || self
                     .final_payload_length
                     .is_some_and(|last| last != udp_length)
+                || self.segments.last_key_value().is_some_and(|(offset, segment)| {
+                    // Disjoint intervals have increasing ends, so the last retained
+                    // tail is enough to validate the newly known UDP boundary.
+                    let segment_end = offset + segment.payload.len();
+                    segment_end > udp_length
+                        || (segment.more_fragments && segment_end == udp_length)
+                })
             {
                 return Err(());
             }
@@ -1266,6 +1273,37 @@ mod tests {
         ]);
         assert!(output.is_empty());
         assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn nonfinal_payload_at_or_beyond_udp_length_is_rejected_in_both_orders() {
+        // The fixture declares UDP Length=40; these eight-byte tails end at 40 and 48.
+        for offset in [32_u16, 40] {
+            for tail_first in [false, true] {
+                let mut reassembler = Ipv4FragmentReassembler::new(1_200, true);
+                let (first_ordinal, tail_ordinal) = if tail_first { (2, 1) } else { (1, 2) };
+                let mut tail = packet(24, false, tail_ordinal, 99 + tail_ordinal as i64);
+                let mut bytes = tail.data.as_slice().to_vec();
+                bytes.truncate(ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 8);
+                bytes[16..18].copy_from_slice(&(IPV4_MIN_HEADER_LEN as u16 + 8).to_be_bytes());
+                bytes[20..22].copy_from_slice(&(MORE_FRAGMENTS | offset / 8).to_be_bytes());
+                tail.data = PacketPayload::owned(bytes.into_boxed_slice());
+                let first = packet(0, true, first_ordinal, 99 + first_ordinal as i64);
+                let input = if tail_first {
+                    vec![tail, first]
+                } else {
+                    vec![first, tail]
+                };
+
+                let (output, pending) = reassembler.process_batch(input);
+                assert!(output.is_empty(), "offset={offset}, tail_first={tail_first}");
+                assert_eq!(pending, None, "offset={offset}, tail_first={tail_first}");
+                assert!(
+                    reassembler.finish().is_empty(),
+                    "invalid tails must not produce prefix fallback: offset={offset}, tail_first={tail_first}"
+                );
+            }
+        }
     }
 
     #[test]
