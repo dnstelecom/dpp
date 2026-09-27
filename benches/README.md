@@ -9,6 +9,10 @@ This directory is the canonical location for repeatable performance measurements
   comparisons.
 - `protocol-correctness-audit.md`: final validation, restored throughput and measured memory costs
   of the 2026-09-05 protocol and matcher fixes, with earlier experiments identified separately.
+- `dns-compression.md`: configurable compression limits, message-local suffix caching,
+  repeated performance measurements and reproduction instructions.
+- `dns-compression-benchmark.py` and `dns-compression/`: synthetic end-to-end and isolated
+  scanner benchmarks for short names, shared suffixes and deep pointer chains.
 
 ## Safety Contract
 
