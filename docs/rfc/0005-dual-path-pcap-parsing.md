@@ -1,173 +1,202 @@
-# RFC 0005 — Dual-Path PCAP Parsing and Monotonic Timestamp Contract
+# RFC 0005 — Dual-path PCAP parsing and monotonic timestamp contract
 
-Status: Accepted  
-Date: 2025-08-18
+**Status:** Accepted · **Date:** 2025-08-18
 
 ## Problem
 
-PCAP comes in two major flavors: classic PCAP (the original tcpdump format) and PCAPNG (the newer,
-more featureful format). Most large DNS captures in production are still classic PCAP, but PCAPNG
-shows up often enough that ignoring it isn't an option.
+DPP must read both classic PCAP and PCAPNG. Most large DNS captures use classic PCAP, where
+per-packet `libpcap` FFI calls and opaque buffering add avoidable overhead. A pure-Rust reader
+gives DPP more control over this common path.
 
-The challenge is that `libpcap` — the standard C library for reading both formats — carries
-overhead that matters at scale: FFI crossings on every packet, less control over buffering, and
-an opaque internal state machine. For classic PCAP, we can do better with a pure-Rust reader.
-For regular-file PCAPNG and other non-classic formats, we still rely on fallback compatibility
-today. For stdin streams, however, probing consumes bytes that cannot be rewound safely on pipes,
-so the parser must stay stream-native once it has inspected the magic bytes.
+Regular files can retain `libpcap` fallback compatibility. Stdin needs a different approach:
+probing consumes bytes that a pipe cannot safely rewind, so the parser must stay stream-native
+after inspecting the magic bytes.
 
-Separately, some captures are known to be globally monotonic by timestamp — every packet's
-timestamp is ≥ the previous one. When that holds, the matcher can use batch-level watermarks
-to evict stale state in bulk instead of checking timeouts per-query. But if the assumption is
-wrong, the results are silently incorrect. So the contract needs teeth.
+Some captures also have globally non-decreasing timestamps. This permits bulk matcher eviction
+using batch-level watermarks, but a timestamp regression would make that eviction unsafe.
+Enabling the optimization therefore requires strict validation.
 
 ## Decision
 
+The parser selects a reader for the input source and format, owns timestamp conversion, and
+validates protocol boundaries before handing packets to DNS matching.
+
+- [Parsing backends](#parsing-backends)
+- [PCAPNG timestamp ownership](#pcapng-timestamp-ownership)
+- [IP and UDP boundaries](#ip-and-udp-boundaries)
+- [DNS QNAME boundary](#dns-qname-boundary)
+- [Monotonic timestamp contract](#monotonic-timestamp-contract)
+
 ### Parsing backends
 
-`PacketParser` (in `src/packet_parser.rs`) picks the backend at open time by inspecting the
-file's magic bytes when the input source is a regular file:
+[`PacketParser`](../../src/packet_parser.rs) selects a backend at open time by inspecting the
+first four bytes:
 
-- **Classic PCAP** → pure-Rust streaming reader via `pcap-file`. No FFI, no `libpcap` dependency
-  on this path. The reader is zero-copy where possible and gives us full control over buffering
-  and batch construction.
+| Input source and format | Backend or outcome |
+| --- | --- |
+| Regular file: classic PCAP | Pure-Rust streaming reader via `pcap-file`; no FFI or `libpcap` on this path |
+| Regular file: PCAPNG or another non-classic format | `libpcap` fallback via the `pcap` crate |
+| EOF-terminated stdin: classic PCAP | Pure-Rust reader via `pcap-file`, with parser-owned probe-and-replay |
+| EOF-terminated stdin: PCAPNG | Parser-owned block framing and section-local interface table; stateless validation via `pcap-file` |
+| EOF-terminated stdin: unknown magic | Explicit rejection |
 
-- **Everything else** (PCAPNG, modified formats) → `libpcap` fallback via the `pcap` crate.
-  Correct but slower. This path exists so DPP doesn't reject valid captures — it just won't be
-  as fast.
+The pure-Rust classic reader is zero-copy where possible and owns buffering and batch
+construction. The regular-file fallback preserves compatibility at a higher processing cost.
 
-- **EOF-terminated stdin classic PCAP streams** → pure-Rust streaming reader via `pcap-file`,
-  using parser-owned probe-and-replay so the same stdin byte stream remains the single source of
-  truth.
+Stdin probing replays bytes into the same stream, preserving one input owner. DPP neither reopens
+an inspected stdin stream through `libpcap` nor creates a temporary file or hidden second ingest
+path for unsupported formats.
 
-- **EOF-terminated stdin PCAPNG streams** → parser-owned pure-Rust block framing and one
-  section-local interface table, with stateless block/body/option validation via `pcap-file`.
-  Once stdin bytes have been inspected, the parser stays stream-native instead of trying to
-  reopen the stream through a second owner.
+| Format | Recognized magic values |
+| --- | --- |
+| Classic PCAP | `0xa1b2c3d4`, `0xd4c3b2a1` |
+| Classic PCAP, nanosecond resolution | `0xa1b23c4d`, `0x4d3cb2a1` |
+| PCAPNG | `0x0a0d0d0a` |
 
-- **EOF-terminated stdin streams with unknown magic** → explicit rejection. DPP does not create a
-  temp file or hidden second ingest path to recover fallback compatibility for unsupported stdin
-  stream formats.
-
-The detection is a simple 4-byte magic check (`0xa1b2c3d4` or `0xd4c3b2a1` for classic,
-`0xa1b23c4d` or `0x4d3cb2a1` for nanosecond-resolution classic, `0x0a0d0d0a` for PCAPNG). For
-regular files, everything else goes to `libpcap`. For stdin streams, everything else is rejected.
+Other magic values go to `libpcap` for regular files and are rejected for stdin.
 
 ### PCAPNG timestamp ownership
 
-The parser reads timestamp high/low words separately in section byte order for both Enhanced
-Packet Blocks and legacy Packet Blocks. It applies each interface's `if_tsresol` and signed
-`if_tsoffset` exactly once. All seven-bit resolution exponents are accepted; the complete raw
-counter is scaled before integer rounding to microseconds, including sub-nanosecond units.
-The final timestamp saturates to `i64` only after adding the signed offset. New sections reset
-the interface table and may change byte order.
+#### Conversion rules
 
-The stateful `pcap-file 3.0.0-rc1` reader is deliberately bypassed: it swaps legacy little-endian
+For both Enhanced Packet Blocks and legacy Packet Blocks, the parser:
+
+1. Reads the timestamp high/low words separately in section byte order.
+2. Applies the interface's `if_tsresol` exactly once, scaling the complete raw counter before
+   integer rounding to microseconds. This includes sub-nanosecond units and all seven-bit
+   resolution exponents.
+3. Adds the signed `if_tsoffset` exactly once.
+4. Saturates the final timestamp to `i64`.
+
+Each new section resets the interface table and may change byte order.
+
+#### Dependency boundary
+
+DPP bypasses the stateful `pcap-file 3.0.0-rc1` reader. That reader swaps legacy little-endian
 timestamp words, mis-scales binary resolutions, ignores offsets, and panics on exponent 30.
+The stateless decoder accepts the wire resolution field without the faulty conversion and
+remains responsible for structural validation.
+
 The newer `3.0.0-rc.3`, inspected on 2026-09-05, fixes those calculations but still rejects
 sub-nanosecond resolutions and dates before the Unix epoch. Upgrading alone does not satisfy
-this timestamp contract. The existing stateless decoder accepts the wire resolution field
-without applying the faulty conversion, and remains responsible for structural validation.
+this timestamp contract.
+
+#### Structural validation and fixtures
 
 The parser validates referenced interfaces, captured/original/snap lengths, and uniqueness of
-timestamp options. Input buffers grow only as bytes arrive; a huge declared length on a truncated
-stream cannot trigger allocation of that entire declared block. Independent manually encoded
-fixtures cover both byte orders and packet-block formats, interface offsets, resolution extremes,
-section resets, truncation, and malformed lengths/options. Tests must not encode expected
-timestamp layouts with the same dependency writer whose decoder they are validating.
+timestamp options. Buffers grow only as bytes arrive: a huge declared length on a truncated
+stream must not trigger allocation of that entire block.
+
+Manually encoded fixtures cover both byte orders and packet-block formats, interface offsets,
+resolution extremes, section resets, truncation, and malformed lengths/options. Expected layouts
+must not be encoded with the same dependency writer whose decoder the test is validating.
 
 ### IP and UDP boundaries
 
-The routing stage and shard-local DNS decoder share one `ParsedUdpDnsMeta` value containing the
-validated DNS offset and length. IPv4 Total Length or IPv6 Payload Length first bounds the IP
-payload; UDP Length then bounds the DNS payload. Bytes outside either declared boundary, including
-Ethernet padding and trailing capture bytes, never reach a DNS decoder.
+Routing and shard-local DNS decoding share one `ParsedUdpDnsMeta` value containing the validated
+DNS offset and length. IPv4 Total Length or IPv6 Payload Length first bounds the IP payload;
+UDP Length then bounds DNS. Ethernet padding and trailing capture bytes outside either boundary
+never reach a DNS decoder.
 
-By default, IPv4 datagrams with the More Fragments flag or a non-zero fragment offset are skipped.
-With `--allow-fragments`, a first IPv4 response fragment may be matched when its DNS header and
-entire question fit in the fragment. The metadata bounds DNS bytes to the observed fragment and
-marks the response as partial. This is an inference from the prefix, not validation of the full UDP
-datagram. A response code is emitted only if there are no additional records or all declared DNS
-records fit in the prefix.
-With `--full-fragments`, DPP also reconstructs complete IPv4 datagrams across packet batches. This
-mode implies `--allow-fragments`; incomplete responses may use the prefix heuristic on capacity
-eviction or end of input, and on elapsed capture-time timeout with `--monotonic-capture`.
-Fragmented queries require complete reassembly. The reassembler keys
-fragments by source, destination, protocol, and IPv4 identification, places payload bytes at the
-declared eight-octet offsets, and waits for the first fragment, final fragment, and contiguous
-coverage before sending a datagram through the existing UDP/DNS parser. Fragmented IP payload
-length must equal the declared UDP Length; mismatches are rejected. Complete datagrams carry
-the final fragment's (`MF=0`) capture timestamp; prefix fallbacks retain the first fragment's
-timestamp. The reassembler bounds incomplete state
-to prevent unbounded capture-driven memory growth. Neither mode reassembles IPv6 fragments.
-IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication and atomic
+#### IPv4 fragmentation modes
+
+| Mode | Accepted fragment processing |
+| --- | --- |
+| Default | Skip IPv4 datagrams with More Fragments set or a non-zero fragment offset |
+| `--allow-fragments` | Allow inference from a first response fragment containing the complete DNS header and question |
+| `--full-fragments` | Reconstruct complete IPv4 datagrams across batches; implies `--allow-fragments` |
+
+With `--allow-fragments`, metadata bounds DNS bytes to the observed fragment and marks the
+response as partial. This is inference from a prefix, not validation of the full UDP datagram.
+A response code is emitted only if no additional records exist or all declared DNS records fit
+in that prefix.
+
+With `--full-fragments`, incomplete responses may use prefix inference on capacity eviction or
+EOF. Elapsed capture-time timeout can also trigger fallback when `--monotonic-capture` is enabled.
+Fragmented queries require complete reassembly.
+
+The reassembler keys fragments by source, destination, protocol, and IPv4 identification. Payload
+bytes use the declared eight-octet offsets. A datagram reaches the existing UDP/DNS parser only
+when the first fragment, final fragment, and contiguous coverage are present. Its fragmented IP
+payload length must equal UDP Length; mismatches are rejected.
+
+Complete datagrams use the final fragment's (`MF=0`) capture timestamp. Prefix fallbacks retain
+the first fragment's timestamp. Incomplete state is bounded to prevent unbounded memory growth.
+Neither fragment mode reassembles IPv6.
+
+#### IPv6 extension headers
+
+IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication, and atomic
 Fragment headers with per-header bounds checks. Non-atomic fragments require reassembly and are
-skipped. The DNS offset can exceed 65535 after a long valid extension chain. Internal metadata
-stores a checked `u16` delta from the minimum 42-byte Ethernet/IPv4/UDP prefix and reconstructs
-the absolute offset when accessing packet bytes. A maximum IPv6 frame ends at byte 65589 and
-must leave at least 12 DNS bytes, so this delta covers the full supported range. The UDP-bounded
-DNS length remains `u16`; routing metadata is 42 bytes on the measured macOS ARM64 target.
+skipped.
+
+#### Compact DNS offsets
+
+A valid IPv6 extension chain can place DNS beyond byte 65535. Internal metadata stores a checked
+`u16` delta from the minimum 42-byte Ethernet/IPv4/UDP prefix and reconstructs the absolute offset
+when accessing packet bytes.
+
+A maximum IPv6 frame ends at byte 65589 and must leave at least 12 DNS bytes, so the delta covers
+the supported range. The UDP-bounded DNS length remains `u16`. Routing metadata measures 42 bytes
+on the tested macOS ARM64 target.
 
 ### DNS QNAME boundary
 
-The standard `hickory` DNS question decoder and the optional custom DNS wire fast path enforce the
-same RFC 1035 boundary after name decompression. A QNAME may occupy at most 255 wire octets,
-including label-length octets and the terminating root octet. Its escaped presentation form can be
-as large as 1003 bytes and remains valid input; DPP preserves it for matching and export rather than
-replacing it with an empty name.
-Both question decoders reject compression pointers that point forward or overlap the current name.
-The fast path's fallback must not become a way to accept a message the semantic decoder rejects.
-Ordinary QUERY messages (OPCODE 0) with QDCOUNT greater than one are malformed under RFC 9619 and
-are rejected by both decoders. Responses that declare answer or authority records must contain
-those complete records even when ARCOUNT is zero; the decoder checks their wire boundaries before
-the matcher sees the response.
+#### Shared decoder rules
 
-If any decompressed QNAME exceeds the wire limit, the entire DNS message is rejected before matcher
-or writer handoff. The processing counter `oversized_qname_message_count` increments exactly once
-for that message, regardless of its question count, and the JSON report exposes the same DNS-message
-unit as `metrics.dns_messages_rejected_oversized_qname`. No question from the rejected message may
-enter matcher state or output.
+The standard `hickory` question decoder and optional custom wire fast path enforce the same
+RFC 1035 limit after decompression: at most **255 wire octets**, including label-length octets
+and the terminating root. An escaped presentation form can reach **1003 bytes** and remains
+valid; DPP preserves it for matching and export.
+
+Both decoders also enforce these rules:
+
+- Reject compression pointers that point forward or overlap the current name. Fast-path fallback
+  must not accept a message the semantic decoder rejects.
+- Reject ordinary QUERY messages (OPCODE 0) with QDCOUNT greater than one, as required by RFC 9619.
+- Require complete declared answer and authority records even when ARCOUNT is zero. Their wire
+  boundaries are checked before matcher handoff.
+
+#### Oversized-name rejection
+
+If any decompressed QNAME exceeds the wire limit, reject the entire DNS message before matcher
+or writer handoff. No question from it may enter matcher state or output.
+
+`oversized_qname_message_count` increments exactly once per rejected message, regardless of
+question count. The JSON metric `metrics.dns_messages_rejected_oversized_qname` uses the same
+DNS-message unit.
 
 ### Monotonic timestamp contract
 
-The `--monotonic-capture` flag opts into a strict invariant: packet timestamps must be globally
-non-decreasing. When enabled:
+`--monotonic-capture` requires globally non-decreasing packet timestamps:
 
-- `PacketParser` tracks timestamp regressions and **fails hard** on the first one, instead of
-  logging a warning and continuing.
-- The pipeline can use the batch-maximum timestamp as a global eviction watermark (see
-  RFC 0004), which keeps matcher memory bounded on long captures.
+| Mode | Timestamp regression | Matcher eviction |
+| --- | --- | --- |
+| Enabled | `PacketParser` fails on the first regression | Use the batch-maximum timestamp as a global eviction watermark, keeping matcher memory bounded on long captures |
+| Disabled (default) | Track regressions and report a post-run warning with the first offending sample | Check per-query timeouts at finalization; long captures with many pending queries use more memory |
 
-When disabled (the default):
-
-- Timestamp regressions are tracked and reported as a post-run warning with the first offending
-  sample.
-- The matcher falls back to per-query timeout checks at finalization time — correct but uses
-  more memory on long captures with many in-flight queries.
+The watermark contract is detailed in [RFC 0004](0004-forward-only-matcher.md#batched-timeout-eviction).
 
 ## Why not always use libpcap?
 
-Performance. On a 10 GB classic PCAP, the pure-Rust reader is measurably faster because it
-avoids per-packet FFI overhead and gives us direct control over read buffering. The difference
-is most visible on high-packet-rate captures where the per-packet cost dominates.
+On a 10 GB classic PCAP, the pure-Rust reader is measurably faster because it avoids per-packet
+FFI and gives DPP control over read buffering. The difference is most visible when high packet
+rates make per-packet cost dominant.
 
-The `pcap-file` crate is currently pinned to a `3.0.0-rc1` release candidate because the stable
-line doesn't expose the API we need. This is a known dependency risk — if the RC is abandoned,
-we'll need to vendor or fork.
+`pcap-file` is pinned to `3.0.0-rc1` because the stable line lacks the required API. This is a
+dependency risk: if the release candidate is abandoned, DPP will need to vendor or fork it.
 
 ## Why fail-fast on monotonic violations?
 
-Because silent data corruption is worse than a crash. If someone passes `--monotonic-capture` on
-a capture that isn't actually monotonic, the batched eviction will retire queries too early and
-produce incorrect timeout counts. A hard error on the first regression makes the failure obvious
-and actionable.
+A timestamp regression can cause batched eviction to retire queries too early and produce
+incorrect timeout counts. Failing on the first regression makes a violated assumption visible
+instead of silently returning incorrect results.
 
 ## Consequences
 
-- Adding support for a new capture format means adding a new `PacketBackend` variant, not
-  changing the parser interface.
-- The pure-Rust reader is the performance-critical path. Changes to it should be benchmarked.
-- Stdin support stays within the offline-processing contract and now uses parser-owned stream-native
-  backends for classic PCAP and PCAPNG so stdin probing does not create a second ingest owner.
-- Regular-file fallback compatibility for non-classic formats still relies on `libpcap`.
-- The `pcap-file` RC dependency should be revisited when a stable release is available.
+- Add new capture formats through a new `PacketBackend` variant; keep the parser interface stable.
+- Benchmark changes to the pure-Rust reader: it is the performance-critical path.
+- Keep stdin within the offline-processing contract, using parser-owned stream-native backends
+  for classic PCAP and PCAPNG.
+- Retain `libpcap` fallback compatibility for non-classic regular files.
+- Revisit the `pcap-file` release candidate when a suitable stable release is available.

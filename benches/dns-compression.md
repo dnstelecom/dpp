@@ -1,12 +1,26 @@
 # DNS compression validation and performance
 
+This document records compression behavior, benchmark commands and results for the initial
+implementation and its later RR-loop inlining fix. The result sections identify the measured
+commits; their timings and test counts describe those revisions.
+
+- [Behavior and validation](#behavior-and-validation)
+- [Initial measurement method](#initial-measurement-method-400acc5)
+- [Reproduction](#reproduction)
+- [Follow-up: RR-loop inlining](#follow-up-rr-loop-inlining-9b329b9)
+- [Initial results](#initial-results-400acc5)
+
 ## Behavior and validation
+
+### Compression limits
 
 `--max-dns-compression-jumps` defaults to 32. The environment equivalent is
 `DPP_MAX_DNS_COMPRESSION_JUMPS`; an explicit CLI value takes precedence. Zero disables
 the jump-count policy, while backward-pointer, bounds and nonoverlap checks remain
 mandatory. The policy covers questions, scanned RR owners and TSIG algorithm names,
 including partial responses and the optional wire fast path's Hickory fallback.
+
+### Decoder ownership and scan paths
 
 The decoder belongs to one immutable DNS message. Cached suffixes retain their
 encoded segment end, expanded length, pointer depth and first label. Reuse checks
@@ -17,7 +31,9 @@ successful walk. No cache survives the message or crosses worker ownership.
 Short RR-owner walks use a direct scanner: at most eight pointers and 64 literal
 bytes per referenced segment. Crossing either threshold switches to the cached
 scanner from the original name offset. These thresholds select an implementation,
-not a different acceptance policy. Uncompressed questions in the optional fast
+not a different acceptance policy.
+
+Uncompressed questions in the optional fast
 path retain a single-pass formatter. Compressed questions are validated before
 Hickory receives their expanded wire form, avoiding recursive replay of long
 pointer chains.
@@ -26,170 +42,17 @@ The RR section loop and metadata reader are both explicitly inlined. This lets
 the compiler remove metadata unused by answer/authority scans and retain the
 scan cursor in registers; see the follow-up investigation below.
 
+### Validation coverage
+
 The tests cover exact jump boundaries, zero/unlimited, warmed-cache depth and
 overlap checks, literal versus compressed OPT roots, TSIG, partial fragments,
 malformed and oversized questions, per-message isolation, and bounded traversal
-work. The strictly backward, nonoverlapping walker accepts a synthetic raw name
+work.
+
+The strictly backward, nonoverlapping walker accepts a synthetic raw name
 with 8,193 pointer transitions when unlimited; normal DNS record framing further
 limits how many such segments fit into a message. The deep benchmark is a valid
 64,419-byte DNS response with 4,600 RRs and a maximum depth of 1,170.
-
-## Follow-up: RR-loop inlining (`9b329b9`)
-
-The initial short-message regression was investigated with single-factor builds
-from the same source directory, compiler, dependencies and profile. Five alternating
-pairs were used for screening, with ten-pair confirmation of the selected fix.
-Production validation and cache behavior are unchanged by the fix: it adds only
-`#[inline(always)]` to `skip_dns_resource_records` and
-`read_dns_resource_record_meta`, plus comments explaining why both are needed.
-
-### Mechanism and controls
-
-The arm64 disassembly of `7807751` contains the RR scan directly inside
-`decode_response_code_with_sections`. The compiler keeps the scan cursor in a
-register and removes unused metadata, including TTL, from answer/authority scans.
-In `400acc5`, `read_dns_resource_record_meta` became a separate 656-byte function
-called for every RR. Each call creates a 64-byte stack frame, saves/restores six
-registers, reads TTL and writes the full metadata result to the stack. The caller
-then reads only the fields needed by that section.
-
-The earlier uncached-scanner control **also retained this separate function**.
-Consequently, disabling suffix caching in that control did not isolate the loss
-of inlining around it. This is an indirect compiler consequence of integrating
-the new decoder, rather than the cost of HashMap lookups on these fixtures.
-
-Forcing only the metadata reader inline (F) removed the per-RR calls and dead
-metadata, but left the section loop as a separate function; timing did not
-improve consistently. Forcing both levels inline (G, the selected fix) restored
-the loop within the caller, including a register-held cursor, and produced the
-measured improvement. Overflow, fixed-header length and full RDATA bounds checks
-remain in the resulting code.
-
-| Screen: one change from the stated control | Literal-eight ratio [IQR] | Conclusion |
-| --- | ---: | --- |
-| Historical `7807751` → rebuilt unmodified `400acc5` (B0) | 1.043 [1.003–1.047] | Original regression reproduced in this session |
-| Original `400acc5` binary → B0 | 1.003 [0.997–1.007] | Scratch rebuild does not explain it |
-| B0 → remove question-capacity bound (C, diagnostic only) | 1.006 [0.999–1.011] | No benefit; allocation safeguard retained |
-| B0 → lazily boxed cache state (D) | 1.016 [1.012–1.025] | Slower; inline state retained |
-| B0 → earlier plain-QNAME formatter shape (E) | 0.999 [0.993–0.999] | Does not recover the original regression |
-| B0 → inline metadata reader only (F) | 1.006 [1.000–1.013] | Assembly improves, end-to-end timing does not |
-| B0 → inline metadata reader and section loop (G) | 0.955 [0.953–0.961] | Selected minimal fix |
-| G → pass cold-path cursor by value (H) | 1.005 [0.992–1.015] | Removes a stack store but no demonstrated timing benefit; omitted |
-
-G also reduced the paired median on eight compressed owners to 0.973
-[0.970–0.995] and on two owners to 0.980 [0.956–0.981]. These are screening
-results, not a claim that each removed instruction accounts for a known fraction
-of elapsed time. All controls produced matching CSV contents and counters.
-Workspace tests (353), Clippy with the existing lint allowances, formatting and
-diff checks passed after applying G.
-
-### Confirmation results
-
-Each configuration below has ten alternating pairs and an excluded warm-up
-pair. The direct causal comparison uses the rebuilt pre-fix source (B0) and
-production `9b329b9`, both with limit 32 and the optional fast decoder, one
-processing thread and one million transactions:
-
-| Case | Pre-fix median (s) | Fixed median (s) | Paired ratio [IQR] |
-| --- | ---: | ---: | ---: |
-| Eight literal owners | 0.274228 | 0.263665 | 0.958 [0.950–0.972] |
-| Eight compressed owners | 0.276779 | 0.269366 | 0.971 [0.966–0.977] |
-| Two compressed owners | 0.237620 | 0.234812 | 0.984 [0.977–0.997] |
-
-This confirms approximately 4.2%, 2.9% and 1.6% less processing time respectively
-from the selected inlining change. A separate ten-pair comparison against the
-historical `7807751` binary, at the same transaction count and candidate limit,
-shows the remaining differences:
-
-| Case | Historical median (s) | Fixed median (s) | Paired ratio [IQR] |
-| --- | ---: | ---: | ---: |
-| Eight literal owners | 0.260786 | 0.263337 | 1.005 [0.995–1.029] |
-| Eight compressed owners | 0.274985 | 0.277004 | 1.007 [0.997–1.018] |
-| Two compressed owners | 0.235979 | 0.237861 | 1.008 [1.004–1.015] |
-| One compressed owner | 0.230069 | 0.233360 | 1.011 [1.007–1.024] |
-| No RR owners | 0.222002 | 0.223651 | 1.008 [1.003–1.012] |
-| Eight owners sharing `www.example.com` | 0.327628 | 0.329540 | 1.003 [0.994–1.011] |
-| Eight owners, chain depth eight | 0.313246 | 0.318369 | 1.014 [1.006–1.023] |
-| Eight authority owners | 0.270605 | 0.273137 | 1.010 [0.995–1.022] |
-| Eight additional owners | 0.281450 | 0.284516 | 1.012 [0.985–1.025] |
-
-The earlier 3–4% penalties on eight literal or directly compressed answer owners
-no longer reproduce; their remaining median differences are below 1%, with IQRs
-crossing 1. A smaller
-0.8–1.4% difference remains on several other cases with IQR above 1. Those costs
-have **not** been assigned to a specific instruction or exclusively to the jump
-limit. The experiment localizes and fixes the main regression, not every last
-nanosecond of the difference from the historical decoder.
-
-Forced inlining can change code size and instruction locality. Confirmation
-therefore also includes the default decoder, all three RR sections, dense/deep
-responses and the staged pipeline; the tables below retain the observed
-differences rather than assuming all workloads benefit.
-
-The default decoder's short-message comparisons against `7807751` use one million
-transactions, one thread and limit 32:
-
-| Case | Historical median (s) | Fixed median (s) | Paired ratio [IQR] |
-| --- | ---: | ---: | ---: |
-| One owner | 0.317102 | 0.286759 | 0.901 [0.894–0.912] |
-| Eight literal owners | 0.351446 | 0.318372 | 0.908 [0.897–0.913] |
-| Eight owners sharing `www.example.com` | 0.450267 | 0.410812 | 0.911 [0.909–0.917] |
-
-Dense cases use 10,000 transactions for 128 RRs and 200 for 4,600 RRs; staged
-one-owner runs use 200,000 transactions. Each cell remains a paired ratio to
-`7807751`, followed by its IQR:
-
-| Case | Threads | Limit | Default decoder | Optional fast decoder |
-| --- | ---: | ---: | ---: | ---: |
-| 128 owners, chain depth 32 | 1 | 32 | 0.704 [0.688–0.718] | 0.704 [0.691–0.713] |
-| 4,600 flat owners | 1 | 32 | 1.004 [0.968–1.043] | 1.025 [0.995–1.066] |
-| 128 distinct literal owners | 1 | 32 | 0.992 [0.981–1.010] | 1.037 [0.994–1.059] |
-| 128 owners with a shared suffix | 1 | 32 | 0.982 [0.959–1.016] | 1.019 [1.002–1.041] |
-| 4,600 owners, chain depth 1,170 | 1 | 0 | 0.0369 [0.0361–0.0374] | 0.0362 [0.0355–0.0364] |
-| One owner | 5 | 32 | 0.970 [0.946–0.987] | 1.016 [0.943–1.022] |
-| 4,600 owners, chain depth 1,170 | 5 | 0 | 0.0657 [0.0639–0.0663] | 0.0635 [0.0627–0.0646] |
-
-The shared-suffix fast case retains an observed +1.9% median with IQR above 1;
-it is not presented as a demonstrated zero-cost case. Deep-chain improvements
-remain about 27-fold with one thread and 15–16-fold with five threads. The final
-matrix comprises 29 configurations and 580 measured executions, plus warm-ups;
-every pair matched counters and CSV contents. RSS sampling remains too sparse
-to compare peaks for these short runs.
-
-### Follow-up reproduction and provenance
-
-Use the existing harness with the pre-fix source `c5fe0f7` (production code
-identical to `400acc5`) and fixed source `9b329b9`, built with the same compiler,
-profile and features. Keep each build in its own Cargo target directory and
-copy each binary before building another revision. For the direct comparison:
-
-```bash
-python3 benches/dns-compression-benchmark.py \
-  --baseline /path/to/dpp-before-inline --baseline-limit 32 \
-  --candidate /path/to/dpp-after-inline --limits 32 --decoders fast \
-  --cases literal-eight,eight,two --transactions 1000000 --runs 10 \
-  --outdir /tmp/dpp-inline-confirmation
-```
-
-For comparison with `7807751`, omit `--baseline-limit` because that version has
-no configurable cap. Include `authority-eight,additional-eight` to cover the
-other RR sections. The scanner harness now sums all three section counts and
-has passed a bounds/end-position smoke check on answer, authority and additional
-fixtures with both 32 and zero limits.
-
-The local investigation artifacts are under `/tmp/dpp-compression-ablation`:
-`manifest.json` records the build variants and source/patch/binary hashes;
-`final-provenance.json` records the final matrix; `final-*` directories contain
-the raw samples, checksums and summaries; `final-summary.json` collects all 29
-configurations with absolute times, ratios and sampled RSS. Disassembly excerpts and the analysis
-are in `/tmp/dpp-compression-disassembly`. The parser-only harness prepared during
-the investigation was not used for these conclusions; adding a benchmark caller
-could itself change the inlining decisions being investigated.
-
-| Follow-up binary | SHA-256 |
-| --- | --- |
-| Rebuilt pre-fix control B0 | `22cb75b59057420f50a593c9d08b226f88d0df88337bc579dbfdf822eb4dffdd` |
-| Production `9b329b9` | `70c1d17e3a956bd17de4bd788664b26c42eca5660797a6fd3b9bb050daf079b1` |
 
 ## Initial measurement method (`400acc5`)
 
@@ -208,7 +71,9 @@ removed for each child process.
 The harness validates packet, query, response, match and timeout counters on every
 run, then compares CSV contents. Parallel output is sorted before comparison.
 It records binary SHA-256, fixture dimensions, per-run processing time, wall time,
-RSS and checksums. The main statistic is the median of the paired
+RSS and checksums.
+
+The main statistic is the median of the paired
 candidate/baseline processing-time ratios; below 1 is faster. The interquartile
 range (IQR) describes dispersion, **not** a confidence interval. A single favorable
 run is not evidence of an improvement.
@@ -221,6 +86,8 @@ comparison for RR-name skipping while keeping the new question parser (including
 its suffix cache) and policy.
 
 ## Reproduction
+
+### Build and run the end-to-end cases
 
 Build the baseline and candidate with the same compiler, target and allocator:
 
@@ -262,6 +129,8 @@ Dense fixtures scale the transaction count by 20 for 128 RRs and by 1,000 for
 nonzero limit, so the deep case runs only with zero. Add `--threads 5` to exercise
 the staged pipeline, and use a new output directory for each experiment.
 
+### Run the isolated scanner
+
 Build and run the isolated scanner using dependency paths reported by Cargo for
 the current compiler, rather than picking arbitrary old `.rlib` files:
 
@@ -271,6 +140,8 @@ python3 benches/dns-compression/build-scan.py --output "$bench_dir/dns-compressi
 "$bench_dir/dns-compression-scan" "$bench_dir/unlimited" 10 100 > "$bench_dir/scan-unlimited.csv"
 "$bench_dir/dns-compression-scan" "$bench_dir/dense" 10 100 > "$bench_dir/scan-dense.csv"
 ```
+
+### Run the uncached control
 
 To reproduce the end-to-end control with uncached RR-name skipping, export the
 candidate commit and apply the benchmark-only patch in that separate directory:
@@ -292,21 +163,205 @@ Use an explicit `--baseline-limit 0` when comparing unlimited configurations wit
 this control. Leave `--baseline-limit` unset for the historical binary, which
 predates the option. The patch is a measurement control, not a production mode.
 
+### Keep inputs and builds separate
+
 The scripts use synthetic data only and do not upload anything. Keep raw output
 under the selected benchmark directory rather than committing generated PCAPs.
 Keep build directories separate: exporting several revisions into one shared
 Cargo target directory can leave the top-level executable from the last copy even
 when a later build of another copy reports `Fresh`.
 
+### Recorded checks for the initial implementation
+
 Final correctness checks on `400acc5` passed: 353 workspace tests, formatting,
 `git diff --check`, and Clippy with the existing `too_many_arguments`,
 `type_complexity` and `large_enum_variant` allowances. CLI smoke checks cover
 default rejection at 33 jumps, explicit 33, zero, environment configuration and
-CLI precedence, in both decoder modes. Before the final inlining and plain-QNAME
+CLI precedence, in both decoder modes.
+
+Before the final inlining and plain-QNAME
 optimizations, a separate randomized comparison of the cached and uncached
 validators covered six million calls over 20,000 messages, with cold and warm
 caches and limits 0 through 11. The final changes also received an independent
 review of cursor handling, error classification and limit equivalence.
+
+## Follow-up: RR-loop inlining (`9b329b9`)
+
+The initial short-message regression was investigated with single-factor builds
+from the same source directory, compiler, dependencies and profile. Five alternating
+pairs were used for screening, with ten-pair confirmation of the selected fix.
+Production validation and cache behavior are unchanged by the fix: it adds only
+`#[inline(always)]` to `skip_dns_resource_records` and
+`read_dns_resource_record_meta`, plus comments explaining why both are needed.
+
+### Mechanism and controls
+
+The arm64 disassembly of `7807751` contains the RR scan directly inside
+`decode_response_code_with_sections`. The compiler keeps the scan cursor in a
+register and removes unused metadata, including TTL, from answer/authority scans.
+
+In `400acc5`, `read_dns_resource_record_meta` became a separate 656-byte function
+called for every RR. Each call creates a 64-byte stack frame, saves/restores six
+registers, reads TTL and writes the full metadata result to the stack. The caller
+then reads only the fields needed by that section.
+
+The earlier uncached-scanner control **also retained this separate function**.
+Consequently, disabling suffix caching in that control did not isolate the loss
+of inlining around it. This is an indirect compiler consequence of integrating
+the new decoder, rather than the cost of HashMap lookups on these fixtures.
+
+Forcing only the metadata reader inline (F) removed the per-RR calls and dead
+metadata, but left the section loop as a separate function; timing did not
+improve consistently.
+
+Forcing both levels inline (G, the selected fix) restored
+the loop within the caller, including a register-held cursor, and produced the
+measured improvement. Overflow, fixed-header length and full RDATA bounds checks
+remain in the resulting code.
+
+| Screen: one change from the stated control | Literal-eight ratio [IQR] | Conclusion |
+| --- | ---: | --- |
+| Historical `7807751` → rebuilt unmodified `400acc5` (B0) | 1.043 [1.003–1.047] | Original regression reproduced in this session |
+| Original `400acc5` binary → B0 | 1.003 [0.997–1.007] | Scratch rebuild does not explain it |
+| B0 → remove question-capacity bound (C, diagnostic only) | 1.006 [0.999–1.011] | No benefit; allocation safeguard retained |
+| B0 → lazily boxed cache state (D) | 1.016 [1.012–1.025] | Slower; inline state retained |
+| B0 → earlier plain-QNAME formatter shape (E) | 0.999 [0.993–0.999] | Does not recover the original regression |
+| B0 → inline metadata reader only (F) | 1.006 [1.000–1.013] | Assembly improves, end-to-end timing does not |
+| B0 → inline metadata reader and section loop (G) | 0.955 [0.953–0.961] | Selected minimal fix |
+| G → pass cold-path cursor by value (H) | 1.005 [0.992–1.015] | Removes a stack store but no demonstrated timing benefit; omitted |
+
+G also reduced the paired median on eight compressed owners to 0.973
+[0.970–0.995] and on two owners to 0.980 [0.956–0.981]. These are screening
+results, not a claim that each removed instruction accounts for a known fraction
+of elapsed time.
+
+All controls produced matching CSV contents and counters.
+Workspace tests (353), Clippy with the existing lint allowances, formatting and
+diff checks passed after applying G.
+
+### Confirmation results
+
+#### Direct comparison with the pre-fix source
+
+Each configuration below has ten alternating pairs and an excluded warm-up
+pair. The direct causal comparison uses the rebuilt pre-fix source (B0) and
+production `9b329b9`, both with limit 32 and the optional fast decoder, one
+processing thread and one million transactions:
+
+| Case | Pre-fix median (s) | Fixed median (s) | Paired ratio [IQR] |
+| --- | ---: | ---: | ---: |
+| Eight literal owners | 0.274228 | 0.263665 | 0.958 [0.950–0.972] |
+| Eight compressed owners | 0.276779 | 0.269366 | 0.971 [0.966–0.977] |
+| Two compressed owners | 0.237620 | 0.234812 | 0.984 [0.977–0.997] |
+
+This confirms approximately 4.2%, 2.9% and 1.6% less processing time respectively
+from the selected inlining change.
+
+#### Comparison with the historical decoder
+
+A separate ten-pair comparison against the
+historical `7807751` binary, at the same transaction count and candidate limit,
+shows the remaining differences:
+
+| Case | Historical median (s) | Fixed median (s) | Paired ratio [IQR] |
+| --- | ---: | ---: | ---: |
+| Eight literal owners | 0.260786 | 0.263337 | 1.005 [0.995–1.029] |
+| Eight compressed owners | 0.274985 | 0.277004 | 1.007 [0.997–1.018] |
+| Two compressed owners | 0.235979 | 0.237861 | 1.008 [1.004–1.015] |
+| One compressed owner | 0.230069 | 0.233360 | 1.011 [1.007–1.024] |
+| No RR owners | 0.222002 | 0.223651 | 1.008 [1.003–1.012] |
+| Eight owners sharing `www.example.com` | 0.327628 | 0.329540 | 1.003 [0.994–1.011] |
+| Eight owners, chain depth eight | 0.313246 | 0.318369 | 1.014 [1.006–1.023] |
+| Eight authority owners | 0.270605 | 0.273137 | 1.010 [0.995–1.022] |
+| Eight additional owners | 0.281450 | 0.284516 | 1.012 [0.985–1.025] |
+
+The earlier 3–4% penalties on eight literal or directly compressed answer owners
+no longer reproduce; their remaining median differences are below 1%, with IQRs
+crossing 1.
+
+A smaller 0.8–1.4% difference remains on several other cases with IQR above 1. Those costs
+have **not** been assigned to a specific instruction or exclusively to the jump
+limit. The experiment localizes and fixes the main regression, not every last
+nanosecond of the difference from the historical decoder.
+
+Forced inlining can change code size and instruction locality. Confirmation
+therefore also includes the default decoder, all three RR sections, dense/deep
+responses and the staged pipeline; the tables below retain the observed
+differences rather than assuming all workloads benefit.
+
+#### Default decoder
+
+The default decoder's short-message comparisons against `7807751` use one million
+transactions, one thread and limit 32:
+
+| Case | Historical median (s) | Fixed median (s) | Paired ratio [IQR] |
+| --- | ---: | ---: | ---: |
+| One owner | 0.317102 | 0.286759 | 0.901 [0.894–0.912] |
+| Eight literal owners | 0.351446 | 0.318372 | 0.908 [0.897–0.913] |
+| Eight owners sharing `www.example.com` | 0.450267 | 0.410812 | 0.911 [0.909–0.917] |
+
+#### Dense responses and staged execution
+
+Dense cases use 10,000 transactions for 128 RRs and 200 for 4,600 RRs; staged
+one-owner runs use 200,000 transactions. Each cell remains a paired ratio to
+`7807751`, followed by its IQR:
+
+| Case | Threads | Limit | Default decoder | Optional fast decoder |
+| --- | ---: | ---: | ---: | ---: |
+| 128 owners, chain depth 32 | 1 | 32 | 0.704 [0.688–0.718] | 0.704 [0.691–0.713] |
+| 4,600 flat owners | 1 | 32 | 1.004 [0.968–1.043] | 1.025 [0.995–1.066] |
+| 128 distinct literal owners | 1 | 32 | 0.992 [0.981–1.010] | 1.037 [0.994–1.059] |
+| 128 owners with a shared suffix | 1 | 32 | 0.982 [0.959–1.016] | 1.019 [1.002–1.041] |
+| 4,600 owners, chain depth 1,170 | 1 | 0 | 0.0369 [0.0361–0.0374] | 0.0362 [0.0355–0.0364] |
+| One owner | 5 | 32 | 0.970 [0.946–0.987] | 1.016 [0.943–1.022] |
+| 4,600 owners, chain depth 1,170 | 5 | 0 | 0.0657 [0.0639–0.0663] | 0.0635 [0.0627–0.0646] |
+
+The shared-suffix fast case retains an observed +1.9% median with IQR above 1;
+it is not presented as a demonstrated zero-cost case. Deep-chain improvements
+remain about 27-fold with one thread and 15–16-fold with five threads.
+
+The final matrix comprises 29 configurations and 580 measured executions, plus warm-ups;
+every pair matched counters and CSV contents. RSS sampling remains too sparse
+to compare peaks for these short runs.
+
+### Follow-up reproduction and provenance
+
+Use the existing harness with the pre-fix source `c5fe0f7` (production code
+identical to `400acc5`) and fixed source `9b329b9`, built with the same compiler,
+profile and features. Keep each build in its own Cargo target directory and
+copy each binary before building another revision. For the direct comparison:
+
+```bash
+python3 benches/dns-compression-benchmark.py \
+  --baseline /path/to/dpp-before-inline --baseline-limit 32 \
+  --candidate /path/to/dpp-after-inline --limits 32 --decoders fast \
+  --cases literal-eight,eight,two --transactions 1000000 --runs 10 \
+  --outdir /tmp/dpp-inline-confirmation
+```
+
+For comparison with `7807751`, omit `--baseline-limit` because that version has
+no configurable cap. Include `authority-eight,additional-eight` to cover the
+other RR sections. The scanner harness now sums all three section counts and
+has passed a bounds/end-position smoke check on answer, authority and additional
+fixtures with both 32 and zero limits.
+
+#### Recorded artifacts
+
+The local investigation artifacts are under `/tmp/dpp-compression-ablation`:
+`manifest.json` records the build variants and source/patch/binary hashes;
+`final-provenance.json` records the final matrix; `final-*` directories contain
+the raw samples, checksums and summaries; `final-summary.json` collects all 29
+configurations with absolute times, ratios and sampled RSS.
+
+Disassembly excerpts and the analysis
+are in `/tmp/dpp-compression-disassembly`. The parser-only harness prepared during
+the investigation was not used for these conclusions; adding a benchmark caller
+could itself change the inlining decisions being investigated.
+
+| Follow-up binary | SHA-256 |
+| --- | --- |
+| Rebuilt pre-fix control B0 | `22cb75b59057420f50a593c9d08b226f88d0df88337bc579dbfdf822eb4dffdd` |
+| Production `9b329b9` | `70c1d17e3a956bd17de4bd788664b26c42eca5660797a6fd3b9bb050daf079b1` |
 
 ## Initial results (`400acc5`)
 
@@ -330,6 +385,7 @@ The default decoder uses approximately 6–9% less processing time in this set.
 The optional fast decoder has a **remaining end-to-end regression** on several
 small synthetic cases, up to 4.3% for eight literal owners. For that case the
 median times are 0.267963 s before and 0.278825 s after, per million transactions.
+
 This is not dismissed as noise: its paired IQR is wholly above 1. The complete
 change includes configurable validation, different question parsing and cache
 context; the control below isolates the adaptive RR scanner more narrowly.
@@ -376,6 +432,7 @@ dense cases use 10,000 transactions for 128 RRs and 200 for 4,600 RRs.
 The depth-32 workload needs about 30% less processing time. The deep unlimited
 workload improves from median 1.443625 s to 0.052278 s with the default decoder,
 and from 1.440767 s to 0.053734 s with the fast decoder (about 27 times faster).
+
 The distinct-owner unlimited/default configuration also has an observed +2.9%
 paired median with IQR above 1. Other flat dense configurations mostly overlap 1.
 Their 30–40 ms end-to-end duration limits sensitivity to scanner costs; the
@@ -408,6 +465,7 @@ Ten alternating pairs per case/limit, one excluded warm-up pair, 100 ms per
 sample. Times include skipping the question and all RR owners of one DNS message,
 with a fresh decoder each time; they exclude question formatting, matching and
 CSV output. The baseline walker receives the same limit as the candidate.
+
 This historical table uses the scanner harness from `c5fe0f7`, which reads
 ANCOUNT. The current harness sums ANCOUNT, NSCOUNT and ARCOUNT so generated
 authority/additional fixtures can also be scanned; that extension received a
@@ -432,7 +490,9 @@ correctness smoke check, not a new set of timings for this table.
 
 The unlimited deep-case medians are 6.966778 ms and 107.433 microseconds per
 message, approximately a 65-fold scanner improvement. Most shallow cases also
-improve. Two small costs remain measurable: approximately 0.4 ns per empty
+improve.
+
+Two small costs remain measurable: approximately 0.4 ns per empty
 response at limit 32, and 1.5 ns per response with eight three-label owners.
 The latter is about 2–3% of isolated scanning. Therefore the result is **not**
 "zero overhead in every case," even though the same-policy end-to-end control

@@ -1,29 +1,28 @@
-# RFC 0003 — Compile-Time Allocator Selection
+# RFC 0003 — Compile-time allocator selection
 
-Status: Accepted  
-Date: 2025-03-21
+**Status:** Accepted · **Date:** 2025-03-21
 
 ## Problem
 
 DPP is allocation-heavy: the parser, matcher, and writers all allocate on hot paths. The global
-allocator has a measurable impact on throughput, RSS, and cross-thread free behavior. For a while,
-the allocator was hardcoded in `src/main.rs` via a direct `jemallocator` dependency — which meant
-allocator policy was implicit, hard to benchmark, and tangled with the process entrypoint.
+allocator affects throughput, RSS, and cross-thread frees. The allocator was previously hardcoded
+in `src/main.rs` through a direct `jemallocator` dependency, making its policy implicit and
+harder to benchmark independently of the entrypoint.
 
 Allocator choice is fundamentally a build-time decision: it affects the entire binary, must be
 settled before `main()` runs, and must not drift between CLI flags, env vars, and code.
 
 ## Decision
 
-Allocator selection is owned by **`src/allocator.rs`** and configured exclusively through
+Allocator selection is owned by [`src/allocator.rs`](../../src/allocator.rs) and configured exclusively through
 mutually exclusive Cargo features:
 
-| Feature              | Allocator            | Notes                                                                |
-|----------------------|----------------------|----------------------------------------------------------------------|
-| `allocator-jemalloc` | `tikv-jemallocator`  | Default. Good all-round choice for throughput and RSS.               |
-| `allocator-mimalloc` | `mimalloc`           | Alternative with different fragmentation characteristics.            |
-| `allocator-system`   | `std::alloc::System` | Useful as a baseline for benchmarking.                               |
-| `allocator-tcmalloc` | `tcmalloc-better`    | Linux x86_64 / aarch64 only. Fails to compile elsewhere — by design. |
+| Feature | Allocator | Role or restriction |
+| --- | --- | --- |
+| `allocator-jemalloc` | `tikv-jemallocator` | Default choice for throughput and RSS |
+| `allocator-mimalloc` | `mimalloc` | Alternative with different fragmentation characteristics |
+| `allocator-system` | `std::alloc::System` | Benchmark baseline |
+| `allocator-tcmalloc` | `tcmalloc-better` | Linux x86_64 / aarch64 only; fails to compile elsewhere |
 
 Exactly one feature must be enabled. Invalid combinations fail the build with a clear error.
 
@@ -31,23 +30,21 @@ Exactly one feature must be enabled. Invalid combinations fail the build with a 
 
 ## Why not a runtime flag?
 
-Because swapping the global allocator at runtime isn't a thing in Rust (and for good reason).
-Making it a Cargo feature keeps the decision explicit, auditable, and benchmarkable. You rebuild,
-you re-measure — there's no illusion that you can just flip a switch.
+The global allocator is selected before `main()` runs. Cargo features make that choice explicit
+and reproducible: change the feature, rebuild, and measure the resulting binary.
 
 ## Trade-offs
 
-- Allocator changes require a rebuild. That's the point.
+- Allocator changes require a rebuild.
 - `allocator-tcmalloc` intentionally fails on unsupported targets instead of silently falling back.
-  Surprises in production are worse than a compile error.
-- `cargo check --all-features` doesn't work because the features are mutually exclusive. This is
-  a known ergonomic cost, but the alternative (runtime dispatch or silent feature priority) is worse.
+- `cargo check --all-features` cannot pass because the features are mutually exclusive. Each
+  allocator configuration must be checked separately; there is no silent feature priority.
 
 ## Validation
 
 When changing allocator configuration:
 
-- `cargo test` with the default feature;
-- `cargo check` for each supported alternative;
-- throughput + RSS benchmarks via `benches/` — don't assume a new allocator is faster without
-  measuring.
+1. Run `cargo test` with the default feature.
+2. Run `cargo check` for each supported alternative.
+3. Measure throughput and RSS using the [allocator benchmark protocol](../../benches/allocator-benchmarking.md).
+   An allocator change needs measured results, not an assumed speedup.
