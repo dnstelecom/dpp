@@ -260,7 +260,7 @@ impl<'a> DnsNameDecoder<'a> {
         Ok(suffix)
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn skip(&mut self, cursor: &mut usize) -> Result<bool, &'static str> {
         let start = *cursor;
         let mut position = start;
@@ -290,8 +290,7 @@ impl<'a> DnsNameDecoder<'a> {
                         // Cheap short walks avoid cache bookkeeping. The full
                         // walker enforces smaller configured limits and caches
                         // longer chains, counting every cached transition.
-                        self.read(cursor)?;
-                        return Ok(false);
+                        return self.skip_cached(cursor);
                     }
                     let next = *self
                         .data
@@ -318,8 +317,7 @@ impl<'a> DnsNameDecoder<'a> {
                     if resume.is_some() && end - segment_start > DIRECT_SUFFIX_BYTES {
                         // Bound repeated literal-label work too, including RR
                         // owner names whose expanded size is not materialized.
-                        self.read(cursor)?;
-                        return Ok(false);
+                        return self.skip_cached(cursor);
                     }
                     self.data
                         .get(..segment_end)
@@ -329,6 +327,12 @@ impl<'a> DnsNameDecoder<'a> {
                 }
             }
         }
+    }
+
+    #[inline(never)]
+    fn skip_cached(&mut self, cursor: &mut usize) -> Result<bool, &'static str> {
+        self.read(cursor)?;
+        Ok(false)
     }
 
     pub(super) fn labels(&self, name: ValidatedName) -> NameLabels<'_, 'a> {
