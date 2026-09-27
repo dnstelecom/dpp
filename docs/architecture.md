@@ -239,6 +239,8 @@ or second encoding of canonical addresses and ports.
   pointer-only segments. Compressed questions are passed to Hickory already expanded, avoiding
   a second recursive traversal without replacing Hickory's question semantics. Literal-root
   validation for OPT remains distinct from a compressed name that expands to root.
+  The optional fast path keeps a single-pass formatter for uncompressed questions; seeing a
+  pointer restarts validation at the original name offset through the shared cached decoder.
   For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
   RFC 9619. A complete response cannot claim answer or authority records that are absent from its DNS
   payload, whether or not it has additional records. TSIG status extraction consumes and

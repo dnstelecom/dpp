@@ -942,6 +942,60 @@ impl DnsProcessor {
         names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
     ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
+        // Most questions contain no compression at all. Keep their original
+        // single-pass formatter free of cache metadata and callback overhead.
+        // A pointer restarts through the shared decoder from the original cursor.
+        let dns_data = names.data();
+        let mut position = *cursor;
+        let mut output = DnsNameBuf::default();
+        let mut expanded_wire_len = 1_usize;
+        let mut oversized = false;
+        loop {
+            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
+            match length {
+                0 => {
+                    if oversized {
+                        return Err(DnsQuestionDecodeError::OversizedQname);
+                    }
+                    if output.as_str().is_empty() {
+                        output
+                            .try_push('.')
+                            .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+                    }
+                    *cursor = position + 1;
+                    return Ok(output);
+                }
+                _ if length & 0xc0 == 0xc0 => {
+                    return Self::read_compressed_wire_domain_name(names, cursor);
+                }
+                _ if length & 0xc0 != 0 => return Err(DnsQuestionDecodeError::Invalid),
+                _ => {
+                    let end = position + 1 + usize::from(length);
+                    let label = dns_data
+                        .get(position + 1..end)
+                        .ok_or("DNS label truncated")?;
+                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label.len());
+                    oversized |= expanded_wire_len > Name::MAX_LENGTH;
+                    if !oversized {
+                        if !output.as_str().is_empty() {
+                            output
+                                .try_push('.')
+                                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+                        }
+                        if !Self::write_label_ascii(label, &mut output) {
+                            return Err(DnsQuestionDecodeError::Invalid);
+                        }
+                    }
+                    position = end;
+                }
+            }
+        }
+    }
+
+    fn read_compressed_wire_domain_name(
+        names: &mut DnsNameDecoder<'_>,
+        cursor: &mut usize,
+    ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
         let mut output = DnsNameBuf::default();
         let mut presentation_valid = true;
         let name = names.read_with_labels(cursor, |label| {

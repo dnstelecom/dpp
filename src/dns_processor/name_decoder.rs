@@ -75,6 +75,10 @@ impl<'a> DnsNameDecoder<'a> {
         }
     }
 
+    pub(super) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     fn cached(&self, start: usize) -> Option<ValidatedName> {
         let state = self.cache.as_ref()?;
         if let Some(cache) = &state.overflow {
@@ -267,11 +271,6 @@ impl<'a> DnsNameDecoder<'a> {
         let mut resume = None;
         let mut segment_start = start;
         let mut segment_end = self.data.len();
-        let direct_limit = if self.max_jumps == 0 {
-            DIRECT_POINTER_JUMPS
-        } else {
-            self.max_jumps.min(DIRECT_POINTER_JUMPS)
-        };
         let mut jumps = 0;
         loop {
             let length = *self
@@ -286,7 +285,9 @@ impl<'a> DnsNameDecoder<'a> {
                     return Ok(resume.is_none() && position == start);
                 }
                 _ if length & POINTER_TAG == POINTER_TAG => {
-                    if jumps == direct_limit {
+                    // Every setting permits the first jump. Defer policy work
+                    // until nested compression, keeping literal/direct names cheap.
+                    if jumps != 0 && (jumps == DIRECT_POINTER_JUMPS || jumps == self.max_jumps) {
                         // Cheap short walks avoid cache bookkeeping. The full
                         // walker enforces smaller configured limits and caches
                         // longer chains, counting every cached transition.
