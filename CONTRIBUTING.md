@@ -43,6 +43,19 @@ Examples:
 - Writer changes should verify output compatibility and shutdown behavior.
 - Benchmark harness changes should be validated with `bash -n benches/benchmark.sh` and a dry run.
 
+## Rebuilding a Missing Release Asset
+
+Once the corrected release workflow is on `main`, rebuild one platform from an existing tag:
+
+```bash
+gh workflow run rust.yml --ref main -f tag=v0.4.0 -f runner=ubuntu-22.04
+```
+
+This runs the current workflow but checks out the source from `refs/tags/v0.4.0`. It does not
+move the tag or overwrite existing release assets. The other runner choices are `ubuntu-24.04`
+and `ubuntu-24.04-arm`. Tag pushes still build all three platforms. Re-running an older failed
+run uses its original workflow revision, so it does not pick up a workflow fix committed later.
+
 ## Community and Commercial Scope
 
 DPP Community Edition and DPP Commercial Edition intentionally have different scopes.
