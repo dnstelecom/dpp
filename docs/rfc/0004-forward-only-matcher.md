@@ -1,118 +1,150 @@
-# RFC 0004 — Forward-Only Matcher and Determinism Contract
+# RFC 0004 — Forward-only matcher and determinism contract
 
-Status: Accepted  
-Date: 2025-06-03
+**Status:** Accepted · **Date:** 2025-06-03
 
 ## Problem
 
-DNS query/response matching sounds simple until you try to do it in parallel on a 20 GB capture.
-The naive approach — a shared hash map protected by a mutex — serializes the entire pipeline on
-the matcher. The "clever" approach — lock-free concurrent maps — makes results depend on thread
-scheduling, which means the same input can produce different output on different runs.
-
-Neither is acceptable. DPP needs matching that is both parallel and deterministic.
+DPP needs DNS query/response matching that is both parallel and deterministic on large captures.
+A shared map protected by a mutex serializes matcher work. Concurrent maps alone do not define a
+deterministic processing order: the same input can still produce different results as thread
+scheduling changes.
 
 ## Decision
 
 The matcher is **forward-only**: it processes packets in `(timestamp_micros, packet_ordinal)`
-order within each shard and never backtracks. The key design choices:
+order within each shard and never backtracks. Each shard owns its state; routing and explicit
+ordering keep matching independent of worker scheduling.
 
-1. **Shard-local state.** Each shard owns its own `QueryMap` and `ResponseMap` (both `BTreeMap`-
-   based). There is no shared mutable matcher state between shards.
+- [State ownership and routing](#state-ownership-and-routing)
+- [Deterministic ordering](#deterministic-ordering)
+- [Transaction identity](#transaction-identity)
+- [Retry deduplication](#retry-deduplication)
+- [Closest-match pairing](#closest-match-pairing)
+- [Batched timeout eviction](#batched-timeout-eviction)
 
-2. **Canonical flow routing.** Before full DNS decode, the routing stage extracts a cheap
-   `CanonicalFlowKey` (observed client IP, client port and resolver IP, oriented by DNS QR)
-   and hashes it to a shard index. This includes the valid case where both ports are 53 and
-   guarantees that a query and its
-   matching response always land in the same shard. This is a coarser partition than matcher
-   identity: VLANs with overlapping endpoints may share a worker, but their transaction state
-   remains distinct.
+### State ownership and routing
 
-3. **Deterministic ordering.** Within a shard, packets are processed in strict
-   `(timestamp, packet_ordinal, record_ordinal)` order. Tie-breaks are explicit — scheduler
-   interleaving and container iteration order are not valid tie-breaks.
+Each shard owns its own `QueryMap` and `ResponseMap`, both based on `BTreeMap`. Shards share no
+mutable matcher state.
 
-   With full IPv4 reassembly, routing retains ready packet batches while fragment sets remain
-   unresolved. A reconstructed datagram can carry an earlier final-fragment timestamp, so merely
-   limiting timeout eviction would still let a retry or response finalize before that datagram.
-   Routing releases the retained packets and reconstructed datagrams together for the existing
-   timestamp/ordinal sort. This also preserves ordering within a batch whose timestamps regress
-   in default mode; it does not impose global monotonicity on that mode.
+Before full DNS decode, routing extracts a `CanonicalFlowKey`: observed client IP, client port,
+and resolver IP, oriented by DNS QR. Hashing this key assigns a shard, including when both ports
+are 53. A query and its matching response therefore reach the same shard.
 
-   This packet backlog is separate from matcher state and bounded between batches to one packet
-   batch (65,536 packets) or 64 MiB of payloads. On overflow, pending fragment sets use the existing
-   capacity fallback before routing releases the backlog. Processing the current input batch and
-   fallback packets can temporarily exceed those retained-state limits. EOF and interrupted
-   intake drain accepted ready packets through the existing shutdown policy. The matcher eviction
-   watermark is capped by both the oldest unresolved fragment and the oldest retained ready packet.
+Flow routing is coarser than transaction identity. VLANs with overlapping endpoints may share a
+worker, but their transaction state remains distinct.
 
-4. **Retry deduplication.** If a query with the same identity arrives while an earlier one is
-   still pending inside the match-timeout window (1200 ms by default), the duplicate is counted
-   but doesn't create a second canonical query. One canonical query → one terminal outcome
-   (matched or timeout), always. Default mode retains retry timestamps inside that pending query's
-   payload. If an earlier query arrives across batches, the matcher regroups the identity's
-   unresolved attempts into earliest-first timeout windows. For example, pending attempts observed
-   at 3s, 2s and then 1s with a 1.2s window leave canonicals at 1s and 3s, rather than losing the
-   latter through transitive deduplication. Finalized transactions are never reopened.
+### Deterministic ordering
 
-   Retry history is allocated only when a duplicate is observed in default mode; monotonic mode
-   needs none. Regrouping costs `O(n log n)` in the affected identity's unresolved attempts and is
-   restricted to earlier-canonical replacements. The canonical query payload remains the sole owner
-   of retry history, with no secondary matcher map.
+Within each shard, candidates are processed in strict `(timestamp, packet_ordinal, record_ordinal)`
+order. Scheduler interleaving and container iteration order are never valid tie-breaks.
 
-   Match identity includes the DNS ID, observed name, client IP and port, resolver IP, query
-   type, query class, opcode and canonical VLAN context. Ethernet decoding owns the ordered
-   TPID/12-bit-VID stack used by both matcher and fragment keys; PCP and DEI bits are excluded.
-   Untagged traffic needs no tag allocation, while tagged metadata and keys share immutable tag
-   storage. Resolver identity, query class, opcode and VLAN context remain internal and are not
-   added to the exported `DnsRecord` schema.
+With full IPv4 reassembly, routing retains ready packet batches while fragment sets remain
+unresolved. A reconstructed datagram can carry an earlier final-fragment timestamp. Capping
+only timeout eviction would still let a retry or response finalize before that datagram arrives.
 
-   The current Community Edition identity key preserves the observed presentation-form QNAME bytes
-   and does not lowercase them before matching. This is a deliberate Community Edition trade-off,
-   not a protocol guarantee. RFC 4343 defines ASCII label comparison as case-insensitive, and a
-   valid response is allowed to differ from the query's 0x20 casing, including when name
-   compression reuses label bytes from another wire location. Community Edition still keeps
-   byte-preserving identity because that better matches the real behavior it targets on offline
-   caching-resolver workloads. Queries and responses that differ only by case may therefore fail
-   to pair even on otherwise valid DNS traffic.
+Routing releases retained packets and reconstructed datagrams together for timestamp/ordinal
+sorting. This also preserves ordering within a batch whose timestamps regress in default mode;
+it does not impose global monotonicity on that mode.
 
-5. **Closest-match pairing.** When a response arrives, the matcher finds the pending query with
-   the closest timestamp (within the timeout window). When a query arrives and a buffered response
-   already exists, the same closest-timestamp logic applies in reverse. This handles mild
-   reordering without sacrificing determinism.
+The ready-packet backlog is separate from matcher state:
 
-6. **Batched timeout eviction** (opt-in via `--monotonic-capture`). When the capture is globally
-   monotonic, the matcher can evict stale queries in bulk using the batch-maximum timestamp as a
-   watermark. The watermark comes from the *routed batch maximum*, not each shard's local maximum,
-   so sparse shards still retire state against the global frontier.
+| Constraint or event | Behavior |
+| --- | --- |
+| Retained-state bound between batches | One packet batch (65,536 packets) or 64 MiB of payloads |
+| Either bound exceeded | Resolve pending fragment sets through the existing capacity fallback, then release the backlog |
+| Current batch and fallback processing | May temporarily exceed the retained-state bounds |
+| EOF or interrupted intake | Drain accepted ready packets under the existing shutdown policy |
+| Matcher eviction watermark | Cap at both the oldest unresolved fragment and the oldest retained ready packet |
+
+### Transaction identity
+
+Matcher identity includes:
+
+- DNS ID and observed presentation-form QNAME;
+- observed client IP and port, plus resolver IP;
+- query type, query class, and opcode;
+- canonical VLAN context.
+
+Ethernet decoding owns the ordered TPID/12-bit-VID stack used by matcher and fragment keys.
+PCP and DEI bits are excluded. Untagged traffic needs no tag allocation; tagged metadata and keys
+share immutable tag storage.
+
+Resolver identity, query class, opcode, and VLAN context remain internal. They are not added to
+the exported `DnsRecord` schema.
+
+#### QNAME casing limitation
+
+Community Edition preserves observed presentation-form QNAME bytes without lowercasing them.
+This is a deliberate trade-off for the offline caching-resolver workloads it targets, not a
+protocol guarantee.
+
+RFC 4343 defines ASCII label comparison as case-insensitive. A valid response may differ from
+the query's 0x20 casing, including when compression reuses label bytes from another wire location.
+Such query/response pairs may fail to match in Community Edition even on otherwise valid DNS
+traffic.
+
+### Retry deduplication
+
+A repeated query with the same identity inside the match-timeout window (`1200 ms` by default)
+is counted as a duplicate while the earlier query remains pending. It does not create a second
+canonical query. On normal completion, each canonical query has one terminal outcome: matched
+once or emitted once as a timeout.
+
+Default mode retains retry timestamps in the pending canonical query's payload. If an earlier
+query arrives across batches, the matcher regroups that identity's unresolved attempts into
+earliest-first timeout windows. Finalized transactions are never reopened.
+
+For example, attempts observed at 3s, then 2s, then 1s with a 1.2s window leave canonical queries
+at 1s and 3s. Transitive deduplication must not absorb the 3s attempt into the earlier window.
+
+Retry history is allocated only when default mode observes a duplicate. Monotonic mode needs
+none. Regrouping costs `O(n log n)` in the affected identity's unresolved attempts and occurs
+only for earlier-canonical replacements. The canonical query payload is the sole owner of this
+history; there is no secondary matcher map.
+
+### Closest-match pairing
+
+When a response arrives, the matcher selects the pending query with the closest timestamp within
+the timeout window. When a query arrives and a buffered response already exists, the same logic
+applies in reverse. This handles mild reordering while preserving deterministic decisions.
+
+### Batched timeout eviction
+
+`--monotonic-capture` opts into bulk eviction of stale queries using a batch-maximum watermark.
+The capture must be globally monotonic under the [RFC 0005 contract](0005-dual-path-pcap-parsing.md#monotonic-timestamp-contract).
+
+The watermark comes from the **routed batch maximum**, not each shard's local maximum. Sparse
+shards therefore retire state against the global frontier.
 
 ## Invariants
 
 These must hold for any valid implementation:
 
-- Each query reaches exactly one terminal outcome: matched once, or emitted once as a timeout.
+- On normal completion, each canonical query reaches exactly one terminal outcome: matched once
+  or emitted once as a timeout. Interrupted and failed runs follow the separate
+  [shutdown policy](../architecture.md#completion-and-failure-handling).
 - For a fixed input PCAP and runtime configuration, finalized record values and order are
   deterministic. Output container layout, such as Parquet row-group boundaries, need not be
   byte-identical across runs.
-- Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never leaks into the exported
+- Internal sequencing metadata (`packet_ordinal`, `record_ordinal`) never enters the exported
   `DnsRecord`.
 - Duplicate responses remain distinguishable in matcher state until matched or discarded.
-- Community Edition intentionally preserves observed QNAME bytes instead of RFC-4343-style
-  case-insensitive canonicalization. Case-only query/response mismatches are therefore an accepted
-  limitation even on otherwise valid DNS traffic.
+- QNAME identity preserves observed bytes. Case-only query/response mismatches are an accepted
+  Community Edition limitation, even on otherwise valid DNS traffic.
 
 ## Why BTreeMap and not HashMap
 
-The matcher uses `BTreeMap` keyed on `(identity, timestamp, packet_ordinal, record_ordinal)`.
-This gives ordered iteration for free, which is essential for closest-match lookups and
-deterministic eviction. A `HashMap` would require sorting on every lookup or eviction pass —
-possible, but slower and more error-prone.
+The matcher uses `BTreeMap` for identity-indexed query and response state. Each identity has a
+timeline ordered by `(timestamp_micros, packet_ordinal, record_ordinal)`. Ordered iteration
+supports closest-match lookups and deterministic eviction; a `HashMap` would require additional
+sorting for those operations.
 
 ## Consequences
 
 - The matcher is the authoritative owner of in-flight state. No other module may hold or mutate
   query/response pairing data.
-- Adding a new matching strategy (e.g., bidirectional or streaming) requires a new RFC.
-- Timeout records encode "no response observed" by leaving response fields absent. The canonical
+- A new matching strategy, such as bidirectional or streaming matching, requires a new RFC.
+- Timeout records leave response fields absent because no response was observed. The canonical
   timeout signal is an absent `response_timestamp`; `response_code` is absent because no DNS
   response exists.

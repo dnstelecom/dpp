@@ -1,44 +1,31 @@
 # Allocator Guide
 
-This document explains how DPP selects its global allocator and how to build alternative allocator
-variants.
+DPP selects one global allocator at build time through Cargo features. The choice applies to the
+whole process; there is no runtime flag or environment override. The default is `tikv-jemallocator`.
 
-## Scope
+## Choose an allocator
 
-Allocator choice in DPP is a build-time concern.
+Exactly one allocator feature must be enabled. Invalid feature combinations fail the build
+explicitly.
 
-- It applies to the whole process.
-- It is selected through Cargo features.
-- It is not exposed as a runtime flag or environment override.
+| Cargo feature | Allocator | Availability |
+| --- | --- | --- |
+| `allocator-jemalloc` | `tikv-jemallocator` | Default build. |
+| `allocator-mimalloc` | `mimalloc` | Alternative build. |
+| `allocator-system` | `std::alloc::System` | Alternative build. |
+| `allocator-tcmalloc` | `tcmalloc-better` | Linux `x86_64` and Linux `aarch64` only. |
 
-The default build uses `tikv-jemallocator`.
-
-## Supported Allocators
-
-Exactly one allocator feature must be enabled.
-
-- `allocator-jemalloc`
-  Default build. Uses `tikv-jemallocator`.
-- `allocator-mimalloc`
-  Alternative build. Uses `mimalloc`.
-- `allocator-system`
-  Alternative build. Uses `std::alloc::System`.
-- `allocator-tcmalloc`
-  Alternative build for Linux `x86_64` and Linux `aarch64` only. Uses `tcmalloc-better`.
-
-Invalid feature combinations fail the build explicitly.
-
-## Build Commands
+## Build a variant
 
 Requires Rust 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 
-Default allocator build:
+Default allocator:
 
 ```bash
 cargo build --release
 ```
 
-Alternative allocator builds:
+Alternative allocators:
 
 ```bash
 cargo build --release --no-default-features --features allocator-system
@@ -48,47 +35,33 @@ cargo build --release --no-default-features --features allocator-mimalloc
 cargo build --release --no-default-features --features allocator-tcmalloc
 ```
 
-If you want host-specific code generation during allocator comparisons, keep the same `RUSTFLAGS`
-for every build variant. Example:
+## Confirm the active allocator
+
+DPP logs the active allocator during startup, making benchmark logs and operational reports easier
+to interpret. For example:
+
+```text
+Allocator: tikv-jemallocator
+```
+
+## Compare allocators
+
+Use the same representative capture, output format, and CPU budget for every variant. Follow the
+[allocator benchmark protocol](../benches/allocator-benchmarking.md) for building separate binaries,
+running the harness, comparing metrics, and meeting the correctness bar before accepting a change.
+
+Keep the same `RUSTFLAGS` across variants. For host-specific code generation:
 
 ```bash
 RUSTFLAGS='-C target-cpu=native' cargo build --release
 RUSTFLAGS='-C target-cpu=native' cargo build --release --no-default-features --features allocator-mimalloc
 ```
 
-Hypothesis: `target-cpu=native` is the right setting for same-host allocator comparisons. If you are
-building portable release binaries, keep the same portable compiler settings across all variants.
+**Hypothesis:** `target-cpu=native` is the right setting for same-host allocator comparisons. For
+portable release binaries, keep the same portable compiler settings across all variants.
 
-## Runtime Visibility
+## Design reference
 
-DPP logs the active allocator during startup. Example log line:
-
-```text
-Allocator: tikv-jemallocator
-```
-
-This makes allocator-specific benchmark logs and operational reports easier to interpret.
-
-## Benchmarking
-
-Allocator changes must be evaluated on the same representative capture, format, and CPU budget.
-
-Use the canonical benchmark protocol here:
-
-- [benches/allocator-benchmarking.md](../benches/allocator-benchmarking.md)
-
-That protocol covers:
-
-- how to build one binary per allocator;
-- how to run the benchmark harness fairly;
-- what metrics to compare;
-- what correctness bar must be met before accepting a change.
-
-## Design Reference
-
-The accepted architecture contract for allocator selection lives here:
-
-- [docs/rfc/0003-allocator-selection.md](rfc/0003-allocator-selection.md)
-
-Use this guide for day-to-day builds and comparisons. Use the RFC when reviewing ownership
-boundaries or changing the contract.
+Use this guide for day-to-day builds and comparisons. The accepted contract for allocator selection
+is [RFC 0003](rfc/0003-allocator-selection.md); consult it when reviewing ownership boundaries or
+changing the contract.

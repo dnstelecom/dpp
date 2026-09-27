@@ -1,41 +1,40 @@
-# RFC 0001 — Ownership Boundaries and Benchmark Contract
+# RFC 0001 — Ownership boundaries and benchmark contract
 
-Status: Accepted  
-Date: 2025-01-14
+**Status:** Accepted · **Date:** 2025-01-14
 
 ## Why this matters
 
-DPP is a multi-threaded pipeline with distinct stages: packet parsing, flow-based routing,
-DNS query/response matching, and serialization to CSV or Parquet. Without explicit ownership
-boundaries, responsibility bleeds across modules — configuration gets duplicated, lifecycle
-contracts become implicit, and shutdown turns into a guessing game.
+DPP has distinct stages for packet parsing, flow routing, DNS query/response matching, and
+CSV or Parquet serialization. Explicit ownership boundaries keep configuration in one place
+and make lifecycle and shutdown responsibilities clear.
 
-On top of that, the project needs a repeatable benchmark that doesn't depend on local paths
-or private PCAP captures sitting on someone's laptop.
+The project also needs repeatable benchmarks that do not depend on hardcoded local paths or
+private captures.
 
 ## Decision
 
 Each module owns exactly one responsibility:
 
-| Module                            | What it owns                                                                                 |
-|-----------------------------------|----------------------------------------------------------------------------------------------|
-| `src/config.rs`                   | Single source of truth for runtime policy: batch sizes, timeouts, execution-model thresholds |
-| `src/output.rs`                   | Writer lifecycle and output-channel control messages                                         |
-| `src/monitor_memory.rs`           | Optional RSS monitoring with explicit stop/join — must not outlive the process               |
-| `src/app.rs`                      | Run orchestration, reporting, shutdown coordination                                          |
-| `src/main.rs`                     | Thin entrypoint: wires `cli` + `runtime` + `app`, returns exit code                          |
-| `src/dns_processor/anonymizer.rs` | Key loading, PBKDF2 derivation, deterministic IP pseudonymization                            |
+| Module | Ownership |
+| --- | --- |
+| [`config.rs`](../../src/config.rs) | Single source of truth for runtime policy: batch sizes, timeouts, and execution-model thresholds |
+| [`output.rs`](../../src/output.rs) | Writer lifecycle and output-channel control messages |
+| [`monitor_memory.rs`](../../src/monitor_memory.rs) | Optional RSS monitoring with explicit stop/join; must not outlive the process |
+| [`app.rs`](../../src/app.rs) | Run orchestration, reporting, and shutdown coordination |
+| [`main.rs`](../../src/main.rs) | Thin entrypoint: compose `cli`, `runtime`, and `app`; return the exit code |
+| [`dns_processor/anonymizer.rs`](../../src/dns_processor/anonymizer.rs) | Key loading, PBKDF2 derivation, and deterministic IP pseudonymization |
 
-Benchmark scaffolding lives under `benches/` and takes all inputs from the caller.
+Benchmark scaffolding lives under [`benches/`](../../benches/README.md) and takes all inputs
+from the caller.
 
 ## Rationale
 
-- **SSOT** — every policy is defined in one place. Changing the match timeout means editing
-  `config.rs`, not grepping the whole tree.
-- **Explicit lifecycle** — shutdown doesn't depend on drop ordering. `monitor_memory` has
-  `stop()` + `join()`, the output channel closes via a control message, not by dropping the sender.
-- **Reproducible benchmarks** — the script has no idea where PCAP files live until you tell it.
-  This keeps private data out of the repository by construction.
+- **Single source of truth (SSOT):** runtime policy changes, such as match-timeout defaults,
+  belong in `config.rs`.
+- **Explicit lifecycle:** `monitor_memory` uses `stop()` and `join()`; the output channel closes
+  through a control message. Shutdown does not depend on drop ordering or dropping the sender.
+- **Reproducible benchmarks:** callers supply capture paths, keeping private input data out of
+  the repository.
 
 ## Consequences
 

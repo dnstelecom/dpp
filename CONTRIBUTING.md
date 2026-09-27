@@ -1,24 +1,21 @@
 # Contributing
 
-Thank you for considering a contribution to DPP.
+DPP welcomes contributions that improve correctness, determinism, maintainability, portability,
+documentation, test coverage, and measurable performance within the Community Edition scope.
 
-Community contributions are welcome, especially when they improve correctness, determinism,
-maintainability, portability, documentation, test coverage, and measurable performance on the
-community-supported feature set.
+## Before you start
 
-## Before You Start
-
-- Read [README.md](README.md) for the product scope and operator-facing contract.
-- Read [docs/architecture.md](docs/architecture.md) before changing runtime behavior or ownership
-  boundaries.
-- Read [docs/rfc/README.md](docs/rfc/README.md) for architecture decisions and long-lived design
-  context.
-- Read [benches/README.md](benches/README.md) before making or claiming performance changes.
+| Before changing… | Read |
+| --- | --- |
+| Product behavior or supported features | [README](README.md) |
+| Runtime behavior or ownership boundaries | [Architecture](docs/architecture.md) |
+| A long-lived design decision | [RFC index](docs/rfc/README.md) |
+| Performance, or making a performance claim | [Benchmark contract](benches/README.md) |
 
 For larger changes, please open an issue or start a discussion before investing in a large patch.
 Early alignment is the easiest way to avoid rework.
 
-## Contribution Guidelines
+## Contribution guidelines
 
 - Preserve ownership boundaries.
 - Do not introduce a second source of truth.
@@ -29,7 +26,7 @@ Early alignment is the easiest way to avoid rework.
 - Call out hot-path performance risk when touching parser, matcher, pipeline, or writer code.
 - Mark unsupported assumptions as hypotheses.
 
-## Testing Expectations
+## Testing expectations
 
 At minimum:
 
@@ -37,13 +34,13 @@ At minimum:
 - Run additional checks that match the change type.
 - Include benchmark evidence for hot-path performance claims.
 
-Examples:
+| Change | Additional validation |
+| --- | --- |
+| Parser or matcher | Targeted `cargo test` coverage. |
+| Writer | Output compatibility and shutdown behavior. |
+| Benchmark harness | `bash -n benches/benchmark.sh` and a dry run. |
 
-- Parser or matcher changes should include targeted `cargo test` coverage.
-- Writer changes should verify output compatibility and shutdown behavior.
-- Benchmark harness changes should be validated with `bash -n benches/benchmark.sh` and a dry run.
-
-## Rebuilding a Missing Release Asset
+## Rebuilding a missing release asset
 
 Once the corrected release workflow is on `main`, rebuild one platform from an existing tag:
 
@@ -51,12 +48,15 @@ Once the corrected release workflow is on `main`, rebuild one platform from an e
 gh workflow run rust.yml --ref main -f tag=v0.4.0 -f runner=ubuntu-22.04
 ```
 
-This runs the current workflow but checks out the source from `refs/tags/v0.4.0`. It does not
-move the tag or overwrite existing release assets. The other runner choices are `ubuntu-24.04`
-and `ubuntu-24.04-arm`. Tag pushes still build all three platforms. Re-running an older failed
-run uses its original workflow revision, so it does not pick up a workflow fix committed later.
+This runs the current workflow but checks out `refs/tags/v0.4.0`. It does not move the tag or
+overwrite existing release assets.
 
-## Community and Commercial Scope
+- Runner choices are `ubuntu-22.04`, `ubuntu-24.04`, and `ubuntu-24.04-arm`.
+- Tag pushes build all three platforms.
+- Re-running an old failed run uses its original workflow revision and does not pick up a later
+  workflow fix.
+
+## Community and Commercial scope
 
 DPP Community Edition and DPP Commercial Edition intentionally have different scopes.
 

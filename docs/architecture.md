@@ -37,11 +37,15 @@ In staged execution, these responsibilities are distributed as follows:
 
 ```mermaid
 flowchart LR
-    Input["PCAP file<br/>or stdin"] --> Read["Read bounded<br/>batches"]
-    Read --> Route["Route<br/>flows"]
-    Route --> Workers["Decode DNS<br/>and match"]
-    Workers --> Aggregate["Merge<br/>in order"]
-    Aggregate --> Write["Write CSV<br/>or Parquet"]
+    Input["PCAP file<br/>or stdin"]:::input --> Read["Read bounded<br/>batches"]:::process
+    Read --> Route["Route<br/>flows"]:::process
+    Route --> Workers["Decode DNS<br/>and match"]:::process
+    Workers --> Aggregate["Merge<br/>in order"]:::process
+    Aggregate --> Write["Write CSV<br/>or Parquet"]:::output
+
+    classDef input fill:#f3e8fd,stroke:#9334e6,color:#1a1a1a
+    classDef process fill:#e6f4ea,stroke:#34a853,color:#1a1a1a
+    classDef output fill:#fce8e6,stroke:#ea4335,color:#1a1a1a
 ```
 
 ### Execution and parallelism
@@ -82,6 +86,7 @@ See [RFC 0006](rfc/0006-adaptive-pipeline.md) for the selection policy and threa
 Parallel ingestion and DNS extraction are allowed. Matching may run in parallel only across
 independent shards, and **each shard exclusively owns its matcher state**. Query and response
 packets in the same client/resolver flow must reach the same worker before full DNS decode.
+
 Each shard processes candidates in deterministic order, and the aggregator
 merges finalized records deterministically before handing them to writers. Scheduler interleaving
 and container iteration order must never decide a tie.
@@ -311,7 +316,9 @@ construction.
 
 Flow hashing buffers the tuple's existing `Hash` writes on the stack and runs SeaHash once over
 those bytes. Integer encoding and digest remain identical to the streaming hasher, preserving
-shard assignment and output order. If the encoding outgrows the buffer, routing replays its bytes
+shard assignment and output order.
+
+If the encoding outgrows the buffer, routing replays its bytes
 into the streaming hasher. This adds neither persistent flow state nor another canonical address
 and port encoding.
 
@@ -339,9 +346,13 @@ additional records or all declared DNS records fit in the prefix.
 
 The DNS processor owns reassembly state. A complete datagram reaches the existing UDP/DNS
 validation path only after the first and last fragments establish its bounds and every byte is
-present. Its IP payload length must equal UDP Length; mismatched fragment sets are rejected.
-When the first fragment arrives after tails, its UDP Length also bounds every retained tail.
-A nonfinal fragment must end before that boundary, regardless of arrival order.
+present.
+
+The datagram bounds must agree:
+
+- IP payload length must equal UDP Length; mismatched fragment sets are rejected.
+- When the first fragment arrives after tails, its UDP Length also bounds every retained tail.
+- A nonfinal fragment must end before that boundary, regardless of arrival order.
 
 Incomplete responses may fall back to first-fragment inference on capacity eviction or EOF.
 With monotonic capture, entries can also expire after the match timeout. Without it, timestamp
@@ -382,14 +393,18 @@ retained-state bound. Routing owns this buffer; it contains no query/response pa
 
 Reassembly keeps a bounded history of completed datagrams. Fragment keys and UDP payload bytes
 are compared before suppressing repeated complete datagrams or prefix fallback matching a recent
-completion. A reused IPv4 ID with different content can form a new datagram, even if its first
+completion.
+
+A reused IPv4 ID with different content can form a new datagram, even if its first
 fragment is identical. An incomplete new datagram whose observed fragments match a recent
 completion is indistinguishable from a duplicate and may be suppressed, as may a fully identical
 new datagram.
 
 A first non-DNS UDP fragment removes earlier tails for its key. A separate bounded history drops
 later non-DNS tails without evicting completed-DNS history. A new DNS first fragment with a reused
-IPv4 ID removes that mark. A DNS tail arriving before its first fragment while the old mark is
+IPv4 ID removes that mark.
+
+A DNS tail arriving before its first fragment while the old mark is
 active is indistinguishable from an old non-DNS tail and may be dropped.
 
 The canonical VLAN context is part of each fragment key: different tagged segments cannot be

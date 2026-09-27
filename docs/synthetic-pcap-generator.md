@@ -1,26 +1,23 @@
 # Synthetic DNS PCAP Generator
 
-`dns-pcap-generator` is a standalone utility that emits classic PCAP with synthetic DNS traffic.
-It does not need an input capture at runtime.
-It lives in the separate workspace crate `tools/dns-pcap-generator`.
-It runs from a fitted profile artifact directory.
+`dns-pcap-generator` is a standalone utility in `tools/dns-pcap-generator`. It generates classic
+PCAP with synthetic DNS traffic from a fitted profile artifact directory; no input capture is
+needed at runtime.
 
-## Goal
+The checked-in `server1-jul-2024` profile resembles the broad DNS mix in a representative July 2024
+resolver capture. It uses a large positive-domain catalog sourced from filtered real client DNS
+traffic, excluding obviously client-specific names and bank domains.
 
-The checked-in `server1-jul-2024` profile is shaped to resemble the broad DNS mix seen in a
-representative July 2024 resolver capture, while deliberately excluding obviously client-specific
-names and bank domains.
+Traffic includes duplicate query retries, unanswered queries, mixed response codes, and multiple
+clients talking to one or more resolvers. Output is deterministic for a fixed `--seed`.
 
-The generator also models:
+- [Build and generate a capture](#build-and-generate-a-capture)
+- [Understand the traffic model](#understand-the-traffic-model)
+- [Use fitted profile artifacts](#use-fitted-profile-artifacts)
+- [Maintain the domain catalog](#maintain-the-domain-catalog)
+- [Sanitization boundary](#sanitization-boundary)
 
-- duplicate query retries
-- unanswered queries
-- mixed response codes
-- multiple clients talking to one or more resolvers
-- deterministic output for a fixed `--seed`
-- a large checked-in positive-domain catalog sourced from filtered real client DNS traffic
-
-## Usage
+## Build and generate a capture
 
 Requires Rust 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 
@@ -30,7 +27,9 @@ Build the standalone binary:
 cargo build -p dns-pcap-generator --release --bin dns-pcap-generator
 ```
 
-Generate a five-minute synthetic capture:
+### Generate by duration
+
+Generate a five-minute capture with an explicit rate, client pool, resolver pool, and seed:
 
 ```bash
 ./target/release/dns-pcap-generator \
@@ -43,7 +42,9 @@ Generate a five-minute synthetic capture:
   --seed 42
 ```
 
-Generate an exact number of logical transactions instead of duration-based traffic:
+### Generate a fixed transaction count
+
+Use `--transactions` for an exact number of logical transactions instead of duration-based traffic:
 
 ```bash
 ./target/release/dns-pcap-generator \
@@ -54,8 +55,9 @@ Generate an exact number of logical transactions instead of duration-based traff
   --resolvers 2
 ```
 
-Generate from the checked-in fitted profile defaults without overriding `qps`, `clients`, or
-`resolvers`:
+### Use the fitted defaults
+
+Omitted `--qps`, `--clients`, and `--resolvers` values inherit the fitted profile defaults:
 
 ```bash
 ./target/release/dns-pcap-generator \
@@ -63,6 +65,69 @@ Generate from the checked-in fitted profile defaults without overriding `qps`, `
   synthetic/fitted-profile.pcap \
   --transactions 500000
 ```
+
+The profile also sets calibrated duplicate and timeout rates and duplicate retry multiplicity.
+Those settings cannot be overridden at runtime, keeping post-DPP behavior anchored to the fitted
+profile.
+
+## Understand the traffic model
+
+### Packet format and address pools
+
+Queries go from the synthetic client pool to the synthetic resolver pool.
+
+| Property | Model |
+| --- | --- |
+| Output | Classic little-endian PCAP. |
+| Packet layers | Ethernet → IPv4 → UDP → DNS. |
+| Synthetic clients | `100.64.0.0/10`. |
+| Synthetic resolvers | `172.20.0.0/16`. |
+| Client limit | `--clients` is validated against the pool's capacity of 4,161,536 distinct synthetic client IPs. |
+
+### Timing and retries
+
+Inter-arrival times follow an exponential distribution around `--qps`. Scheduling uses nanosecond
+precision with fractional carry, while classic PCAP stores microsecond timestamps. At high QPS,
+multiple packets can therefore share a timestamp without imposing a one-microsecond minimum gap on
+the generated rate.
+
+Duplicate retries use the profile's fitted delay for each retry step. Delays are not necessarily
+increasing: the first unanswered steps have long backoff, while later fitted or hypothesized steps
+can be much shorter. A response follows the last retry.
+
+Matched response latency is calibrated from the local `server1_jul_2024.csv` distribution. Most
+replies arrive in a few dozen microseconds, with a rare long tail and heavier `ServFail` delays.
+
+The generator streams output and keeps only future scheduled packets in memory, which scales much
+better than materializing the whole capture before sorting.
+
+### DNS answers
+
+| Successful query | Response contents |
+| --- | --- |
+| `A`, `AAAA`, `HTTPS`, `SVCB` | Syntactically valid DNS answers. |
+| `NS` for the root domain (`.`) | A valid root-server target selected from `a.root-servers.net` through `m.root-servers.net`. |
+| `TXT`, `SRV`, `CNAME`, `MX` | May return `NOERROR` with zero answers: an intentional NODATA-style simplification. |
+
+## Use fitted profile artifacts
+
+The generator loads `fitted-generator.toml` from `--profile-dir`, verifies the referenced catalog's
+digest, and uses the artifact directory as its runtime source of truth.
+
+The checked-in `server1-jul-2024` profile contains `fitted-generator.toml`. Its `catalog_path` points
+to the workspace-level `tools/dns-pcap-generator/catalog_data.tsv`, keeping one reviewable copy of
+the sanitized catalog instead of duplicating it inside the profile directory.
+
+### Validation and errors
+
+Runtime failures use typed CLI errors, with stable top-level messages and source chains for invalid
+arguments and I/O failures. In particular:
+
+- Catalog rows with zero weights or DNS names longer than 255 wire bytes are rejected.
+- Fitted profiles are rejected if `duplicate_max` is below every configured retry count.
+- Generation returns an error if a packet timestamp exceeds the classic PCAP 32-bit seconds range.
+
+## Maintain the domain catalog
 
 Regenerate the checked-in workspace catalog TSV from a local CSV:
 
@@ -74,73 +139,29 @@ cargo run -p dns-catalog-builder --release -- \
 ```
 
 The catalog builder writes and syncs a separate temporary file beside the destination before
-replacing the output. Concurrent builds targeting the same path cannot truncate each other's
-temporary files; the last successful replacement supplies the complete catalog. Ordinary I/O
-errors preserve the previous output and trigger best-effort removal of that build's temporary
-file. A process crash or a filesystem cleanup error can leave a temporary file behind.
+replacing the output:
 
-The generator loads `fitted-generator.toml` from `--profile-dir`, verifies the referenced
-`catalog_data.tsv` digest, and then uses the artifact directory as the runtime source of truth.
-The checked-in `server1-jul-2024` profile points its `catalog_path` at the workspace-level
-`tools/dns-pcap-generator/catalog_data.tsv`, so the catalog remains a single reviewable source of
-truth instead of being duplicated inside the profile directory. Runtime failures are reported
-through typed CLI errors, so invalid arguments and I/O failures surface with stable top-level
-messages and source chains.
-Catalog rows with zero weights or DNS names longer than 255 wire bytes are rejected, as are fitted
-profiles whose `duplicate_max` is below every configured retry count. Generation returns an error
-if a packet timestamp exceeds the classic PCAP 32-bit seconds range.
+- Concurrent builds targeting the same path cannot truncate each other's temporary files. The last
+  successful replacement supplies the complete catalog.
+- Ordinary I/O errors preserve the previous output and trigger best-effort removal of that build's
+  temporary file.
+- A process crash or filesystem cleanup error can leave a temporary file behind.
 
-## Model
+When changing the traffic shape, keep the fitted profile, catalog, and tests in sync so the
+sanitization boundary remains explicit.
 
-- The output is classic little-endian PCAP with Ethernet + IPv4 + UDP + DNS packets.
-- Queries go from a synthetic client pool in `100.64.0.0/10` to a synthetic resolver pool in
-  `172.20.0.0/16`.
-- `--clients` is validated against the distinct address capacity of that client pool, which is
-  4,161,536 synthetic client IPs.
-- Inter-arrival times are sampled from an exponential distribution around the configured `--qps`.
-  The generator schedules them at nanosecond precision with fractional carry. Classic PCAP stores
-  microsecond timestamps, so at high QPS multiple packets can share a timestamp without imposing
-  a one-microsecond minimum gap on the generated rate.
-- Duplicate retries use the profile's fitted delay for each retry step. These delays are not
-  necessarily increasing: the first unanswered steps have long backoff, while later fitted or
-  hypothesized steps can be much shorter. A response follows the last retry.
-- Matched response latency is calibrated from the local `server1_jul_2024.csv` distribution:
-  most replies land in a few dozen microseconds, with a rare long tail and heavier `ServFail`
-  delays.
-- Successful `A`, `AAAA`, `HTTPS`, and `SVCB` responses include syntactically valid DNS answers.
-- Successful `NS` queries for the root domain (`.`) are allowed and return a valid root-server
-  target selected from the current `a.root-servers.net` through `m.root-servers.net` set.
-- `TXT`, `SRV`, `CNAME`, and `MX` questions may return `NOERROR` with zero answers; that is an
-  intentional NODATA-style simplification.
-- The checked-in runtime profile carries calibrated duplicate/timeout rates and duplicate retry
-  multiplicity. Those knobs are not user-overridable at runtime, which keeps post-DPP behavior
-  anchored to the fitted profile.
-- The positive-domain catalog stays in `tools/dns-pcap-generator/catalog_data.tsv`, and the
-  checked-in profile references it via `catalog_path`. This avoids a second source of truth for
-  the sanitized catalog.
-- Omitted `--qps`, `--clients`, and `--resolvers` values inherit the fitted profile defaults.
-
-## Sanitization Boundary
+## Sanitization boundary
 
 The checked-in positive-domain catalog is curated and validated to exclude:
 
-- `android.clients.*`
-- push-courier / Apple-device routing names
-- `_dns.resolver.arpa`
-- `.local`, `.lan`, `.home.arpa`
-- Banking domains
-- labels that look like long unique numeric or hex identifiers
+| Category | Exclusions |
+| --- | --- |
+| Client and device routing | `android.clients.*`; push-courier / Apple-device routing names. |
+| Resolver discovery | `_dns.resolver.arpa`. |
+| Local names | `.local`, `.lan`, `.home.arpa`. |
+| Sensitive domain category | Banking domains. |
+| Identifier-like labels | Long unique numeric or hex identifiers. |
 
-Hypothesis:
-The current “client-specific” detector is a conservative heuristic, not a formally complete
-classifier. It is designed to block obvious device/user-specific names without requiring access to
+**Hypothesis:** The current client-specific detector is a conservative heuristic, not a formally
+complete classifier. It is designed to block obvious device/user-specific names without requiring
 the original capture at runtime.
-
-## Operational Notes
-
-- The generator streams output and keeps only future scheduled packets in memory, so it scales much
-  better than materializing the whole capture before sorting.
-- The checked-in `server1-jul-2024` profile includes `fitted-generator.toml` and intentionally
-  reuses the workspace catalog TSV instead of carrying a second copy of the catalog. If the traffic
-  shape needs to change, keep the fitted profile and the catalog/tests in sync so the sanitization
-  boundary remains explicit.

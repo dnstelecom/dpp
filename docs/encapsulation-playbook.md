@@ -1,40 +1,49 @@
 # Encapsulation Conversion Guide
 
-## Goal
+Use this guide to convert captures with MPLS or another unsupported outer encapsulation into flat
+Ethernet plus IPv4 or IPv6 captures that DPP can read directly.
 
-This document explains how to convert a capture that contains MPLS or another unsupported outer
-encapsulation layer into a flat Ethernet plus IPv4 or IPv6 capture that DPP can read directly.
-Ethernet VLAN and QinQ stacks with TPIDs `0x8100`, `0x88a8`, or `0x9100` are decoded natively.
-Matching and IPv4 reassembly preserve the complete ordered TPID/VLAN-ID stack, so overlapping
-IP endpoints on different tagged segments remain separate. PCP and DEI changes are ignored for
-this identity; no VLAN column is added to exported records.
+- [Decide whether conversion is needed](#decide-whether-conversion-is-needed)
+- [Convert a capture on Linux](#convert-a-capture-on-linux)
+- [Validate the output](#validate-the-output)
+- [Add native support](#add-native-support)
 
-Target output shape:
+## Decide whether conversion is needed
 
-1. Ethernet
-2. IPv4 or IPv6
-3. UDP
-4. DNS payload
+| Capture layers | Action |
+| --- | --- |
+| Ethernet → IPv4 or IPv6 → UDP → DNS | Read directly; no conversion needed. |
+| Ethernet with VLAN or QinQ tags | Read directly; TPIDs `0x8100`, `0x88a8`, and `0x9100` are supported natively. |
+| MPLS labels or another unsupported shim between Ethernet and IP | Inspect the capture, then normalize supported labels with the script below. |
 
-If the input capture already has that shape, no conversion is needed.
+A typical symptom of unsupported encapsulation is that DPP runs, but query or response counts are
+lower than expected because the current fast path does not extract the labeled packets.
 
-## When to Use This Guide
+Native VLAN and QinQ handling preserves the complete ordered TPID/VLAN-ID stack in matching and
+IPv4 reassembly. Overlapping IP endpoints on different tagged segments remain separate. PCP and
+DEI changes do not affect this identity, and exported records do not gain a VLAN column.
 
-Use this guide when the original capture contains any of the following before the IP header:
+> The normalization script removes VLAN and QinQ tags as well as MPLS labels. VLAN or
+> provider-bridging layers alone do not require conversion.
 
-- MPLS label stacks
-- other unsupported shim layers between Ethernet and IP
+## Convert a capture on Linux
 
-Typical symptom:
+Keep the original capture unchanged for audit and debugging. Write to a separate output file and
+treat the normalized capture as derived data; do not overwrite the source in place.
 
-- DPP runs, but query or response counts are lower than expected because unsupported labeled packets
-  are not being extracted by the current fast path.
+### 1. Install the tools
 
-## Linux Workflow
+Install `tshark` and Python support:
 
-### 1. Inspect the Capture
+```bash
+sudo apt-get update
+sudo apt-get install -y tshark python3 python3-pip
+python3 -m pip install --user scapy
+```
 
-Use `tshark` to confirm whether the capture contains VLAN, QinQ, MPLS, or other outer layers.
+### 2. Inspect the capture
+
+Use `tshark` to check for VLAN, QinQ, MPLS, or other outer layers:
 
 ```bash
 tshark -r input.pcap -q -z io,phs
@@ -43,25 +52,22 @@ tshark -r input.pcap -q -z io,phs
 If you see `mpls` or another unsupported layer before `ip` or `ipv6`, continue with normalization.
 VLAN and provider-bridging layers alone do not require this step.
 
-### 2. Install the Required Tools
-
-Install `tshark` and Python support on Linux:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y tshark python3 python3-pip
-python3 -m pip install --user scapy
-```
-
 If the capture is `pcapng` and a downstream tool expects classic `pcap`, convert it first:
 
 ```bash
 editcap -F libpcap input.pcapng input.pcap
 ```
 
-### 3. Normalize the Capture
+### 3. Normalize the capture
 
-Save the following script as `normalize_encapsulation.py`:
+The script preserves Ethernet source and destination MAC addresses and packet timestamps. It strips
+outer VLAN, QinQ, and MPLS layers, then writes only packets that resolve cleanly to IPv4 or IPv6.
+
+It does not decode or rewrite DNS contents, preserve unsupported non-IP payloads after stripping,
+or guarantee support for every proprietary shim layer. If too many packets are skipped, inspect
+the protocol hierarchy again for a layer the script cannot handle.
+
+Save the following as `normalize_encapsulation.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -147,71 +153,50 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-Run it:
+Run it with separate input and output paths:
 
 ```bash
 python3 normalize_encapsulation.py input.pcap normalized.pcap
 ```
 
-What this does:
+## Validate the output
 
-- preserves Ethernet source and destination MAC addresses;
-- removes outer VLAN, QinQ, and MPLS layers;
-- keeps the original packet timestamp;
-- writes only packets that resolve cleanly to IPv4 or IPv6 after stripping the outer labels.
-
-What it does **not** do:
-
-- it does not preserve unsupported non-IP payloads after label stripping;
-- it does not decode or rewrite DNS contents;
-- it does not guarantee support for every possible proprietary shim layer.
-
-### 4. Validate the Result
-
-Check that the normalized capture now has the expected protocol hierarchy:
+### 1. Check the protocol hierarchy
 
 ```bash
 tshark -r normalized.pcap -q -z io,phs
 ```
 
-You should now see the DNS packets under plain IPv4 or IPv6 instead of under outer VLAN or MPLS
-labels.
+DNS packets should now appear under plain IPv4 or IPv6 instead of outer VLAN or MPLS labels.
 
-### 5. Run DPP on the Normalized Capture
+### 2. Run DPP
+
+For CSV:
 
 ```bash
 target/release/dpp normalized.pcap normalized.csv --format csv
 ```
 
-Or for Parquet:
+For Parquet:
 
 ```bash
 target/release/dpp normalized.pcap normalized.pq --format pq
 ```
 
-## Validation Checklist
+### 3. Check the results
 
-After conversion, validate all of the following:
+- Confirm the expected output packet count, order, and timestamps.
+- Check that DPP query and response counts move in the expected direction.
+- Inspect representative DNS flows that were previously missing.
+- Confirm that repeated DPP runs on the normalized capture remain deterministic.
 
-- the output capture still preserves the expected packet count order and timestamps;
-- DPP query and response counts move in the expected direction;
-- representative DNS flows that were previously missing are now present;
-- repeated DPP runs on the normalized capture remain deterministic.
+## Add native support
 
-## Safety Notes
+If normalization is not acceptable operationally, native support belongs in
+[`src/dns_processor/parser.rs`](../src/dns_processor/parser.rs) and, for fragmented IPv4,
+[`reassembly.rs`](../src/dns_processor/reassembly.rs).
 
-- Keep the original capture unchanged for audit and debugging.
-- Do not overwrite the source file in place.
-- Treat the normalized capture as derived data from the original packet stream.
-- If the conversion script skips too many packets, inspect the protocol hierarchy again; the
-  capture may contain an encapsulation layer that is still unsupported by the script.
-
-## If Native Support Is Needed
-
-If normalization is not acceptable operationally and DPP must read those captures directly, native
-support belongs in `src/dns_processor/parser.rs` and, for fragmented IPv4, `reassembly.rs`.
-
-That change must be accompanied by:
+Any such change requires:
 
 - unit tests for every newly supported encapsulation layer;
 - determinism checks on representative captures;
