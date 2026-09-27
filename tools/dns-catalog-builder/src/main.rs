@@ -10,13 +10,17 @@ use csv::StringRecord;
 use dns_pcap_generator::is_disallowed_domain;
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 type Result<T> = std::result::Result<T, Error>;
+
+static TEMPORARY_CATALOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const TEMPORARY_CATALOG_ATTEMPTS: usize = 100;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -254,12 +258,8 @@ fn normalized_name(row: &StringRecord, name_index: usize) -> Option<String> {
 }
 
 fn write_catalog_atomic(output: &Path, entries: &[CatalogEntry]) -> Result<()> {
-    let temp_path = temporary_output_path(output)?;
+    let (temporary, file) = TemporaryCatalog::create(output, &TEMPORARY_CATALOG_SEQUENCE)?;
     {
-        let file = File::create(&temp_path).map_err(|source| Error::TemporaryCatalogCreate {
-            path: temp_path.clone(),
-            source,
-        })?;
         let mut writer = BufWriter::new(file);
         for entry in entries {
             writeln!(writer, "{}\t{}", entry.count, entry.name).map_err(|source| {
@@ -270,39 +270,307 @@ fn write_catalog_atomic(output: &Path, entries: &[CatalogEntry]) -> Result<()> {
             })?;
         }
         writer.flush().map_err(|source| Error::OutputFlush {
-            path: temp_path.clone(),
+            path: temporary.path.clone(),
             source,
         })?;
         writer
             .get_ref()
             .sync_all()
             .map_err(|source| Error::OutputSync {
-                path: temp_path.clone(),
+                path: temporary.path.clone(),
                 source,
             })?;
     }
 
-    fs::rename(&temp_path, output).map_err(|source| Error::CatalogRename {
-        temp_path,
-        output_path: output.to_path_buf(),
-        source,
-    })?;
-    Ok(())
+    temporary.publish(output)
 }
 
-fn temporary_output_path(output: &Path) -> Result<PathBuf> {
-    let file_name = output
-        .file_name()
-        .ok_or_else(|| Error::OutputPathMissingFileName {
+#[derive(Debug)]
+struct TemporaryCatalog {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TemporaryCatalog {
+    fn create(output: &Path, sequence: &AtomicU64) -> Result<(Self, File)> {
+        let mut attempts = 0;
+        loop {
+            let id = sequence.fetch_add(1, Ordering::Relaxed);
+            let path = temporary_output_path(output, id)?;
+            let candidate_name = path.file_name().expect("temporary path has a file name");
+            if output.file_name().is_some_and(|name| {
+                candidate_name
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(name.as_encoded_bytes())
+            }) {
+                continue;
+            }
+            attempts += 1;
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path,
+                            published: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(source)
+                    if source.kind() == io::ErrorKind::AlreadyExists
+                        && attempts < TEMPORARY_CATALOG_ATTEMPTS => {}
+                Err(source) => return Err(Error::TemporaryCatalogCreate { path, source }),
+            }
+        }
+    }
+
+    fn publish(mut self, output: &Path) -> Result<()> {
+        fs::rename(&self.path, output).map_err(|source| Error::CatalogRename {
+            temp_path: self.path.clone(),
+            output_path: output.to_path_buf(),
+            source,
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryCatalog {
+    fn drop(&mut self) {
+        if !self.published {
+            // Preserve the original I/O error if cleanup itself fails.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn temporary_output_path(output: &Path, id: u64) -> Result<PathBuf> {
+    if output.file_name().is_none() {
+        return Err(Error::OutputPathMissingFileName {
             path: output.to_path_buf(),
-        })?
-        .to_string_lossy();
-    Ok(output.with_file_name(format!(".{file_name}.tmp")))
+        });
+    }
+    Ok(output.with_file_name(format!(".dns-catalog.{}.{id}.tmp", std::process::id())))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_catalog;
+    use super::{
+        CatalogEntry, Error, TEMPORARY_CATALOG_ATTEMPTS, TemporaryCatalog, build_catalog,
+        temporary_output_path, write_catalog_atomic,
+    };
+    use std::fs;
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("dns-catalog-builder-{}-{id}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_catalog_atomic_replaces_complete_catalog() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        fs::write(&output, "previous catalog").unwrap();
+
+        write_catalog_atomic(
+            &output,
+            &[
+                CatalogEntry {
+                    count: 7,
+                    name: "example.com".into(),
+                },
+                CatalogEntry {
+                    count: 3,
+                    name: "example.org".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "7\texample.com\n3\texample.org\n"
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_output_file_name_publishes_successfully() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("c".repeat(250));
+        write_catalog_atomic(
+            &output,
+            &[CatalogEntry {
+                count: 7,
+                name: "example.com".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&output).unwrap(), "7\texample.com\n");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn temporary_candidate_cannot_create_destination_before_publication() {
+        for uppercase in [false, true] {
+            let directory = TestDirectory::new();
+            let candidate = temporary_output_path(&directory.0.join("catalog.tsv"), 0).unwrap();
+            let output = if uppercase {
+                candidate.with_file_name(candidate.file_name().unwrap().to_ascii_uppercase())
+            } else {
+                candidate
+            };
+            let (temporary, mut file) =
+                TemporaryCatalog::create(&output, &AtomicU64::new(0)).unwrap();
+            file.write_all(b"7\texample.com\n").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            assert!(!output.exists());
+
+            temporary.publish(&output).unwrap();
+            assert_eq!(fs::read_to_string(&output).unwrap(), "7\texample.com\n");
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn overlapping_publisher_abort_preserves_written_catalog() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        let (first, mut first_file) =
+            TemporaryCatalog::create(&output, &AtomicU64::new(0)).unwrap();
+        first_file.write_all(b"7\texample.com\n").unwrap();
+
+        // The second publisher starts after the first has written, then exits before writing.
+        let (second, second_file) = TemporaryCatalog::create(&output, &AtomicU64::new(0)).unwrap();
+        assert_ne!(first.path, second.path);
+        drop(second_file);
+        drop(second);
+
+        first_file.sync_all().unwrap();
+        drop(first_file);
+        first.publish(&output).unwrap();
+        assert_eq!(fs::read_to_string(&output).unwrap(), "7\texample.com\n");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn overlapping_publishers_each_replace_with_their_complete_catalog() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        let sequence = AtomicU64::new(0);
+        let (first, mut first_file) = TemporaryCatalog::create(&output, &sequence).unwrap();
+        let (second, mut second_file) = TemporaryCatalog::create(&output, &sequence).unwrap();
+        first_file.write_all(b"7\texample.com\n").unwrap();
+        second_file.write_all(b"3\texample.org\n").unwrap();
+        first_file.sync_all().unwrap();
+        second_file.sync_all().unwrap();
+        drop(first_file);
+        drop(second_file);
+
+        first.publish(&output).unwrap();
+        assert_eq!(fs::read_to_string(&output).unwrap(), "7\texample.com\n");
+        second.publish(&output).unwrap();
+        assert_eq!(fs::read_to_string(&output).unwrap(), "3\texample.org\n");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn temporary_catalog_collision_preserves_existing_file() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        let existing_temp = temporary_output_path(&output, 0).unwrap();
+        fs::write(&output, "previous catalog").unwrap();
+        fs::write(&existing_temp, "another publisher").unwrap();
+
+        let (temporary, file) = TemporaryCatalog::create(&output, &AtomicU64::new(0)).unwrap();
+        assert_ne!(temporary.path, existing_temp);
+        drop(file);
+        drop(temporary);
+
+        assert_eq!(
+            fs::read_to_string(&existing_temp).unwrap(),
+            "another publisher"
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "previous catalog");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn temporary_catalog_collision_exhaustion_preserves_existing_files() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        for id in 0..TEMPORARY_CATALOG_ATTEMPTS as u64 {
+            fs::write(
+                temporary_output_path(&output, id).unwrap(),
+                "another publisher",
+            )
+            .unwrap();
+        }
+
+        let error = TemporaryCatalog::create(&output, &AtomicU64::new(0)).unwrap_err();
+        assert!(matches!(error, Error::TemporaryCatalogCreate { source, .. }
+            if source.kind() == io::ErrorKind::AlreadyExists));
+        for id in 0..TEMPORARY_CATALOG_ATTEMPTS as u64 {
+            assert_eq!(
+                fs::read_to_string(temporary_output_path(&output, id).unwrap()).unwrap(),
+                "another publisher"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&directory.0).unwrap().count(),
+            TEMPORARY_CATALOG_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn failed_publication_removes_only_its_temporary_file() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("catalog.tsv");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("keep"), "existing destination").unwrap();
+        let unrelated = directory.0.join("another-publisher.tmp");
+        fs::write(&unrelated, "another publisher").unwrap();
+
+        let error = write_catalog_atomic(
+            &output,
+            &[CatalogEntry {
+                count: 7,
+                name: "example.com".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CatalogRename { .. }));
+        assert_eq!(
+            fs::read_to_string(output.join("keep")).unwrap(),
+            "existing destination"
+        );
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "another publisher");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
 
     #[test]
     fn build_catalog_aggregates_filters_and_sorts_rows() {

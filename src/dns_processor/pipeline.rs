@@ -351,6 +351,44 @@ fn join_thread<T>(handle: thread::JoinHandle<anyhow::Result<T>>, label: &str) ->
         .map_err(|err| io::Error::other(format!("{label} panicked: {:?}", err)))?
 }
 
+fn join_matcher_workers(
+    handles: Vec<thread::JoinHandle<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
+    let mut result = Ok(());
+    for (worker_idx, handle) in handles.into_iter().enumerate() {
+        let worker_result = join_thread(handle, &format!("Matcher worker {worker_idx}"));
+        if result.is_ok() {
+            result = worker_result;
+        }
+    }
+    result
+}
+
+trait StagedThreadSpawner {
+    fn spawn<F>(
+        &mut self,
+        builder: thread::Builder,
+        task: F,
+    ) -> io::Result<thread::JoinHandle<anyhow::Result<()>>>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static;
+}
+
+struct SystemThreadSpawner;
+
+impl StagedThreadSpawner for SystemThreadSpawner {
+    fn spawn<F>(
+        &mut self,
+        builder: thread::Builder,
+        task: F,
+    ) -> io::Result<thread::JoinHandle<anyhow::Result<()>>>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        builder.spawn(task)
+    }
+}
+
 fn logical_shard_count(num_threads: usize, shard_parallelism_enabled: bool) -> usize {
     if !shard_parallelism_enabled {
         return 1;
@@ -1038,12 +1076,32 @@ fn run_staged_processing_pipeline(
     affinity_plan: AffinityPlan,
     signals: WorkerShutdownSignals,
 ) -> anyhow::Result<PipelineCounters> {
+    run_staged_processing_pipeline_with_spawner(
+        dns_processor,
+        batch_rx,
+        tx,
+        ShardRoutingPlan::new(shard_count, worker_count),
+        affinity_plan,
+        signals,
+        &mut SystemThreadSpawner,
+    )
+}
+
+fn run_staged_processing_pipeline_with_spawner(
+    dns_processor: Arc<DnsProcessor>,
+    batch_rx: Receiver<PacketBatch>,
+    tx: Sender<OutputMessage>,
+    routing_plan: ShardRoutingPlan,
+    affinity_plan: AffinityPlan,
+    signals: WorkerShutdownSignals,
+    spawner: &mut impl StagedThreadSpawner,
+) -> anyhow::Result<PipelineCounters> {
     let WorkerShutdownSignals {
         shutdown_requested,
         intake_failed,
         output_closed,
     } = signals;
-    let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
+    let worker_count = routing_plan.worker_ranges.len();
     let (result_tx, result_rx) =
         crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH * worker_count.max(1));
 
@@ -1054,67 +1112,85 @@ fn run_staged_processing_pipeline(
         let (worker_tx, worker_rx) = crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH);
         worker_txs.push(worker_tx);
 
-        worker_handles.push(
-            thread::Builder::new()
-                .name(format!("DPP_Matcher_{}", worker_idx))
-                .spawn({
-                    let dns_processor = Arc::clone(&dns_processor);
-                    let result_tx = result_tx.clone();
-                    let shutdown_requested = Arc::clone(&shutdown_requested);
-                    let intake_failed = Arc::clone(&intake_failed);
-                    let output_closed = Arc::clone(&output_closed);
-                    let affinity_plan = affinity_plan.clone();
-                    move || {
-                        affinity_plan.apply_to_current_thread(
-                            staged_matcher_affinity_slot(worker_idx),
-                            "staged matcher worker",
-                        );
-                        run_matcher_worker(
-                            dns_processor,
-                            worker_idx,
-                            shard_range,
-                            worker_rx,
-                            result_tx,
-                            WorkerShutdownSignals {
-                                shutdown_requested,
-                                intake_failed,
-                                output_closed,
-                            },
-                        )
-                    }
-                })?,
+        let worker = spawner.spawn(
+            thread::Builder::new().name(format!("DPP_Matcher_{}", worker_idx)),
+            {
+                let dns_processor = Arc::clone(&dns_processor);
+                let result_tx = result_tx.clone();
+                let shutdown_requested = Arc::clone(&shutdown_requested);
+                let intake_failed = Arc::clone(&intake_failed);
+                let output_closed = Arc::clone(&output_closed);
+                let affinity_plan = affinity_plan.clone();
+                move || {
+                    affinity_plan.apply_to_current_thread(
+                        staged_matcher_affinity_slot(worker_idx),
+                        "staged matcher worker",
+                    );
+                    run_matcher_worker(
+                        dns_processor,
+                        worker_idx,
+                        shard_range,
+                        worker_rx,
+                        result_tx,
+                        WorkerShutdownSignals {
+                            shutdown_requested,
+                            intake_failed,
+                            output_closed,
+                        },
+                    )
+                }
+            },
         );
+        match worker {
+            Ok(handle) => worker_handles.push(handle),
+            Err(error) => {
+                drop(worker_txs);
+                drop(batch_rx);
+                drop(result_tx);
+                // No aggregator will receive the workers' finalization messages.
+                drop(result_rx);
+                let _ = join_matcher_workers(worker_handles);
+                return Err(error.into());
+            }
+        }
     }
     drop(result_tx);
 
-    let parser_handle = thread::Builder::new()
-        .name("DPP_Parser".to_string())
-        .spawn({
-            let output_closed = Arc::clone(&output_closed);
-            let allow_fragments = dns_processor.allow_fragments;
-            let full_fragments = dns_processor.full_fragments;
-            let match_timeout_micros = dns_processor.match_timeout_micros;
-            let monotonic_capture = dns_processor.monotonic_capture;
-            let affinity_plan = affinity_plan.clone();
-            move || {
-                affinity_plan.apply_to_current_thread(
-                    staged_parser_affinity_slot(worker_count),
-                    "staged parser",
-                );
-                run_parser_stage(
-                    batch_rx,
-                    worker_txs,
-                    routing_plan,
-                    output_closed,
-                    FragmentProcessingConfig {
-                        allow_fragments,
-                        full_fragments,
-                        match_timeout_micros,
-                        monotonic_capture,
-                    },
-                )
-            }
-        })?;
+    let parser = spawner.spawn(thread::Builder::new().name("DPP_Parser".to_string()), {
+        let output_closed = Arc::clone(&output_closed);
+        let allow_fragments = dns_processor.allow_fragments;
+        let full_fragments = dns_processor.full_fragments;
+        let match_timeout_micros = dns_processor.match_timeout_micros;
+        let monotonic_capture = dns_processor.monotonic_capture;
+        let affinity_plan = affinity_plan.clone();
+        move || {
+            affinity_plan.apply_to_current_thread(
+                staged_parser_affinity_slot(worker_count),
+                "staged parser",
+            );
+            run_parser_stage(
+                batch_rx,
+                worker_txs,
+                routing_plan,
+                output_closed,
+                FragmentProcessingConfig {
+                    allow_fragments,
+                    full_fragments,
+                    match_timeout_micros,
+                    monotonic_capture,
+                },
+            )
+        }
+    });
+    let parser_handle = match parser {
+        Ok(handle) => handle,
+        Err(error) => {
+            // The rejected task drops the intake receiver and worker senders.
+            drop(result_rx);
+            let _ = join_matcher_workers(worker_handles);
+            return Err(error.into());
+        }
+    };
 
     affinity_plan.apply_to_current_thread(
         staged_aggregator_affinity_slot(worker_count),
@@ -1123,13 +1199,7 @@ fn run_staged_processing_pipeline(
     let aggregator_result = run_aggregator(result_rx, tx, worker_count, output_closed);
 
     let parser_result = join_thread(parser_handle, "Parser stage");
-    let worker_result =
-        worker_handles
-            .into_iter()
-            .enumerate()
-            .try_for_each(|(worker_idx, worker_handle)| {
-                join_thread(worker_handle, &format!("Matcher worker {}", worker_idx)).map(|_| ())
-            });
+    let worker_result = join_matcher_workers(worker_handles);
 
     parser_result?;
     worker_result?;
@@ -1304,12 +1374,170 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::{Duration, Instant};
 
     fn test_worker_signals(shutdown_requested: bool) -> WorkerShutdownSignals {
         WorkerShutdownSignals {
             shutdown_requested: Arc::new(AtomicBool::new(shutdown_requested)),
             intake_failed: Arc::new(AtomicBool::new(false)),
             output_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    struct FailingStagedSpawner {
+        call: usize,
+        fail_at: usize,
+        finished_work: Sender<()>,
+        release: Receiver<()>,
+        exits: Arc<AtomicUsize>,
+    }
+
+    impl StagedThreadSpawner for FailingStagedSpawner {
+        fn spawn<F>(
+            &mut self,
+            builder: thread::Builder,
+            task: F,
+        ) -> io::Result<thread::JoinHandle<anyhow::Result<()>>>
+        where
+            F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+        {
+            let call = self.call;
+            self.call += 1;
+            if call == self.fail_at {
+                return Err(io::Error::other(format!(
+                    "injected spawn failure at {call}"
+                )));
+            }
+
+            let finished_work = self.finished_work.clone();
+            let release = self.release.clone();
+            let exits = Arc::clone(&self.exits);
+            builder.spawn(move || {
+                let _ = task();
+                finished_work
+                    .send(())
+                    .expect("test observes worker cleanup");
+                release.recv().expect("test releases worker exit");
+                exits.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(anyhow::anyhow!("secondary worker failure"))
+            })
+        }
+    }
+
+    fn finish_after_worker_release<T>(
+        finished_work: Receiver<()>,
+        release: Sender<()>,
+        done: Receiver<anyhow::Result<T>>,
+        coordinator: thread::JoinHandle<()>,
+        held_workers: usize,
+    ) -> anyhow::Result<T> {
+        for _ in 0..held_workers {
+            finished_work
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker reaches its exit gate");
+        }
+        let early_result = (held_workers > 0).then(|| done.recv_timeout(Duration::from_millis(50)));
+        // Release even if the coordinator returned early, so a failing test leaves no held worker.
+        for _ in 0..held_workers {
+            release.send(()).expect("worker exit released");
+        }
+        let returned_early = matches!(early_result, Some(Ok(_)));
+        let result = match early_result {
+            Some(Ok(result)) => result,
+            Some(Err(crossbeam::channel::RecvTimeoutError::Disconnected)) => {
+                panic!("coordinator disconnected without returning its result")
+            }
+            _ => done
+                .recv_timeout(Duration::from_secs(5))
+                .expect("coordinator finishes after workers exit"),
+        };
+        coordinator.join().expect("test coordinator joins");
+        assert!(
+            !returned_early,
+            "returned while a worker was still held alive"
+        );
+        result
+    }
+
+    #[test]
+    fn staged_spawn_failures_join_started_workers_and_preserve_startup_error() {
+        // Calls 0/1 start matcher workers; call 2 starts the parser.
+        for fail_at in 0..=2 {
+            let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
+            let (output_tx, _output_rx) = crossbeam::channel::unbounded();
+            let (finished_tx, finished_rx) = crossbeam::channel::unbounded();
+            let (release_tx, release_rx) = crossbeam::channel::unbounded();
+            let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+            let exits = Arc::new(AtomicUsize::new(0));
+            let mut spawner = FailingStagedSpawner {
+                call: 0,
+                fail_at,
+                finished_work: finished_tx,
+                release: release_rx,
+                exits: Arc::clone(&exits),
+            };
+            let processor = Arc::new(DnsProcessor::new(None).expect("processor initializes"));
+            let coordinator = thread::spawn(move || {
+                let result = run_staged_processing_pipeline_with_spawner(
+                    processor,
+                    batch_rx,
+                    output_tx,
+                    ShardRoutingPlan::new(4, 2),
+                    AffinityPlan::disabled(),
+                    test_worker_signals(false),
+                    &mut spawner,
+                );
+                done_tx.send(result).expect("test observes startup result");
+            });
+
+            let error =
+                finish_after_worker_release(finished_rx, release_tx, done_rx, coordinator, fail_at)
+                    .err()
+                    .expect("injected spawn failure is returned");
+            assert_eq!(
+                error.to_string(),
+                format!("injected spawn failure at {fail_at}")
+            );
+            assert_eq!(exits.load(AtomicOrdering::SeqCst), fail_at);
+            assert!(matches!(
+                batch_tx.try_send(Vec::new()),
+                Err(crossbeam::channel::TrySendError::Disconnected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn matcher_join_waits_for_remaining_workers_after_error_or_panic() {
+        for first_panics in [false, true] {
+            let (finished_tx, finished_rx) = crossbeam::channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+            let (done_tx, done_rx) = crossbeam::channel::bounded(1);
+            let first = thread::spawn(move || {
+                assert!(!first_panics, "first worker panic");
+                Err(anyhow::anyhow!("first worker failure"))
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !first.is_finished() {
+                assert!(Instant::now() < deadline, "first worker completes");
+                thread::yield_now();
+            }
+            let second = thread::spawn(move || {
+                finished_tx.send(()).expect("test observes second worker");
+                release_rx.recv().expect("second worker released");
+                Err(anyhow::anyhow!("later worker failure"))
+            });
+            let coordinator = thread::spawn(move || {
+                let result = join_matcher_workers(vec![first, second]);
+                done_tx.send(result).expect("test observes join result");
+            });
+            let error =
+                finish_after_worker_release(finished_rx, release_tx, done_rx, coordinator, 1)
+                    .expect_err("first worker error is returned after all workers exit");
+            if first_panics {
+                assert!(error.to_string().contains("Matcher worker 0 panicked"));
+            } else {
+                assert_eq!(error.to_string(), "first worker failure");
+            }
         }
     }
 

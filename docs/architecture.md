@@ -83,6 +83,12 @@ and uses the remaining CPU budget for shard workers. Routed DNS packets also car
 metadata into shard workers so the worker path can reuse the first L3/L4 parse instead of
 repeating it for full DNS question decoding.
 
+The staged pipeline waits for every successfully started worker before returning a startup
+error. It releases the input and result channels before joining those workers, so cleanup can
+finish without an aggregator. During normal teardown it joins every worker
+even if an earlier worker returns an error or panics, preserving the first worker error after
+any parser-stage error.
+
 Ethernet decoding also produces one canonical VLAN context: the ordered stack of tag TPIDs and
 12-bit VLAN IDs. PCP and DEI are QoS metadata and do not distinguish transactions. This context is
 shared by fragment keys and matcher identities, keeping overlapping IP endpoints in different
