@@ -1349,7 +1349,7 @@ mod tests {
                 let mut bytes = tail.data.as_slice().to_vec();
                 bytes.truncate(ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 8);
                 bytes[16..18].copy_from_slice(&(IPV4_MIN_HEADER_LEN as u16 + 8).to_be_bytes());
-                bytes[20..22].copy_from_slice(&(MORE_FRAGMENTS | offset / 8).to_be_bytes());
+                bytes[20..22].copy_from_slice(&(MORE_FRAGMENTS | (offset / 8)).to_be_bytes());
                 tail.data = PacketPayload::owned(bytes.into_boxed_slice());
                 let first = packet(0, true, first_ordinal, 99 + first_ordinal as i64);
                 let input = if tail_first {
