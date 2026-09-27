@@ -79,7 +79,7 @@ impl Anonymizer {
                 ));
             }
             let mut salt = [0u8; 32];
-            for (output, pair) in salt.iter_mut().zip(salt_hex.chunks_exact(2)) {
+            for (output, pair) in salt.iter_mut().zip(salt_hex.as_chunks::<2>().0) {
                 let digits = std::str::from_utf8(pair).expect("ASCII hex digits checked");
                 *output = u8::from_str_radix(digits, 16).expect("ASCII hex digits checked");
             }
