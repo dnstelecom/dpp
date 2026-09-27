@@ -321,7 +321,7 @@ fn parse_response_code_text(value: &str) -> Option<ProtoResponseCode> {
     }
 }
 
-const DNS_NAME_INLINE_CAPACITY: usize = 255;
+const DNS_NAME_INLINE_CAPACITY: usize = 64;
 /// Maximum escaped presentation length for a 255-octet wire name: 250 label bytes, each expanded
 /// to a four-byte octal escape, plus three label separators.
 pub const DNS_NAME_PRESENTATION_MAX_LENGTH: usize = 1003;
@@ -333,8 +333,8 @@ struct InlineDnsName {
 }
 
 #[derive(Clone)]
-// Boxing the inline variant would allocate for every common QNAME. Keep the large no-allocation
-// hot path and spill only the rare presentation that exceeds 255 bytes.
+// Keep common QNAMEs inline while limiting the size of matcher identity keys. Longer
+// presentations spill without changing the 1003-byte validation limit.
 #[allow(clippy::large_enum_variant)]
 enum DnsNameStorage {
     Inline(InlineDnsName),
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn dns_name_buf_spills_presentation_larger_than_inline_capacity() {
-        let spilled = "a".repeat(256);
+        let spilled = "a".repeat(super::DNS_NAME_INLINE_CAPACITY + 1);
         let name = DnsNameBuf::new(&spilled).expect("spill presentation fits");
 
         assert_eq!(name.as_str(), spilled);
@@ -729,7 +729,13 @@ mod tests {
 
     #[test]
     fn dns_name_buf_keeps_common_names_inline_without_kilobyte_layout() {
-        assert!(size_of::<DnsNameBuf>() <= 272);
+        assert!(size_of::<DnsNameBuf>() <= 80);
+        let at_boundary = DnsNameBuf::new(&"a".repeat(super::DNS_NAME_INLINE_CAPACITY))
+            .expect("inline presentation fits");
+        assert!(matches!(
+            at_boundary.storage,
+            super::DnsNameStorage::Inline(_)
+        ));
     }
 
     #[test]

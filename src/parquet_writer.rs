@@ -183,22 +183,49 @@ where
     Ok(())
 }
 
+#[derive(Default)]
+struct ParquetWriterScratch {
+    request_timestamps: Vec<i64>,
+    response_timestamps: Vec<i64>,
+    response_timestamp_definition_levels: Vec<i16>,
+    source_ports: Vec<i32>,
+    ids: Vec<i32>,
+    query_types: Vec<ByteArray>,
+    response_codes: Vec<ByteArray>,
+    response_code_definition_levels: Vec<i16>,
+}
+
+impl ParquetWriterScratch {
+    fn prepare(&mut self, len: usize) {
+        self.request_timestamps.clear();
+        self.request_timestamps.reserve(len);
+        self.response_timestamps.clear();
+        self.response_timestamps.reserve(len);
+        self.response_timestamp_definition_levels.clear();
+        self.response_timestamp_definition_levels.reserve(len);
+        self.source_ports.clear();
+        self.source_ports.reserve(len);
+        self.ids.clear();
+        self.ids.reserve(len);
+        self.query_types.clear();
+        self.query_types.reserve(len);
+        self.response_codes.clear();
+        self.response_codes.reserve(len);
+        self.response_code_definition_levels.clear();
+        self.response_code_definition_levels.reserve(len);
+    }
+}
+
 fn flush_buffer_async_parquet<W>(
     parquet_writer: &mut SerializedFileWriter<W>,
     buffer: &mut Vec<DnsRecord>,
+    scratch: &mut ParquetWriterScratch,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     W: Write + Send,
 {
     let len = buffer.len();
-    let mut request_timestamps = Vec::with_capacity(len);
-    let mut response_timestamps = Vec::with_capacity(len);
-    let mut response_timestamp_definition_levels = Vec::with_capacity(len);
-    let mut source_ports = Vec::with_capacity(len);
-    let mut ids = Vec::with_capacity(len);
-    let mut query_types = Vec::with_capacity(len);
-    let mut response_codes = Vec::with_capacity(len);
-    let mut response_code_definition_levels = Vec::with_capacity(len);
+    scratch.prepare(len);
     let (source_ip_byte_capacity, name_byte_capacity) =
         buffer
             .iter()
@@ -212,24 +239,28 @@ where
     let mut name_builder = PackedByteArrayBuilder::with_capacity(len, name_byte_capacity);
 
     for record in buffer.iter() {
-        request_timestamps.push(record.request_timestamp);
+        scratch.request_timestamps.push(record.request_timestamp);
         if let Some(response_timestamp) = record.response_timestamp {
-            response_timestamps.push(response_timestamp);
-            response_timestamp_definition_levels.push(1);
+            scratch.response_timestamps.push(response_timestamp);
+            scratch.response_timestamp_definition_levels.push(1);
         } else {
-            response_timestamp_definition_levels.push(0);
+            scratch.response_timestamp_definition_levels.push(0);
         }
-        source_ports.push(i32::from(record.source_port));
-        ids.push(i32::from(record.id));
+        scratch.source_ports.push(i32::from(record.source_port));
+        scratch.ids.push(i32::from(record.id));
 
         source_ip_builder.push_display(record.source_ip);
         name_builder.push_bytes(record.name.as_bytes());
-        query_types.push(protocol_text_bytes(record.query_type.as_str()));
+        scratch
+            .query_types
+            .push(protocol_text_bytes(record.query_type.as_str()));
         if let Some(response_code) = &record.response_code {
-            response_codes.push(protocol_text_bytes(response_code.as_str()));
-            response_code_definition_levels.push(1);
+            scratch
+                .response_codes
+                .push(protocol_text_bytes(response_code.as_str()));
+            scratch.response_code_definition_levels.push(1);
         } else {
-            response_code_definition_levels.push(0);
+            scratch.response_code_definition_levels.push(0);
         }
     }
 
@@ -241,13 +272,13 @@ where
     let mut row_group_writer = parquet_writer.next_row_group()?;
     write_column::<Int64Type>(
         &mut row_group_writer,
-        &request_timestamps,
+        &scratch.request_timestamps,
         "Missing Parquet INT64 column",
     )?;
     write_optional_column::<Int64Type>(
         &mut row_group_writer,
-        &response_timestamps,
-        &response_timestamp_definition_levels,
+        &scratch.response_timestamps,
+        &scratch.response_timestamp_definition_levels,
         "Missing Parquet INT64 column",
     )?;
     write_column::<ByteArrayType>(
@@ -257,10 +288,14 @@ where
     )?;
     write_column::<Int32Type>(
         &mut row_group_writer,
-        &source_ports,
+        &scratch.source_ports,
         "Missing Parquet INT32 column",
     )?;
-    write_column::<Int32Type>(&mut row_group_writer, &ids, "Missing Parquet INT32 column")?;
+    write_column::<Int32Type>(
+        &mut row_group_writer,
+        &scratch.ids,
+        "Missing Parquet INT32 column",
+    )?;
     write_column::<ByteArrayType>(
         &mut row_group_writer,
         &names,
@@ -268,13 +303,13 @@ where
     )?;
     write_column::<ByteArrayType>(
         &mut row_group_writer,
-        &query_types,
+        &scratch.query_types,
         "Missing Parquet BYTE_ARRAY column",
     )?;
     write_optional_column::<ByteArrayType>(
         &mut row_group_writer,
-        &response_codes,
-        &response_code_definition_levels,
+        &scratch.response_codes,
+        &scratch.response_code_definition_levels,
         "Missing Parquet BYTE_ARRAY column",
     )?;
     row_group_writer.close()?;
@@ -289,9 +324,10 @@ pub(crate) fn parquet_writer(
     rx: Receiver<OutputMessage>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buffer = Vec::with_capacity(OUTPUT_FLUSH_THRESHOLD);
+    let mut scratch = ParquetWriterScratch::default();
 
     drain_output_messages(rx, &mut buffer, |buffer| {
-        flush_buffer_async_parquet(&mut parquet_writer, buffer)
+        flush_buffer_async_parquet(&mut parquet_writer, buffer, &mut scratch)
     })?;
 
     parquet_writer.close()?;
@@ -351,6 +387,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -389,6 +428,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -427,6 +469,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let writer = create_parquet_writer(
             SharedSink {
@@ -467,6 +512,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -506,6 +554,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -570,9 +621,13 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let mut writer = create_parquet_writer(file, &config).expect("creates parquet writer");
+        let mut scratch = ParquetWriterScratch::default();
 
         let mut empty_name = test_dns_record();
         empty_name.source_ip = "192.0.2.1".parse().expect("IPv4 address parses");
@@ -586,15 +641,40 @@ mod tests {
         long_ipv6.name = DnsNameBuf::new(&escaped_zero).expect("maximum presentation name fits");
 
         let mut buffer = vec![empty_name, long_ipv6];
-        flush_buffer_async_parquet(&mut writer, &mut buffer).expect("first row group is written");
+        flush_buffer_async_parquet(&mut writer, &mut buffer, &mut scratch)
+            .expect("first row group is written");
         assert!(buffer.is_empty());
+        let retained_capacities = [
+            scratch.request_timestamps.capacity(),
+            scratch.response_timestamps.capacity(),
+            scratch.response_timestamp_definition_levels.capacity(),
+            scratch.source_ports.capacity(),
+            scratch.ids.capacity(),
+            scratch.query_types.capacity(),
+            scratch.response_codes.capacity(),
+            scratch.response_code_definition_levels.capacity(),
+        ];
 
         let escaped_one = max_escaped_name(1);
         let mut second_group = test_dns_record();
         second_group.source_ip = "2001:db8:ffff::ffff".parse().expect("IPv6 address parses");
         second_group.name = DnsNameBuf::new(&escaped_one).expect("maximum presentation name fits");
         buffer.push(second_group);
-        flush_buffer_async_parquet(&mut writer, &mut buffer).expect("second row group is written");
+        flush_buffer_async_parquet(&mut writer, &mut buffer, &mut scratch)
+            .expect("second row group is written");
+        assert_eq!(
+            [
+                scratch.request_timestamps.capacity(),
+                scratch.response_timestamps.capacity(),
+                scratch.response_timestamp_definition_levels.capacity(),
+                scratch.source_ports.capacity(),
+                scratch.ids.capacity(),
+                scratch.query_types.capacity(),
+                scratch.response_codes.capacity(),
+                scratch.response_code_definition_levels.capacity(),
+            ],
+            retained_capacities
+        );
         writer.close().expect("parquet writer closes");
 
         let reader = SerializedFileReader::new(File::open(&filename).expect("opens output"))

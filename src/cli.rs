@@ -6,8 +6,8 @@
  */
 
 use crate::config::{
-    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, InputSource, MAX_MATCH_TIMEOUT_MS, OutputFormat,
-    OutputTarget, ReportFormat, output_target_for_path,
+    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, DEFAULT_MAX_DNS_COMPRESSION_JUMPS, InputSource,
+    MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget, ReportFormat, output_target_for_path,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -30,10 +30,11 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_v2 = parse_env_bool("DPP_V2");
     let env_affinity = parse_env_bool("DPP_AFFINITY");
     let env_dns_wire_fast_path = parse_env_bool("DPP_DNS_WIRE_FAST_PATH");
+    let env_max_dns_compression_jumps = env::var_os("DPP_MAX_DNS_COMPRESSION_JUMPS");
+    let env_allow_fragments = parse_env_bool("DPP_ALLOW_FRAGMENTS");
+    let env_full_fragments = parse_env_bool("DPP_FULL_FRAGMENTS");
     let env_monotonic_capture = parse_env_bool("DPP_MONOTONIC_CAPTURE");
-    let env_threads = env::var("DPP_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+    let env_threads = env::var_os("DPP_THREADS");
     let env_bonded = env::var_os("DPP_BONDED");
 
     let matches = build_cli(version).get_matches();
@@ -67,12 +68,11 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         .map(|parallelism| parallelism.get())
         .unwrap_or(1);
 
-    let requested_threads = matches
-        .get_one::<String>("threads")
-        .and_then(|value| value.parse::<usize>().ok())
-        .or(env_threads);
+    let requested_threads = resolve_thread_limit(&matches, env_threads.as_deref())?;
 
     let bonded = resolve_bonded(&matches, env_bonded.as_deref())?;
+    let max_dns_compression_jumps =
+        resolve_max_dns_compression_jumps(&matches, env_max_dns_compression_jumps.as_deref())?;
 
     let output_filename = matches
         .get_one::<String>("output_filename")
@@ -83,6 +83,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let output_target = output_target_for_path(&output_filename);
     validate_output_path(&output_filename)?;
     validate_distinct_input_output(&input_source, &output_filename)?;
+    validate_distinct_key_output(anonymize.as_deref(), &output_filename)?;
     validate_output_mode(output_target, format, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
@@ -90,6 +91,8 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let silent = resolve_silent_mode(&matches, env_silent, output_target);
     let affinity = matches.get_flag("affinity") || env_affinity;
     let dns_wire_fast_path = matches.get_flag("dns_wire_fast_path") || env_dns_wire_fast_path;
+    let (allow_fragments, full_fragments) =
+        resolve_fragment_flags(&matches, env_allow_fragments, env_full_fragments);
     let monotonic_capture = matches.get_flag("monotonic_capture") || env_monotonic_capture;
 
     validate_parquet_only_flags(format, zstd, v2)?;
@@ -110,6 +113,9 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         bonded,
         anonymize,
         dns_wire_fast_path,
+        max_dns_compression_jumps,
+        allow_fragments,
+        full_fragments,
     })
 }
 
@@ -126,8 +132,13 @@ fn build_cli(version: &'static str) -> Command {
   DPP_AFFINITY          Set to 'true' to apply CPU affinity to processing threads
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
+  DPP_MAX_DNS_COMPRESSION_JUMPS
+                        Maximum compression-pointer jumps per DNS name; default is 32, 0 disables the limit (used if --max-dns-compression-jumps is not specified)
+  DPP_ALLOW_FRAGMENTS   Set to 'true' to match queries with observable first IPv4 response fragments without reassembly
+  DPP_FULL_FRAGMENTS    Set to 'true' to reassemble IPv4 fragments and enable first-fragment response matching
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
+  DPP_THREADS           Maximum CPU execution budget (positive integer, capped to available CPUs; used if --threads is not specified)
   DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
   DPP_MATCH_TIMEOUT_MS  DNS match timeout in milliseconds; allowed range is 1..=5000, default is 1200
   DPP_BONDED=N          Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity
@@ -194,7 +205,7 @@ LICENSE INFORMATION:
             Arg::new("threads")
                 .long("threads")
                 .short('t')
-                .hide(true)
+                .help("Cap the CPU execution budget (positive integer, never exceeds available CPUs)")
                 .value_name("N")
                 .num_args(1),
         )
@@ -231,6 +242,26 @@ LICENSE INFORMATION:
             Arg::new("dns_wire_fast_path")
                 .long("dns-wire-fast-path")
                 .help("Enable the optional question-only DNS wire fast path with hickory fallback")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("max_dns_compression_jumps")
+                .long("max-dns-compression-jumps")
+                .help("Maximum compression-pointer jumps per DNS name (default: 32; 0 disables the limit)")
+                .value_name("N")
+                .num_args(1)
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("allow_fragments")
+                .long("allow-fragments")
+                .help("Match queries with observable first IPv4 response fragments without reassembly; full UDP/DNS content remains unverified")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("full_fragments")
+                .long("full-fragments")
+                .help("Reassemble IPv4 fragments into complete datagrams; also enables --allow-fragments")
                 .action(ArgAction::SetTrue),
         )
         .arg(
@@ -274,6 +305,12 @@ fn parse_env_bool(key: &str) -> bool {
     })
 }
 
+fn resolve_fragment_flags(matches: &ArgMatches, env_allow: bool, env_full: bool) -> (bool, bool) {
+    let full_fragments = matches.get_flag("full_fragments") || env_full;
+    let allow_fragments = matches.get_flag("allow_fragments") || env_allow || full_fragments;
+    (allow_fragments, full_fragments)
+}
+
 fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Result<u64> {
     match matches
         .get_one::<String>("match_timeout_ms")
@@ -283,6 +320,23 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
         Some(value) => parse_match_timeout_ms(value),
         None => Ok(DEFAULT_MATCH_TIMEOUT_MS),
     }
+}
+
+fn resolve_thread_limit(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<Option<usize>> {
+    let value = if let Some(cli_value) = matches.get_one::<String>("threads") {
+        cli_value.as_str()
+    } else if let Some(env_value) = env_value {
+        env_value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_THREADS must be valid UTF-8"))?
+    } else {
+        return Ok(None);
+    };
+    let limit = value
+        .parse::<usize>()
+        .with_context(|| format!("Failed to parse CPU thread limit from '{value}'"))?;
+    anyhow::ensure!(limit > 0, "CPU thread limit must be greater than 0.");
+    Ok(Some(limit))
 }
 
 fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usize> {
@@ -297,6 +351,29 @@ fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usi
             .parse::<usize>()
             .with_context(|| format!("Failed to parse DPP_BONDED from '{}'", value.display())),
         None => Ok(0),
+    }
+}
+
+fn resolve_max_dns_compression_jumps(
+    matches: &ArgMatches,
+    env_value: Option<&OsStr>,
+) -> Result<usize> {
+    if let Some(value) = matches.get_one::<usize>("max_dns_compression_jumps") {
+        return Ok(*value);
+    }
+
+    match env_value {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_MAX_DNS_COMPRESSION_JUMPS must contain valid UTF-8"))?
+            .parse::<usize>()
+            .with_context(|| {
+                format!(
+                    "Failed to parse DPP_MAX_DNS_COMPRESSION_JUMPS from '{}'",
+                    value.display()
+                )
+            }),
+        None => Ok(DEFAULT_MAX_DNS_COMPRESSION_JUMPS),
     }
 }
 
@@ -379,6 +456,27 @@ fn validate_distinct_input_output(input_source: &InputSource, output_path: &Path
         );
     }
 
+    Ok(())
+}
+
+fn validate_distinct_key_output(key_path: Option<&Path>, output_path: &Path) -> Result<()> {
+    let Some(key_path) = key_path else {
+        return Ok(());
+    };
+    if matches!(output_target_for_path(output_path), OutputTarget::Stdout) || !output_path.exists()
+    {
+        return Ok(());
+    }
+
+    if same_file::is_same_file(key_path, output_path)
+        .context("Failed to compare anonymization key and output file identities")?
+    {
+        bail!(
+            "Error: Anonymization key '{}' and output path '{}' refer to the same file; refusing to overwrite the key.",
+            key_path.display(),
+            output_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -619,6 +717,71 @@ mod tests {
     }
 
     #[test]
+    fn compression_jump_limit_defaults_to_32_and_accepts_zero() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_max_dns_compression_jumps(&defaults, None).unwrap(),
+            DEFAULT_MAX_DNS_COMPRESSION_JUMPS
+        );
+        assert_eq!(DEFAULT_MAX_DNS_COMPRESSION_JUMPS, 32);
+        for value in ["0", "64"] {
+            let expected = value.parse::<usize>().unwrap();
+            assert_eq!(
+                resolve_max_dns_compression_jumps(&defaults, Some(OsStr::new(value))).unwrap(),
+                expected
+            );
+            let cli = build_cli("test")
+                .try_get_matches_from(["dpp", "--max-dns-compression-jumps", value, "input.pcap"])
+                .expect("cli parses");
+            assert_eq!(
+                resolve_max_dns_compression_jumps(&cli, Some(OsStr::new("invalid"))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_compression_jump_limits_are_rejected() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for value in ["-1", "invalid", "184467440737095516160"] {
+            assert!(
+                build_cli("test")
+                    .try_get_matches_from([
+                        "dpp",
+                        &format!("--max-dns-compression-jumps={value}"),
+                        "input.pcap",
+                    ])
+                    .is_err()
+            );
+            assert!(resolve_max_dns_compression_jumps(&defaults, Some(OsStr::new(value))).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_compression_jump_env_is_rejected_unless_cli_overrides_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0xff]);
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_max_dns_compression_jumps(&defaults, Some(invalid)).is_err());
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--max-dns-compression-jumps", "0", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_max_dns_compression_jumps(&cli, Some(invalid)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn env_match_timeout_wins_when_cli_is_absent() {
         let matches = build_cli("test")
             .try_get_matches_from(["dpp", "input.pcap"])
@@ -641,12 +804,96 @@ mod tests {
     }
 
     #[test]
+    fn thread_limit_uses_env_and_cli_takes_precedence() {
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_thread_limit(&env_only, Some(OsStr::new("4"))).unwrap(),
+            Some(4)
+        );
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "2", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_thread_limit(&cli, Some(OsStr::new("4"))).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn invalid_thread_limits_are_rejected() {
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for invalid in ["0", "bad", "184467440737095516160"] {
+            assert!(resolve_thread_limit(&env_only, Some(OsStr::new(invalid))).is_err());
+        }
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "0", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_thread_limit(&cli, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_thread_env_is_rejected_unless_cli_overrides_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0xff]);
+        let env_only = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_thread_limit(&env_only, Some(invalid)).is_err());
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--threads", "2", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(resolve_thread_limit(&cli, Some(invalid)).unwrap(), Some(2));
+    }
+
+    #[test]
     fn cli_monotonic_capture_flag_is_recognized() {
         let matches = build_cli("test")
             .try_get_matches_from(["dpp", "--monotonic-capture", "input.pcap"])
             .expect("cli parses");
 
         assert!(matches.get_flag("monotonic_capture"));
+    }
+
+    #[test]
+    fn cli_allow_fragments_flag_is_opt_in() {
+        let default_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(!default_matches.get_flag("allow_fragments"));
+
+        let enabled_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--allow-fragments", "input.pcap"])
+            .expect("cli parses");
+        assert!(enabled_matches.get_flag("allow_fragments"));
+    }
+
+    #[test]
+    fn full_fragments_implies_allow_fragments() {
+        let matches = build_cli("test")
+            .try_get_matches_from(["dpp", "--full-fragments", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(resolve_fragment_flags(&matches, false, false), (true, true));
+
+        let default_matches = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_fragment_flags(&default_matches, false, true),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_fragment_flags(&default_matches, false, false),
+            (false, false)
+        );
     }
 
     #[test]
@@ -690,6 +937,24 @@ mod tests {
             .expect("readable anonymization key is accepted");
 
         fs::remove_file(path).expect("removes temp anonymization key");
+    }
+
+    #[test]
+    fn anonymization_key_and_hard_link_cannot_be_output() {
+        let key_path = unique_temp_path("anonymize.key");
+        let alias_path = unique_temp_path("anonymize-output.csv");
+        fs::write(&key_path, b"secret").expect("writes temp anonymization key");
+        fs::hard_link(&key_path, &alias_path).expect("creates hard link to key");
+
+        for output_path in [&key_path, &alias_path] {
+            let error = validate_distinct_key_output(Some(&key_path), output_path)
+                .expect_err("key alias must not be used as output");
+            assert!(error.to_string().contains("refusing to overwrite the key"));
+        }
+        assert_eq!(fs::read(&key_path).expect("reads preserved key"), b"secret");
+
+        fs::remove_file(alias_path).expect("removes hard link");
+        fs::remove_file(key_path).expect("removes key file");
     }
 
     #[test]

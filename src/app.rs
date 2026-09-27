@@ -6,7 +6,7 @@
  */
 
 use crate::config::{AppConfig, InputSource, OutputFormat, ReportFormat};
-use crate::dns_processor::{DnsProcessor, ProcessingCounters};
+use crate::dns_processor::{DnsProcessor, PipelineExecutionConfig, ProcessingCounters};
 use crate::error::{AppRunError, OutputError};
 use crate::output::OutputMessage;
 use crate::packet_parser::{NonMonotonicTimestampSample, PacketParser};
@@ -149,6 +149,26 @@ fn display_parser_mode(args: &AppConfig) {
     } else {
         info!("DNS wire fast path: disabled");
     }
+    if args.max_dns_compression_jumps == 0 {
+        info!("DNS compression-pointer jump limit: disabled");
+    } else {
+        info!(
+            "DNS compression-pointer jump limit: {} per name",
+            args.max_dns_compression_jumps
+        );
+    }
+}
+
+fn display_fragment_mode(args: &AppConfig) {
+    if args.full_fragments {
+        info!(
+            "IPv4 fragment reassembly: enabled (incomplete responses may use first-fragment matching)"
+        );
+    } else if args.allow_fragments {
+        info!(
+            "IPv4 response fragment prefix matching: enabled (no reassembly; full UDP/DNS content unverified)"
+        );
+    }
 }
 
 fn display_match_timeout(args: &AppConfig) {
@@ -185,6 +205,9 @@ struct RunConfigSummary {
     match_timeout_ms: u64,
     monotonic_capture: bool,
     dns_wire_fast_path: bool,
+    max_dns_compression_jumps: usize,
+    allow_fragments: bool,
+    full_fragments: bool,
     anonymization_enabled: bool,
     anonymize_key_path: Option<String>,
     zstd: bool,
@@ -229,6 +252,7 @@ struct RunMetricsSummary {
     total_dns_queries_processed: usize,
     deduplicated_duplicate_queries: usize,
     total_dns_responses_processed: usize,
+    fragmented_response_prefix_count: usize,
     total_matched_query_response_pairs: usize,
     timed_out_queries: usize,
     timed_out_query_ratio: f64,
@@ -326,16 +350,39 @@ fn average_matched_rtt_ms(
     }
 }
 
+struct RunSummaryTimings {
+    processing_seconds: f64,
+    final_write_post_processing_seconds: f64,
+    total_runtime_seconds: f64,
+}
+
+impl RunSummaryTimings {
+    fn new(
+        processing_seconds: f64,
+        final_write_post_processing_seconds: f64,
+        total_runtime_seconds: f64,
+    ) -> Self {
+        Self {
+            processing_seconds,
+            final_write_post_processing_seconds,
+            total_runtime_seconds,
+        }
+    }
+}
+
 fn build_run_summary(
     args: &AppConfig,
     execution_budget: crate::config::ExecutionBudget,
     counters: ProcessingCounters,
     warnings: RunWarningsSummary,
     max_memory_usage_kib: usize,
-    processing_seconds: f64,
-    final_write_post_processing_seconds: f64,
-    total_runtime_seconds: f64,
+    timings: RunSummaryTimings,
 ) -> RunSummary {
+    let RunSummaryTimings {
+        processing_seconds,
+        final_write_post_processing_seconds,
+        total_runtime_seconds,
+    } = timings;
     let processing_speed_pps =
         packets_per_second(counters.total_packets_processed, processing_seconds);
 
@@ -359,6 +406,9 @@ fn build_run_summary(
             match_timeout_ms: args.match_timeout_ms,
             monotonic_capture: args.monotonic_capture,
             dns_wire_fast_path: args.dns_wire_fast_path,
+            max_dns_compression_jumps: args.max_dns_compression_jumps,
+            allow_fragments: args.allow_fragments,
+            full_fragments: args.full_fragments,
             anonymization_enabled: args.anonymize_key_path().is_some(),
             anonymize_key_path: args.anonymize_key_path().map(canonical_path_string),
             zstd: args.zstd,
@@ -383,6 +433,7 @@ fn build_run_summary(
             total_dns_queries_processed: counters.dns_query_count,
             deduplicated_duplicate_queries: counters.duplicated_query_count,
             total_dns_responses_processed: counters.dns_response_count,
+            fragmented_response_prefix_count: counters.fragmented_response_prefix_count,
             total_matched_query_response_pairs: counters.matched_query_response_count,
             timed_out_queries: counters.timeout_query_count,
             timed_out_query_ratio: timed_out_query_ratio(
@@ -439,6 +490,15 @@ fn display_text_summary(summary: &RunSummary) {
             .total_dns_responses_processed
             .to_formatted_string(&Locale::en)
     );
+    if summary.config.allow_fragments {
+        info!(
+            "Accepted first IPv4 response fragments: {}",
+            summary
+                .metrics
+                .fragmented_response_prefix_count
+                .to_formatted_string(&Locale::en)
+        );
+    }
     info!(
         "{}",
         oversized_qname_rejection_summary_line(
@@ -542,13 +602,6 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
 
     let packet_count = Arc::new(AtomicUsize::new(0));
 
-    if let Some(requested_threads) = args.requested_threads {
-        tracing::warn!(
-            "Ignoring deprecated thread override {}. DPP now auto-sizes execution from all available CPUs.",
-            requested_threads
-        );
-    }
-
     runtime::log_build_messages()?;
     runtime::log_system_info(&args, affinity_plan.is_enabled())?;
     runtime::log_accessible_input_file(&args)?;
@@ -559,6 +612,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
     display_parquet_format_information(&args);
     display_anonymization(&args);
     display_parser_mode(&args);
+    display_fragment_mode(&args);
     display_match_timeout(&args);
     display_monotonic_capture_mode(&args);
 
@@ -569,7 +623,10 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
             args.match_timeout_micros(),
             args.monotonic_capture,
         )
-        .map_err(|source| AppRunError::DnsProcessorInit { source })?,
+        .map_err(|source| AppRunError::DnsProcessorInit { source })?
+        .with_max_dns_compression_jumps(args.max_dns_compression_jumps)
+        .with_allow_fragments(args.allow_fragments)
+        .with_full_fragments(args.full_fragments),
     );
     let mut packet_parser = match PacketParser::new_with_shutdown(
         &args.input_source,
@@ -601,9 +658,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         &mut packet_parser,
         &packet_count,
         &tx,
-        execution_budget,
-        affinity_plan,
-        true,
+        PipelineExecutionConfig {
+            execution_budget,
+            affinity_plan,
+            shard_parallelism_enabled: true,
+        },
         Arc::clone(&shutdown_requested),
         Arc::clone(&output_closed),
     )
@@ -679,9 +738,11 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
             counters,
             warnings,
             max_memory_kib,
-            processing_seconds,
-            final_write_post_processing_seconds,
-            total_runtime_seconds,
+            RunSummaryTimings::new(
+                processing_seconds,
+                final_write_post_processing_seconds,
+                total_runtime_seconds,
+            ),
         );
 
         match args.report_format {
@@ -728,6 +789,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 
@@ -761,9 +825,7 @@ mod tests {
             ProcessingCounters::default(),
             RunWarningsSummary::default(),
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
@@ -788,6 +850,29 @@ mod tests {
             config.get("output_record_batch_size"),
             Some(&serde_json::json!(crate::config::OUTPUT_RECORD_BATCH_SIZE))
         );
+    }
+
+    #[test]
+    fn run_summary_reports_accepted_ipv4_response_prefixes() {
+        let mut config = test_config();
+        config.allow_fragments = true;
+        config.full_fragments = true;
+        let summary = build_run_summary(
+            &config,
+            config.execution_budget(),
+            ProcessingCounters {
+                fragmented_response_prefix_count: 2,
+                ..ProcessingCounters::default()
+            },
+            RunWarningsSummary::default(),
+            0,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
+        );
+
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        assert_eq!(serialized["config"]["allow_fragments"], true);
+        assert_eq!(serialized["config"]["full_fragments"], true);
+        assert_eq!(serialized["metrics"]["fragmented_response_prefix_count"], 2);
     }
 
     #[test]
@@ -924,6 +1009,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 
@@ -939,9 +1027,7 @@ mod tests {
             },
             RunWarningsSummary::default(),
             123,
-            2.0,
-            0.75,
-            2.75,
+            RunSummaryTimings::new(2.0, 0.75, 2.75),
         );
 
         assert_eq!(summary.metrics.processing_speed_pps, 2_000);
@@ -959,9 +1045,7 @@ mod tests {
             ProcessingCounters::default(),
             RunWarningsSummary::default(),
             123,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
@@ -989,9 +1073,7 @@ mod tests {
                 ..RunWarningsSummary::default()
             },
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
@@ -1028,9 +1110,7 @@ mod tests {
                 ..RunWarningsSummary::default()
             },
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
@@ -1064,9 +1144,7 @@ mod tests {
             },
             RunWarningsSummary::default(),
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         assert_eq!(summary.metrics.timed_out_queries, 2);
@@ -1086,9 +1164,7 @@ mod tests {
             },
             RunWarningsSummary::default(),
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
 
         assert_eq!(summary.metrics.dns_messages_rejected_oversized_qname, 3);
@@ -1145,9 +1221,7 @@ mod tests {
             ProcessingCounters::default(),
             RunWarningsSummary::default(),
             0,
-            1.0,
-            0.5,
-            1.5,
+            RunSummaryTimings::new(1.0, 0.5, 1.5),
         );
         let mut sink = BrokenPipeJsonSink {
             bytes_until_broken_pipe: 4,

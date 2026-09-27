@@ -7,6 +7,7 @@
 
 use hickory_proto::ProtoError;
 use hickory_proto::op::Header;
+#[cfg(test)]
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
@@ -16,7 +17,8 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
-use super::types::ProcessedDnsRecord;
+use super::name_decoder::DnsNameDecoder;
+use super::types::{ProcessedDnsRecord, VlanContext};
 use crate::custom_types::{DnsNameBuf, DnsNameTooLong, ProtoResponseCode};
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -27,6 +29,9 @@ const DNS_HEADER_LEN: usize = 12;
 const MIN_DNS_OFFSET: usize = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN;
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86dd;
+const ETHER_TYPE_VLAN: u16 = 0x8100;
+const ETHER_TYPE_PROVIDER_BRIDGING: u16 = 0x88a8;
+const ETHER_TYPE_LEGACY_QINQ: u16 = 0x9100;
 const IP_PROTOCOL_UDP: u8 = 17;
 const IPV6_HOP_BY_HOP: u8 = 0;
 const IPV6_ROUTING: u8 = 43;
@@ -35,15 +40,41 @@ const IP_AUTHENTICATION: u8 = 51;
 const IPV6_DESTINATION_OPTIONS: u8 = 60;
 const IPV6_FRAGMENT_OFFSET_AND_MORE: u16 = 0xfff9;
 const IPV4_MORE_FRAGMENTS: u16 = 0x2000;
+const IPV4_DONT_FRAGMENT: u16 = 0x4000;
+const IPV4_RESERVED_FLAG: u16 = 0x8000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const DNS_PORT: u16 = 53;
-const DNS_POINTER_MASK: u8 = 0b1100_0000;
-const DNS_POINTER_TAG: u8 = 0b1100_0000;
-const DNS_LABEL_LEN_MASK: u8 = 0b0011_1111;
-const DNS_COMPRESSION_JUMP_LIMIT: usize = 32;
 const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
 const DNS_TSIG_RECORD_TYPE: u16 = 250;
+
+/// Decode the encapsulated EtherType, payload start and canonical VLAN context once.
+/// Reassembly and DNS matching share this traversal and its VLAN identity semantics.
+pub(super) fn ethernet_ethertype_and_payload_offset(
+    data: &[u8],
+) -> Result<(u16, usize, VlanContext), &'static str> {
+    let ethernet = data
+        .get(..ETHERNET_HEADER_LEN)
+        .ok_or("Failed to parse Ethernet packet")?;
+    let mut ethertype = u16::from_be_bytes([ethernet[12], ethernet[13]]);
+    let mut payload_offset = ETHERNET_HEADER_LEN;
+    let mut tags = Vec::new();
+
+    while matches!(
+        ethertype,
+        ETHER_TYPE_VLAN | ETHER_TYPE_PROVIDER_BRIDGING | ETHER_TYPE_LEGACY_QINQ
+    ) {
+        let tag = data
+            .get(payload_offset..payload_offset + 4)
+            .ok_or("Failed to parse Ethernet VLAN tag")?;
+        let vlan_id = u16::from_be_bytes([tag[0], tag[1]]) & 0x0fff;
+        tags.push((u32::from(ethertype) << 16) | u32::from(vlan_id));
+        ethertype = u16::from_be_bytes([tag[2], tag[3]]);
+        payload_offset += 4;
+    }
+
+    Ok((ethertype, payload_offset, VlanContext::from_tags(tags)))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CanonicalFlowKey {
@@ -52,22 +83,25 @@ pub(super) struct CanonicalFlowKey {
     pub(super) resolver_ip: IpAddr,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
+    vlan_context: VlanContext,
     // DNS starts at least at byte 42. A maximum IPv6 frame ends at byte 65589;
     // reserving the validated 12-byte DNS header bounds this delta to 65535.
     dns_offset_delta: u16,
     pub(super) dns_len: u16,
     pub(super) is_response: bool,
+    /// The first IPv4 fragment contains a complete question but not the complete UDP datagram.
+    pub(super) partial_first_ipv4_fragment: bool,
 }
 
 impl ParsedUdpDnsMeta {
-    fn dns_offset(self) -> usize {
+    fn dns_offset(&self) -> usize {
         MIN_DNS_OFFSET + usize::from(self.dns_offset_delta)
     }
 
-    fn src_ip(self) -> IpAddr {
+    fn src_ip(&self) -> IpAddr {
         if self.is_response {
             self.flow_key.resolver_ip
         } else {
@@ -75,7 +109,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dst_ip(self) -> IpAddr {
+    fn dst_ip(&self) -> IpAddr {
         if self.is_response {
             self.flow_key.client_ip
         } else {
@@ -83,7 +117,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn src_port(self) -> u16 {
+    fn src_port(&self) -> u16 {
         if self.is_response {
             DNS_PORT
         } else {
@@ -91,7 +125,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dst_port(self) -> u16 {
+    fn dst_port(&self) -> u16 {
         if self.is_response {
             self.flow_key.client_port
         } else {
@@ -99,7 +133,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
+    fn dns_data<'a>(&self, data: &'a [u8]) -> Result<&'a [u8], &'static str> {
         let start = self.dns_offset();
         let end = start
             .checked_add(usize::from(self.dns_len))
@@ -112,6 +146,7 @@ struct DecodedDnsHeader {
     id: u16,
     opcode: u8,
     response_code: ProtoResponseCode,
+    partial_response_code: Option<ProtoResponseCode>,
 }
 
 struct DecodedDnsQuestion {
@@ -162,8 +197,19 @@ struct AdditionalResponseCodeFields {
 
 impl DnsProcessor {
     #[inline]
+    #[cfg(test)]
     pub(super) fn packet_routing_meta(data: &[u8]) -> Option<ParsedUdpDnsMeta> {
-        Self::extract_udp_dns_meta(data).ok().flatten()
+        Self::packet_routing_meta_with_fragments(data, false)
+    }
+
+    #[inline]
+    pub(super) fn packet_routing_meta_with_fragments(
+        data: &[u8],
+        allow_first_ipv4_response_fragment: bool,
+    ) -> Option<ParsedUdpDnsMeta> {
+        Self::extract_udp_dns_meta_with_fragments(data, allow_first_ipv4_response_fragment)
+            .ok()
+            .flatten()
     }
 
     #[inline]
@@ -339,8 +385,11 @@ impl DnsProcessor {
         meta: ParsedUdpDnsMeta,
         records: &mut Vec<ProcessedDnsRecord>,
     ) -> Result<(), DnsQuestionDecodeError> {
-        let (header, queries) =
-            self.decode_dns_questions(meta.dns_data(data)?, meta.is_response)?;
+        let (header, queries) = self.decode_dns_questions(
+            meta.dns_data(data)?,
+            meta.is_response,
+            meta.partial_first_ipv4_fragment,
+        )?;
 
         self.build_dns_records_into(
             &header,
@@ -389,6 +438,9 @@ impl DnsProcessor {
                 query_class: query.query_class,
                 opcode: header.opcode,
                 response_code,
+                vlan_context: meta.vlan_context.clone(),
+                partial_first_ipv4_fragment: meta.partial_first_ipv4_fragment,
+                partial_response_code: header.partial_response_code,
             });
         }
     }
@@ -397,12 +449,31 @@ impl DnsProcessor {
         &self,
         dns_data: &[u8],
         decode_extended_rcode: bool,
+        partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
+        let mut names = DnsNameDecoder::new(dns_data, self.max_dns_compression_jumps);
         if self.dns_wire_fast_path {
-            Self::decode_dns_questions_fast(dns_data, decode_extended_rcode)
-                .or_else(|_| Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode))
+            Self::decode_dns_questions_fast(
+                dns_data,
+                &mut names,
+                decode_extended_rcode,
+                partial_first_ipv4_fragment,
+            )
+            .or_else(|_| {
+                Self::decode_dns_questions_hickory(
+                    dns_data,
+                    &mut names,
+                    decode_extended_rcode,
+                    partial_first_ipv4_fragment,
+                )
+            })
         } else {
-            Self::decode_dns_questions_hickory(dns_data, decode_extended_rcode)
+            Self::decode_dns_questions_hickory(
+                dns_data,
+                &mut names,
+                decode_extended_rcode,
+                partial_first_ipv4_fragment,
+            )
         }
     }
 
@@ -421,9 +492,17 @@ impl DnsProcessor {
         opcode == 0 && query_count > 1
     }
 
+    fn question_capacity(dns_len: usize, count: usize) -> usize {
+        // Even a root question occupies five bytes. An untrusted count alone
+        // must not reserve tens of MiB for presentation-form names.
+        count.min(dns_len.saturating_sub(DNS_HEADER_LEN) / 5)
+    }
+
     fn decode_dns_questions_fast(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         decode_extended_rcode: bool,
+        partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         if dns_data.len() < DNS_HEADER_LEN {
             return Err(DnsQuestionDecodeError::Invalid);
@@ -443,9 +522,9 @@ impl DnsProcessor {
         }
 
         let mut cursor = DNS_HEADER_LEN;
-        let mut queries = Vec::with_capacity(query_count);
+        let mut queries = Vec::with_capacity(Self::question_capacity(dns_data.len(), query_count));
         for _ in 0..query_count {
-            let name = Self::read_wire_domain_name(dns_data, &mut cursor)?;
+            let name = Self::read_wire_domain_name(names, &mut cursor)?;
             let query_type = HickoryRecordType::from(Self::parse_u16_at(
                 dns_data,
                 cursor,
@@ -463,6 +542,7 @@ impl DnsProcessor {
         }
         let mut response_code =
             ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
+        let mut partial_response_code = None;
         if decode_extended_rcode {
             let section_counts = DnsSectionCounts {
                 answers: usize::from(Self::parse_u16_at(
@@ -481,12 +561,21 @@ impl DnsProcessor {
                     "Failed to parse DNS additional count",
                 )?),
             };
-            if section_counts.answers > 0
+            if partial_first_ipv4_fragment {
+                partial_response_code = Self::decode_partial_response_code_with_sections(
+                    dns_data,
+                    names,
+                    cursor,
+                    section_counts,
+                    low_response_code,
+                )?;
+            } else if section_counts.answers > 0
                 || section_counts.authorities > 0
                 || section_counts.additionals > 0
             {
                 response_code = Self::decode_response_code_with_sections(
                     dns_data,
+                    names,
                     cursor,
                     section_counts,
                     low_response_code,
@@ -497,6 +586,7 @@ impl DnsProcessor {
             id,
             opcode,
             response_code,
+            partial_response_code,
         };
 
         Ok((header, queries))
@@ -504,7 +594,9 @@ impl DnsProcessor {
 
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         decode_extended_rcode: bool,
+        partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
         let mut decoder = BinDecoder::new(dns_data);
         let header = Header::read(&mut decoder).map_err(|_| DnsQuestionDecodeError::Invalid)?;
@@ -512,24 +604,48 @@ impl DnsProcessor {
         if Self::invalid_question_count(opcode, header.counts.queries as usize) {
             return Err(DnsQuestionDecodeError::Invalid);
         }
-        let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
-            .map_err(Self::classify_hickory_question_error)?;
+        let mut cursor = decoder.index();
+        let mut queries = Vec::with_capacity(Self::question_capacity(
+            dns_data.len(),
+            header.counts.queries as usize,
+        ));
+        for _ in 0..header.counts.queries {
+            let query = Self::read_hickory_question(dns_data, names, &mut cursor)?;
+            queries.push(DecodedDnsQuestion {
+                name: Self::format_domain_name(query.name())
+                    .map_err(|_| DnsQuestionDecodeError::Invalid)?,
+                query_type: query.query_type(),
+                query_class: query.query_class().into(),
+            });
+        }
         let mut response_code = ProtoResponseCode::from(header.response_code);
-        if decode_extended_rcode
-            && (header.counts.answers > 0
-                || header.counts.authorities > 0
-                || header.counts.additionals > 0)
-        {
-            response_code = Self::decode_response_code_with_sections(
-                dns_data,
-                decoder.index(),
-                DnsSectionCounts {
-                    answers: header.counts.answers as usize,
-                    authorities: header.counts.authorities as usize,
-                    additionals: header.counts.additionals as usize,
-                },
-                header.response_code.low(),
-            )?;
+        let mut partial_response_code = None;
+        if decode_extended_rcode {
+            let section_counts = DnsSectionCounts {
+                answers: header.counts.answers as usize,
+                authorities: header.counts.authorities as usize,
+                additionals: header.counts.additionals as usize,
+            };
+            if partial_first_ipv4_fragment {
+                partial_response_code = Self::decode_partial_response_code_with_sections(
+                    dns_data,
+                    names,
+                    cursor,
+                    section_counts,
+                    header.response_code.low(),
+                )?;
+            } else if section_counts.answers > 0
+                || section_counts.authorities > 0
+                || section_counts.additionals > 0
+            {
+                response_code = Self::decode_response_code_with_sections(
+                    dns_data,
+                    names,
+                    cursor,
+                    section_counts,
+                    header.response_code.low(),
+                )?;
+            }
         }
 
         Ok((
@@ -537,23 +653,15 @@ impl DnsProcessor {
                 id: header.id,
                 opcode,
                 response_code,
+                partial_response_code,
             },
-            queries
-                .into_iter()
-                .map(|query: Query| {
-                    Ok(DecodedDnsQuestion {
-                        name: Self::format_domain_name(query.name())
-                            .map_err(|_| DnsQuestionDecodeError::Invalid)?,
-                        query_type: query.query_type(),
-                        query_class: query.query_class().into(),
-                    })
-                })
-                .collect::<Result<Vec<_>, DnsQuestionDecodeError>>()?,
+            queries,
         ))
     }
 
     fn decode_response_code_with_sections(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         mut cursor: usize,
         section_counts: DnsSectionCounts,
         low_response_code: u8,
@@ -561,10 +669,23 @@ impl DnsProcessor {
         let response_code =
             ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
 
-        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.answers, true)?;
-        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.authorities, true)?;
+        Self::skip_dns_resource_records(
+            dns_data,
+            names,
+            &mut cursor,
+            section_counts.answers,
+            true,
+        )?;
+        Self::skip_dns_resource_records(
+            dns_data,
+            names,
+            &mut cursor,
+            section_counts.authorities,
+            true,
+        )?;
         let additional_fields = Self::read_additional_response_code_fields(
             dns_data,
+            names,
             &mut cursor,
             section_counts.additionals,
         )?;
@@ -585,14 +706,83 @@ impl DnsProcessor {
         }
     }
 
+    fn decode_partial_response_code_with_sections(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        cursor: usize,
+        section_counts: DnsSectionCounts,
+        low_response_code: u8,
+    ) -> Result<Option<ProtoResponseCode>, DnsQuestionDecodeError> {
+        let low_code = ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
+        let mut boundary_cursor = cursor;
+        let record_count =
+            section_counts.answers + section_counts.authorities + section_counts.additionals;
+        let mut additional_fields = AdditionalResponseCodeFields::default();
+        for index in 0..record_count {
+            match Self::read_dns_resource_record_meta(dns_data, names, &mut boundary_cursor) {
+                Ok(meta) => {
+                    if index < section_counts.answers + section_counts.authorities {
+                        if meta.record_type == DNS_OPT_RECORD_TYPE {
+                            return Err(DnsQuestionDecodeError::Invalid);
+                        }
+                    } else {
+                        let additional_index =
+                            index - section_counts.answers - section_counts.authorities;
+                        Self::include_additional_response_code_fields(
+                            dns_data,
+                            names,
+                            &mut additional_fields,
+                            &meta,
+                            additional_index,
+                            section_counts.additionals,
+                        )
+                        .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+                    }
+                }
+                Err(error) if Self::is_incomplete_fragment_section(error) => {
+                    // OPT and TSIG are additional records. With no additionals, the header's
+                    // low RCODE is final even when an answer spans later IP fragments.
+                    return Ok((section_counts.additionals == 0).then_some(low_code));
+                }
+                Err(_) => return Err(DnsQuestionDecodeError::Invalid),
+            }
+        }
+
+        // All declared records fit in the first fragment. Decode their complete response-code
+        // context, including OPT and TSIG, using the same validation as full datagrams.
+        Self::decode_response_code_with_sections(
+            dns_data,
+            names,
+            cursor,
+            section_counts,
+            low_response_code,
+        )
+        .map(Some)
+        .map_err(|_| DnsQuestionDecodeError::Invalid)
+    }
+
+    fn is_incomplete_fragment_section(error: &str) -> bool {
+        matches!(
+            error,
+            "DNS name truncated"
+                | "DNS compression pointer truncated"
+                | "DNS label truncated"
+                | "DNS resource record truncated"
+        )
+    }
+
+    // Inline the section loop together with the metadata reader so callers can
+    // keep the cursor local and discard unused RR fields in the hot scan.
+    #[inline(always)]
     fn skip_dns_resource_records(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         count: usize,
         reject_opt: bool,
     ) -> Result<(), &'static str> {
         for _ in 0..count {
-            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
+            let meta = Self::read_dns_resource_record_meta(dns_data, names, cursor)?;
             if reject_opt && meta.record_type == DNS_OPT_RECORD_TYPE {
                 return Err("OPT record outside additional section");
             }
@@ -603,46 +793,67 @@ impl DnsProcessor {
 
     fn read_additional_response_code_fields(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         additional_count: usize,
     ) -> Result<AdditionalResponseCodeFields, &'static str> {
         let mut fields = AdditionalResponseCodeFields::default();
         for index in 0..additional_count {
-            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
-
-            match meta.record_type {
-                DNS_OPT_RECORD_TYPE => {
-                    if fields.edns_response_code_high.is_some() {
-                        return Err("Multiple OPT records");
-                    }
-                    if !meta.owner_is_root {
-                        return Err("OPT record owner must be root");
-                    }
-
-                    fields.edns_response_code_high = Some((meta.ttl >> 24) as u8);
-                }
-                DNS_TSIG_RECORD_TYPE => {
-                    if fields.tsig_error.is_some() {
-                        return Err("Multiple TSIG records");
-                    }
-                    if index + 1 != additional_count {
-                        return Err("TSIG record must be last additional");
-                    }
-
-                    fields.tsig_error = Some(Self::read_tsig_error(dns_data, &meta)?);
-                }
-                _ => {}
-            }
+            let meta = Self::read_dns_resource_record_meta(dns_data, names, cursor)?;
+            Self::include_additional_response_code_fields(
+                dns_data,
+                names,
+                &mut fields,
+                &meta,
+                index,
+                additional_count,
+            )?;
         }
 
         Ok(fields)
     }
 
-    fn read_tsig_error(dns_data: &[u8], meta: &DnsResourceRecordMeta) -> Result<u16, &'static str> {
+    fn include_additional_response_code_fields(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        fields: &mut AdditionalResponseCodeFields,
+        meta: &DnsResourceRecordMeta,
+        index: usize,
+        additional_count: usize,
+    ) -> Result<(), &'static str> {
+        match meta.record_type {
+            DNS_OPT_RECORD_TYPE => {
+                if fields.edns_response_code_high.is_some() {
+                    return Err("Multiple OPT records");
+                }
+                if !meta.owner_is_root {
+                    return Err("OPT record owner must be root");
+                }
+                fields.edns_response_code_high = Some((meta.ttl >> 24) as u8);
+            }
+            DNS_TSIG_RECORD_TYPE => {
+                if fields.tsig_error.is_some() {
+                    return Err("Multiple TSIG records");
+                }
+                if index + 1 != additional_count {
+                    return Err("TSIG record must be last additional");
+                }
+                fields.tsig_error = Some(Self::read_tsig_error(dns_data, names, meta)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn read_tsig_error(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        meta: &DnsResourceRecordMeta,
+    ) -> Result<u16, &'static str> {
         let mut cursor = meta.rdata_start;
         let rdata_end = meta.rdata_end;
 
-        Self::skip_wire_domain_name_in_range(dns_data, &mut cursor, rdata_end)?;
+        Self::skip_wire_domain_name_in_range(names, &mut cursor, rdata_end)?;
         Self::skip_bytes_in_range(&mut cursor, rdata_end, 6 + 2)?;
         let mac_size = usize::from(Self::parse_u16_at(
             dns_data,
@@ -667,11 +878,14 @@ impl DnsProcessor {
         Ok(error)
     }
 
+    // Inlining lets answer/authority scans omit TTL and metadata materialization.
+    #[inline(always)]
     fn read_dns_resource_record_meta(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
     ) -> Result<DnsResourceRecordMeta, &'static str> {
-        let owner_is_root = Self::skip_wire_domain_name(dns_data, cursor)?;
+        let owner_is_root = names.skip(cursor)?;
         let fixed_start = *cursor;
         let fixed_end = fixed_start
             .checked_add(DNS_RESOURCE_RECORD_FIXED_LEN)
@@ -700,7 +914,7 @@ impl DnsProcessor {
     }
 
     fn skip_wire_domain_name_in_range(
-        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         limit: usize,
     ) -> Result<(), &'static str> {
@@ -708,7 +922,7 @@ impl DnsProcessor {
             return Err("DNS name truncated");
         }
 
-        Self::skip_wire_domain_name(dns_data, cursor)?;
+        names.skip(cursor)?;
         if *cursor > limit {
             return Err("DNS name truncated");
         }
@@ -729,143 +943,46 @@ impl DnsProcessor {
         Ok(())
     }
 
-    fn skip_wire_domain_name(dns_data: &[u8], cursor: &mut usize) -> Result<bool, &'static str> {
-        let start = *cursor;
-        let mut position = *cursor;
-        let mut resume_position = None;
-        let mut jump_count = 0;
-        let mut segment_start = position;
-        let mut segment_end = dns_data.len();
-
-        loop {
-            let length = *dns_data
-                .get(..segment_end)
-                .and_then(|segment| segment.get(position))
-                .ok_or("DNS name truncated")?;
-
-            match length {
-                0 => {
-                    position += 1;
-                    *cursor = resume_position.unwrap_or(position);
-                    return Ok(resume_position.is_none() && position == start + 1);
-                }
-                _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
-                    let next = *dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1))
-                        .ok_or("DNS compression pointer truncated")?;
-                    let offset =
-                        (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
-
-                    if offset >= segment_start {
-                        return Err("DNS compression pointer is not prior to name");
-                    }
-
-                    if resume_position.is_none() {
-                        resume_position = Some(position + 2);
-                    }
-
-                    jump_count += 1;
-                    if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err("DNS compression pointer loop");
-                    }
-
-                    segment_end = segment_start;
-                    segment_start = offset;
-                    position = offset;
-                }
-                _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err("Unsupported DNS label encoding");
-                }
-                _ => {
-                    let label_len = usize::from(length);
-                    dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
-                        .ok_or("DNS label truncated")?;
-                    position += 1 + label_len;
-                }
-            }
-        }
-    }
-
     fn read_wire_domain_name(
-        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
     ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
-        let mut output = DnsNameBuf::default();
+        // Most questions contain no compression at all. Keep their original
+        // single-pass formatter free of cache metadata and callback overhead.
+        // A pointer restarts through the shared decoder from the original cursor.
+        let dns_data = names.data();
         let mut position = *cursor;
-        let mut resume_position = None;
-        let mut wrote_label = false;
-        let mut jump_count = 0;
+        let mut output = DnsNameBuf::default();
         let mut expanded_wire_len = 1_usize;
         let mut oversized = false;
-        let mut segment_start = position;
-        let mut segment_end = dns_data.len();
-
         loop {
-            let length = *dns_data
-                .get(..segment_end)
-                .and_then(|segment| segment.get(position))
-                .ok_or("DNS name truncated")?;
-
+            let length = *dns_data.get(position).ok_or("DNS name truncated")?;
             match length {
                 0 => {
-                    position += 1;
                     if oversized {
                         return Err(DnsQuestionDecodeError::OversizedQname);
                     }
-                    if !wrote_label {
+                    if output.as_str().is_empty() {
                         output
                             .try_push('.')
                             .map_err(|_| DnsQuestionDecodeError::Invalid)?;
                     }
-
-                    *cursor = resume_position.unwrap_or(position);
+                    *cursor = position + 1;
                     return Ok(output);
                 }
-                _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
-                    let next = *dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1))
-                        .ok_or("DNS compression pointer truncated")?;
-                    let offset =
-                        (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
-
-                    // Each pointer must refer to an earlier, nonoverlapping name,
-                    // matching Hickory's question decoder (RFC 1035 section 4.1.4).
-                    if offset >= segment_start {
-                        return Err(DnsQuestionDecodeError::Invalid);
-                    }
-
-                    if resume_position.is_none() {
-                        resume_position = Some(position + 2);
-                    }
-
-                    jump_count += 1;
-                    if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err(DnsQuestionDecodeError::Invalid);
-                    }
-
-                    segment_end = segment_start;
-                    segment_start = offset;
-                    position = offset;
+                _ if length & 0xc0 == 0xc0 => {
+                    return Self::read_compressed_wire_domain_name(names, cursor);
                 }
-                _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err(DnsQuestionDecodeError::Invalid);
-                }
+                _ if length & 0xc0 != 0 => return Err(DnsQuestionDecodeError::Invalid),
                 _ => {
-                    let label_len = usize::from(length);
+                    let end = position + 1 + usize::from(length);
                     let label = dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
+                        .get(position + 1..end)
                         .ok_or("DNS label truncated")?;
-
-                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label_len);
+                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label.len());
                     oversized |= expanded_wire_len > Name::MAX_LENGTH;
-
                     if !oversized {
-                        if wrote_label {
+                        if !output.as_str().is_empty() {
                             output
                                 .try_push('.')
                                 .map_err(|_| DnsQuestionDecodeError::Invalid)?;
@@ -874,12 +991,73 @@ impl DnsProcessor {
                             return Err(DnsQuestionDecodeError::Invalid);
                         }
                     }
-
-                    wrote_label = true;
-                    position += 1 + label_len;
+                    position = end;
                 }
             }
         }
+    }
+
+    fn read_compressed_wire_domain_name(
+        names: &mut DnsNameDecoder<'_>,
+        cursor: &mut usize,
+    ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
+        let mut output = DnsNameBuf::default();
+        let mut presentation_valid = true;
+        let name = names.read_with_labels(cursor, |label| {
+            if presentation_valid {
+                if !output.as_str().is_empty() {
+                    presentation_valid = output.try_push('.').is_ok();
+                }
+                presentation_valid &= Self::write_label_ascii(label, &mut output);
+            }
+        })?;
+        if name.expanded_wire_len > Name::MAX_LENGTH {
+            return Err(DnsQuestionDecodeError::OversizedQname);
+        }
+        if !presentation_valid {
+            return Err(DnsQuestionDecodeError::Invalid);
+        }
+        if output.as_str().is_empty() {
+            output
+                .try_push('.')
+                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+        }
+        Ok(output)
+    }
+
+    fn read_hickory_question(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        cursor: &mut usize,
+    ) -> Result<Query, DnsQuestionDecodeError> {
+        let start = *cursor;
+        let name = names.read(cursor)?;
+        if name.expanded_wire_len > Name::MAX_LENGTH {
+            return Err(DnsQuestionDecodeError::OversizedQname);
+        }
+        let fields = dns_data
+            .get(*cursor..*cursor + 4)
+            .ok_or("DNS question truncated")?;
+        *cursor += 4;
+        if name.jumps == 0 {
+            return Query::read(&mut BinDecoder::new(&dns_data[start..*cursor]))
+                .map_err(|error| Self::classify_hickory_question_error(error.into()));
+        }
+
+        // Hickory keeps semantic ownership of questions, but never recursively
+        // follows the original chain again. The validated name fits on the stack.
+        let mut expanded = [0_u8; Name::MAX_LENGTH + 4];
+        let mut end = 0;
+        for label in names.labels(name) {
+            expanded[end] = label.len() as u8;
+            end += 1;
+            expanded[end..end + label.len()].copy_from_slice(label);
+            end += label.len();
+        }
+        end += 1; // terminating root, already zeroed
+        expanded[end..end + 4].copy_from_slice(fields);
+        Query::read(&mut BinDecoder::new(&expanded[..end + 4]))
+            .map_err(|error| Self::classify_hickory_question_error(error.into()))
     }
 
     #[inline]
@@ -893,23 +1071,37 @@ impl DnsProcessor {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    #[cfg(test)]
     fn extract_udp_dns_meta(data: &[u8]) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
-        let ethernet = data
-            .get(..ETHERNET_HEADER_LEN)
-            .ok_or("Failed to parse Ethernet packet")?;
-        let ethertype = u16::from_be_bytes([ethernet[12], ethernet[13]]);
-        let payload = &data[ETHERNET_HEADER_LEN..];
+        Self::extract_udp_dns_meta_with_fragments(data, false)
+    }
 
-        match ethertype {
-            ETHER_TYPE_IPV4 => Self::extract_udp_dns_from_ipv4(payload, ETHERNET_HEADER_LEN),
-            ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, ETHERNET_HEADER_LEN),
+    fn extract_udp_dns_meta_with_fragments(
+        data: &[u8],
+        allow_first_ipv4_response_fragment: bool,
+    ) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
+        let (ethertype, l3_offset, vlan_context) = ethernet_ethertype_and_payload_offset(data)?;
+        let payload = &data[l3_offset..];
+
+        let mut meta = match ethertype {
+            ETHER_TYPE_IPV4 => Self::extract_udp_dns_from_ipv4(
+                payload,
+                l3_offset,
+                allow_first_ipv4_response_fragment,
+            ),
+            ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, l3_offset),
             _ => Ok(None),
+        }?;
+        if let Some(meta) = meta.as_mut() {
+            meta.vlan_context = vlan_context;
         }
+        Ok(meta)
     }
 
     fn extract_udp_dns_from_ipv4(
         data: &[u8],
         l3_offset: usize,
+        allow_first_ipv4_response_fragment: bool,
     ) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
         let header = data
             .get(..IPV4_MIN_HEADER_LEN)
@@ -938,9 +1130,20 @@ impl DnsProcessor {
 
         let flags_and_fragment_offset =
             Self::parse_u16_at(header, 6, "Failed to parse IPv4 packet")?;
-        if flags_and_fragment_offset & (IPV4_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
-            // DNS extraction has no IPv4 fragment reassembly stage.
+        let fragmented =
+            flags_and_fragment_offset & (IPV4_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0;
+        let first_fragment = flags_and_fragment_offset & IPV4_MORE_FRAGMENTS != 0
+            && flags_and_fragment_offset & IPV4_FRAGMENT_OFFSET_MASK == 0;
+        if fragmented && !(allow_first_ipv4_response_fragment && first_fragment) {
             return Ok(None);
+        }
+        if first_fragment
+            && flags_and_fragment_offset & (IPV4_RESERVED_FLAG | IPV4_DONT_FRAGMENT) != 0
+        {
+            return Err("Contradictory IPv4 fragmentation flags");
+        }
+        if first_fragment && (total_length - header_len) % 8 != 0 {
+            return Err("Non-final IPv4 fragment payload length is not divisible by eight");
         }
 
         if header[9] != IP_PROTOCOL_UDP {
@@ -959,6 +1162,8 @@ impl DnsProcessor {
             src_ip,
             dst_ip,
             l3_offset + header_len,
+            first_fragment,
+            usize::from(u16::MAX) - header_len,
         )
     }
 
@@ -1002,6 +1207,8 @@ impl DnsProcessor {
                     src_ip,
                     dst_ip,
                     l3_offset + IPV6_HEADER_LEN + cursor,
+                    false,
+                    usize::from(u16::MAX),
                 );
             }
 
@@ -1054,6 +1261,8 @@ impl DnsProcessor {
         src_ip: IpAddr,
         dst_ip: IpAddr,
         l4_offset: usize,
+        partial_first_ipv4_fragment: bool,
+        maximum_udp_length: usize,
     ) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
         if data.len() < UDP_HEADER_LEN {
             return Err("Failed to parse UDP packet");
@@ -1069,7 +1278,17 @@ impl DnsProcessor {
         if udp_length < UDP_HEADER_LEN {
             return Err("Failed to parse UDP packet");
         }
-        let datagram = data.get(..udp_length).ok_or("Failed to parse UDP packet")?;
+        if udp_length > maximum_udp_length {
+            return Err("UDP length exceeds the IP datagram limit");
+        }
+        let datagram = if partial_first_ipv4_fragment {
+            if udp_length <= data.len() {
+                return Err("First IPv4 fragment does not contain a partial UDP datagram");
+            }
+            data
+        } else {
+            data.get(..udp_length).ok_or("Failed to parse UDP packet")?
+        };
         let dns_data = datagram
             .get(UDP_HEADER_LEN..)
             .ok_or("Failed to parse UDP packet")?;
@@ -1080,6 +1299,10 @@ impl DnsProcessor {
         if (is_response && src_port != DNS_PORT) || (!is_response && dst_port != DNS_PORT) {
             return Ok(None);
         }
+        if partial_first_ipv4_fragment && !is_response {
+            // A first-fragment query is not useful for the response-only opt-in mode.
+            return Ok(None);
+        }
 
         let dns_offset = l4_offset
             .checked_add(UDP_HEADER_LEN)
@@ -1087,6 +1310,7 @@ impl DnsProcessor {
 
         Ok(Some(ParsedUdpDnsMeta {
             flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port, is_response),
+            vlan_context: VlanContext::default(),
             dns_offset_delta: u16::try_from(
                 dns_offset
                     .checked_sub(MIN_DNS_OFFSET)
@@ -1096,6 +1320,7 @@ impl DnsProcessor {
             dns_len: u16::try_from(dns_data.len())
                 .map_err(|_| "UDP DNS payload exceeds supported range")?,
             is_response,
+            partial_first_ipv4_fragment,
         }))
     }
 
@@ -1150,6 +1375,29 @@ mod protocol_regression_tests {
         make_udp_dns_packet_with_payload(src, dst, src_port, dst_port, dns)
     }
 
+    fn with_vlan_tags(packet: &[u8], tags: &[(u16, u16)]) -> Vec<u8> {
+        let mut tagged = Vec::with_capacity(packet.len() + tags.len() * 4);
+        tagged.extend_from_slice(&packet[..12]);
+        for &(ethertype, tci) in tags {
+            tagged.extend_from_slice(&ethertype.to_be_bytes());
+            tagged.extend_from_slice(&tci.to_be_bytes());
+        }
+        tagged.extend_from_slice(&packet[12..]);
+        tagged
+    }
+
+    fn first_ipv4_fragment(mut packet: Vec<u8>, fragment_payload_len: usize) -> Vec<u8> {
+        assert_eq!(fragment_payload_len % 8, 0);
+        let fragment_len = IPV4_MIN_HEADER_LEN + fragment_payload_len;
+        assert!(packet.len() > ETHERNET_HEADER_LEN + fragment_len);
+        packet.truncate(ETHERNET_HEADER_LEN + fragment_len);
+        packet[ETHERNET_HEADER_LEN + 2..ETHERNET_HEADER_LEN + 4]
+            .copy_from_slice(&(fragment_len as u16).to_be_bytes());
+        packet[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+            .copy_from_slice(&IPV4_MORE_FRAGMENTS.to_be_bytes());
+        packet
+    }
+
     fn ipv6(dns: &[u8], extensions: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let mut payload = Vec::new();
         for (index, (_, extension)) in extensions.iter().enumerate() {
@@ -1199,12 +1447,233 @@ mod protocol_regression_tests {
     }
 
     #[test]
+    fn vlan_and_qinq_frames_route_and_decode_dns() {
+        let query_dns = question(0x0100, 1);
+        let response_dns = question(0x8180, 1);
+        let tags = [
+            vec![(ETHER_TYPE_VLAN, 100)],
+            vec![(ETHER_TYPE_PROVIDER_BRIDGING, 200), (ETHER_TYPE_VLAN, 100)],
+            vec![(ETHER_TYPE_LEGACY_QINQ, 200), (ETHER_TYPE_VLAN, 100)],
+        ];
+
+        for tag_stack in &tags {
+            let query = with_vlan_tags(&ipv4(&query_dns, false, 53000), tag_stack);
+            let response = with_vlan_tags(&ipv4(&response_dns, true, 53000), tag_stack);
+            let query_meta = DnsProcessor::packet_routing_meta(&query).expect("tagged query");
+            let response_meta =
+                DnsProcessor::packet_routing_meta(&response).expect("tagged response");
+            assert_eq!(query_meta.flow_key, response_meta.flow_key);
+            assert_eq!(query_meta.dns_data(&query), Ok(query_dns.as_slice()));
+            assert_eq!(
+                response_meta.dns_data(&response),
+                Ok(response_dns.as_slice())
+            );
+
+            for processor in processors() {
+                assert_eq!(processor.process_packet_batch(&query, 0).unwrap().len(), 1);
+                assert_eq!(
+                    processor
+                        .process_packet_batch(&response, 100)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+
+        let ipv6_query = with_vlan_tags(
+            &ipv6(&query_dns, &[]),
+            &[(ETHER_TYPE_PROVIDER_BRIDGING, 200), (ETHER_TYPE_VLAN, 100)],
+        );
+        let ipv6_meta = DnsProcessor::packet_routing_meta(&ipv6_query).expect("tagged IPv6");
+        assert_eq!(ipv6_meta.dns_data(&ipv6_query), Ok(query_dns.as_slice()));
+    }
+
+    #[test]
+    fn truncated_vlan_tag_is_rejected() {
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 4];
+        frame[12..14].copy_from_slice(&ETHER_TYPE_VLAN.to_be_bytes());
+        for len in ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + 4 {
+            assert_eq!(
+                ethernet_ethertype_and_payload_offset(&frame[..len]),
+                Err("Failed to parse Ethernet VLAN tag")
+            );
+        }
+
+        frame[16..18].copy_from_slice(&ETHER_TYPE_VLAN.to_be_bytes());
+        assert_eq!(
+            ethernet_ethertype_and_payload_offset(&frame),
+            Err("Failed to parse Ethernet VLAN tag")
+        );
+    }
+
+    #[test]
     fn qr_does_not_create_candidates_on_wrong_server_port() {
         for packet in [
             ipv4(&question(0x8180, 1), false, 53000),
             ipv4(&question(0x0100, 1), true, 53000),
         ] {
             assert!(DnsProcessor::packet_routing_meta(&packet).is_none());
+        }
+    }
+
+    #[test]
+    fn opt_in_first_ipv4_response_fragment_requires_complete_question() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60, 0, 16]);
+        dns.extend_from_slice(&[b'x'; 16]);
+        dns.extend_from_slice(&[0; 16]);
+        let complete = ipv4(&dns, true, 53000);
+        let first = first_ipv4_fragment(complete, 40);
+
+        assert!(DnsProcessor::packet_routing_meta(&first).is_none());
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true)
+            .expect("first response fragment routes when enabled");
+        assert!(meta.partial_first_ipv4_fragment);
+        assert_eq!(meta.dns_data(&first).unwrap().len(), 32);
+
+        for processor in processors() {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
+                PacketProcessingOutcome::Records(records) => records,
+                other => panic!("partial response rejected: {other:?}"),
+            };
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].id, 0xbeef);
+            assert_eq!(records[0].name.as_str(), "example.com");
+            assert!(!records[0].is_query);
+            assert!(records[0].partial_first_ipv4_fragment);
+            assert!(records[0].partial_response_code.is_none());
+        }
+
+        let incomplete_question = first_ipv4_fragment(ipv4(&dns, true, 53000), 24);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&incomplete_question, true)
+            .expect("header-only first fragment routes for decode validation");
+        for processor in processors() {
+            assert!(matches!(
+                processor.process_packet_batch_with_meta(&incomplete_question, 100, meta.clone()),
+                PacketProcessingOutcome::Invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn opt_in_does_not_accept_other_fragments_or_truncated_unfragmented_responses() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60, 0, 16]);
+        dns.extend_from_slice(&[b'x'; 16]);
+
+        let mut query_dns = dns.clone();
+        query_dns[2..4].copy_from_slice(&0x0100_u16.to_be_bytes());
+        let query_first = first_ipv4_fragment(ipv4(&query_dns, false, 53000), 40);
+        assert!(DnsProcessor::packet_routing_meta_with_fragments(&query_first, true).is_none());
+
+        let mut noninitial = first_ipv4_fragment(ipv4(&dns, true, 53000), 40);
+        noninitial[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+            .copy_from_slice(&(IPV4_MORE_FRAGMENTS | 1).to_be_bytes());
+        assert!(DnsProcessor::packet_routing_meta_with_fragments(&noninitial, true).is_none());
+
+        for flags in [
+            IPV4_MORE_FRAGMENTS | IPV4_DONT_FRAGMENT,
+            IPV4_MORE_FRAGMENTS | IPV4_RESERVED_FLAG,
+        ] {
+            let mut invalid_flags = first_ipv4_fragment(ipv4(&dns, true, 53000), 40);
+            invalid_flags[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+                .copy_from_slice(&flags.to_be_bytes());
+            assert!(
+                DnsProcessor::packet_routing_meta_with_fragments(&invalid_flags, true).is_none()
+            );
+        }
+
+        let mut truncated_full = first_ipv4_fragment(ipv4(&dns, true, 53000), 40);
+        truncated_full[ETHERNET_HEADER_LEN + 6..ETHERNET_HEADER_LEN + 8]
+            .copy_from_slice(&0_u16.to_be_bytes());
+        assert!(DnsProcessor::packet_routing_meta_with_fragments(&truncated_full, true).is_none());
+
+        let mut missing_answer = question(0x8180, 1);
+        missing_answer[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        let full_packet = ipv4(&missing_answer, true, 53000);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&full_packet, true)
+            .expect("complete response routes for strict validation");
+        assert!(!meta.partial_first_ipv4_fragment);
+        for processor in processors() {
+            assert!(matches!(
+                processor.process_packet_batch_with_meta(&full_packet, 100, meta.clone()),
+                PacketProcessingOutcome::Invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn partial_response_code_is_reported_only_when_complete_in_first_fragment() {
+        let mut no_additionals = question(0x8183, 1);
+        no_additionals[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        no_additionals.extend_from_slice(&[0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60, 0, 16]);
+        no_additionals.extend_from_slice(&[b'x'; 16]);
+        let first = first_ipv4_fragment(ipv4(&no_additionals, true, 53000), 40);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
+        for processor in processors() {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
+                PacketProcessingOutcome::Records(records) => records,
+                other => panic!("partial response rejected: {other:?}"),
+            };
+            assert_eq!(records[0].partial_response_code.unwrap().as_u16(), 3);
+        }
+
+        let mut with_opt = question(0x8180, 1);
+        with_opt[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        with_opt.extend_from_slice(&[0, 0, 41, 4, 208, 1, 0, 0, 0, 0, 0]);
+        with_opt.extend_from_slice(&[0; 16]);
+        let first = first_ipv4_fragment(ipv4(&with_opt, true, 53000), 48);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
+        for processor in processors() {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
+                PacketProcessingOutcome::Records(records) => records,
+                other => panic!("partial response rejected: {other:?}"),
+            };
+            assert_eq!(records[0].partial_response_code.unwrap().as_u16(), 16);
+        }
+
+        let mut with_tsig = tsig_response(16, 0, &[]);
+        let fragment_payload_len = (UDP_HEADER_LEN + with_tsig.len()).next_multiple_of(8);
+        with_tsig.extend_from_slice(&[0; 16]);
+        let first = first_ipv4_fragment(ipv4(&with_tsig, true, 53000), fragment_payload_len);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
+        for processor in processors() {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
+                PacketProcessingOutcome::Records(records) => records,
+                other => panic!("partial response rejected: {other:?}"),
+            };
+            assert_eq!(records[0].partial_response_code.unwrap().as_u16(), 16);
+            assert_eq!(
+                records[0].partial_response_code.unwrap().as_str(),
+                "TSIG Failure"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_response_rejects_visible_opt_in_answer_even_if_later_record_is_incomplete() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        // A complete OPT in the answer section is already invalid, although the
+        // following answer extends beyond the first IPv4 fragment.
+        dns.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        dns.extend_from_slice(&[0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 60, 0, 16]);
+        dns.extend_from_slice(&[b'x'; 16]);
+        let first = first_ipv4_fragment(ipv4(&dns, true, 53000), 56);
+        let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
+        for processor in processors() {
+            assert!(matches!(
+                processor.process_packet_batch_with_meta(&first, 100, meta.clone()),
+                PacketProcessingOutcome::Invalid
+            ));
         }
     }
 
@@ -1287,7 +1756,11 @@ mod protocol_regression_tests {
     #[test]
     fn compression_rejects_overlapping_names_but_accepts_prior_questions() {
         let overlap = [4, b'a', b'b', 0xc0, 0, 0];
-        assert!(DnsProcessor::read_wire_domain_name(&overlap, &mut 3).is_err());
+        assert!(
+            DnsProcessor::read_wire_domain_name(&mut DnsNameDecoder::new(&overlap, 0), &mut 3)
+                .is_err()
+        );
+        assert!(DnsNameDecoder::new(&overlap, 0).skip(&mut 3).is_err());
         assert!(Name::read(&mut BinDecoder::new(&overlap).clone(3)).is_err());
 
         let mut dns = question(0x0900, 1);
@@ -1299,6 +1772,179 @@ mod protocol_regression_tests {
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].name, records[1].name);
             assert_eq!(records[1].query_type, HickoryRecordType::AAAA);
+        }
+    }
+
+    fn response_with_compression_chain(count: u16) -> (Vec<u8>, usize) {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&count.to_be_bytes());
+        let mut previous_owner = DNS_HEADER_LEN;
+        let mut last_owner = 0;
+        for index in 0..count {
+            last_owner = dns.len();
+            dns.extend_from_slice(&(0xc000 | previous_owner as u16).to_be_bytes());
+            dns.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, index as u8]);
+            previous_owner = last_owner;
+        }
+        (dns, last_owner)
+    }
+
+    #[test]
+    fn compression_limit_counts_cached_suffixes_in_both_decoders() {
+        for count in [1, 2, 32, 33, 256] {
+            let (dns, _) = response_with_compression_chain(count);
+            if count == 33 {
+                assert_eq!(Message::from_vec(&dns).unwrap().answers.len(), 33);
+            }
+            for limit in [1, 32, 33, 0] {
+                for processor in processors() {
+                    let fast = processor.dns_wire_fast_path;
+                    let result = processor
+                        .with_max_dns_compression_jumps(limit)
+                        .process_packet_batch(&ipv4(&dns, true, 53000), 100);
+                    assert_eq!(
+                        result.is_some(),
+                        limit == 0 || usize::from(count) <= limit,
+                        "depth={count}, limit={limit}, fast={fast}"
+                    );
+                }
+            }
+        }
+        let (dns, _) = response_with_compression_chain(33);
+        for processor in processors() {
+            assert!(
+                processor
+                    .process_packet_batch(&ipv4(&dns, true, 53000), 100)
+                    .is_none(),
+                "default limit must be 32, including after fast-path fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_limit_applies_to_questions_and_unlimited_avoids_recursive_decoding() {
+        for count in [32, 33, 2700] {
+            let mut dns = question(0x0900, 1); // IQUERY permits multiple questions.
+            dns[4..6].copy_from_slice(&(count + 1_u16).to_be_bytes());
+            let mut previous = DNS_HEADER_LEN;
+            for _ in 0..count {
+                let current = dns.len();
+                dns.extend_from_slice(&(0xc000 | previous as u16).to_be_bytes());
+                dns.extend_from_slice(&[0, 1, 0, 1]);
+                previous = current;
+            }
+            for limit in [32, 0] {
+                for processor in processors() {
+                    let result = processor
+                        .with_max_dns_compression_jumps(limit)
+                        .process_packet_batch(&ipv4(&dns, false, 53000), 0);
+                    assert_eq!(result.is_some(), limit == 0 || count <= 32);
+                    if let Some(records) = result {
+                        assert_eq!(records.len(), usize::from(count) + 1);
+                        assert!(
+                            records
+                                .iter()
+                                .all(|record| record.name.as_str() == "example.com")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compression_limit_applies_to_tsig_algorithm_and_partial_responses() {
+        let (mut dns, last_owner) = response_with_compression_chain(32);
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 18]);
+        dns.extend_from_slice(&(0xc000 | last_owner as u16).to_be_bytes());
+        dns.extend_from_slice(&[0; 12]); // time, fudge, MAC length and original ID
+        dns.extend_from_slice(&[0, 16, 0, 0]); // TSIG error and Other Data length
+        for limit in [32, 33, 0] {
+            for processor in processors() {
+                let result = processor
+                    .with_max_dns_compression_jumps(limit)
+                    .decode_dns_questions(&dns, true, false);
+                assert_eq!(result.is_ok(), limit != 32);
+                if let Ok((header, _)) = result {
+                    assert_eq!(header.response_code.as_u16(), 16);
+                }
+            }
+        }
+        let (mut partial, last_owner) = response_with_compression_chain(33);
+        partial.truncate(last_owner + 2); // complete owner, absent RR fields/data
+        for processor in processors() {
+            assert!(matches!(
+                processor.decode_dns_questions(&partial, true, true),
+                Err(DnsQuestionDecodeError::Invalid)
+            ));
+            let (header, _) = processor
+                .with_max_dns_compression_jumps(0)
+                .decode_dns_questions(&partial, true, true)
+                .unwrap();
+            assert_eq!(header.partial_response_code.unwrap().as_u16(), 0);
+        }
+    }
+
+    #[test]
+    fn cached_expanded_root_does_not_allow_compressed_opt_owner() {
+        let mut dns = encode_dns_header(0xbeef, 0x8180, 1);
+        dns[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0, 0, 1, 0, 1]); // root question
+        dns.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
+        dns.extend_from_slice(&[0xc0, 12, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        for processor in processors() {
+            assert!(
+                processor
+                    .process_packet_batch(&ipv4(&dns, true, 53000), 0)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_compression_is_not_treated_as_an_incomplete_fragment() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        dns.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 0, 0, 3]);
+        let target = dns.len();
+        dns.extend_from_slice(&[4, b'a', b'b']);
+        // The preceding bytes pretend to be a label crossing this owner's
+        // pointer. Those bytes are present; this is overlap, not missing data.
+        dns.extend_from_slice(&(0xc000 | target as u16).to_be_bytes());
+        for processor in processors() {
+            assert!(matches!(
+                processor.decode_dns_questions(&dns, true, true),
+                Err(DnsQuestionDecodeError::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn compression_walkers_reject_cycles_and_truncation() {
+        for (case, bytes, offset) in [
+            ("self pointer", &[0xc0, 0][..], 0),
+            ("pointer cycle", &[0xc0, 2, 0xc0, 0][..], 2),
+            ("truncated pointer", &[0xc0][..], 0),
+            ("truncated label", &[2, b'a'][..], 0),
+        ] {
+            let mut read_cursor = offset;
+            assert!(
+                DnsProcessor::read_wire_domain_name(
+                    &mut DnsNameDecoder::new(bytes, 0),
+                    &mut read_cursor
+                )
+                .is_err(),
+                "{case}"
+            );
+            let mut skip_cursor = offset;
+            assert!(
+                DnsNameDecoder::new(bytes, 0)
+                    .skip(&mut skip_cursor)
+                    .is_err(),
+                "{case}"
+            );
         }
     }
 

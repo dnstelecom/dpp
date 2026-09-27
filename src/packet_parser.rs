@@ -35,7 +35,7 @@ use std::os::fd::AsFd;
 pub struct PacketPayload(Box<[u8]>);
 
 impl PacketPayload {
-    fn owned(data: Box<[u8]>) -> Self {
+    pub(crate) fn owned(data: Box<[u8]>) -> Self {
         Self(data)
     }
 
@@ -236,14 +236,14 @@ impl PacketParser {
 
         while packet_buffer.len() < chunk_size {
             if self.stdin_shutdown_requested() {
-                return Ok(None);
+                break;
             }
 
             let next_packet = match self.backend.next_packet_data() {
                 Err(error)
                     if self.stdin_shutdown_requested() && is_stdin_shutdown_error(&error) =>
                 {
-                    return Ok(None);
+                    break;
                 }
                 result => result?,
             };
@@ -538,6 +538,8 @@ fn ensure_libpcap_ethernet_linktype(
     Ok(())
 }
 
+const MAX_PCAPNG_BLOCK_LEN: u32 = 16 * 1024 * 1024;
+
 /// Owns stdin PCAPNG framing and its sole section-local interface table. The dependency's
 /// stateful reader converts timestamps incorrectly; even `next_raw_block` rejects valid
 /// resolutions while updating interfaces. Only its stateless block validation is used here.
@@ -570,8 +572,7 @@ impl PcapNgStreamReader {
         }
 
         // Read only the fixed prefix before trusting the declared block length. The body
-        // grows with bytes actually received, so a huge length in a truncated stream cannot
-        // force an equally huge allocation. Memory remains bounded by the largest read block.
+        // grows with bytes actually received, while the bound also covers nontruncated streams.
         let mut prefix = [0_u8; 12];
         self.input.read_exact(&mut prefix)?;
         if is_pcapng_magic(prefix[..4].try_into().expect("four-byte block type")) {
@@ -585,6 +586,10 @@ impl PcapNgStreamReader {
         anyhow::ensure!(
             block_len >= 12 && block_len.is_multiple_of(4),
             "Invalid pcapng block length {block_len}: expected a multiple of four, at least 12"
+        );
+        anyhow::ensure!(
+            block_len <= MAX_PCAPNG_BLOCK_LEN,
+            "Pcapng block length {block_len} exceeds maximum {MAX_PCAPNG_BLOCK_LEN} bytes"
         );
         self.block_bytes.clear();
         self.block_bytes.extend_from_slice(&prefix);
@@ -762,6 +767,48 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
 
+    #[derive(Clone, Copy)]
+    enum ShutdownTiming {
+        AfterPacket,
+        OnNextRead,
+    }
+
+    struct CancellingStream {
+        bytes: Vec<u8>,
+        offset: usize,
+        shutdown: Arc<AtomicBool>,
+        timing: ShutdownTiming,
+    }
+
+    impl Read for CancellingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.offset == self.bytes.len() {
+                self.shutdown.store(true, AtomicOrdering::SeqCst);
+                return Err(io::Error::other(StdinReadCancelled));
+            }
+
+            // Keep the capture header separate so opening the parser cannot prefetch the packet.
+            let chunk_end = if self.offset < 4 {
+                4
+            } else if self.offset < 24 {
+                24
+            } else {
+                self.bytes.len()
+            };
+            let len = (chunk_end - self.offset).min(buf.len());
+            buf[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            if self.offset == self.bytes.len() && matches!(self.timing, ShutdownTiming::AfterPacket)
+            {
+                self.shutdown.store(true, AtomicOrdering::SeqCst);
+            }
+            Ok(len)
+        }
+    }
+
     fn packet(timestamp_micros: i64, sequence: u64) -> PacketData {
         PacketData {
             data: PacketPayload::owned(Box::from([])),
@@ -771,10 +818,17 @@ mod tests {
     }
 
     fn parser_from_stream(bytes: Vec<u8>) -> PacketParser {
+        parser_from_reader(Box::new(Cursor::new(bytes)), None)
+    }
+
+    fn parser_from_reader(
+        reader: StreamReader,
+        stdin_shutdown: Option<Arc<AtomicBool>>,
+    ) -> PacketParser {
         PacketParser {
-            backend: PacketBackend::from_stream(Box::new(Cursor::new(bytes)), "test-stream")
+            backend: PacketBackend::from_stream(reader, "test-stream")
                 .expect("stream parser opens"),
-            stdin_shutdown: None,
+            stdin_shutdown,
             enforce_monotonic_timestamps: false,
             packet_ordinal: 0,
             last_timestamp_micros: None,
@@ -876,6 +930,35 @@ mod tests {
     }
 
     #[test]
+    fn stdin_shutdown_returns_packets_already_read_into_batch() {
+        for timing in [ShutdownTiming::AfterPacket, ShutdownTiming::OnNextRead] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let reader = CancellingStream {
+                bytes: classic_pcap_bytes(&[(1, 2, &[1, 2, 3, 4])]),
+                offset: 0,
+                shutdown: Arc::clone(&shutdown),
+                timing,
+            };
+            let mut parser = parser_from_reader(Box::new(reader), Some(Arc::clone(&shutdown)));
+
+            let batch = parser
+                .next_batch(8)
+                .expect("cancelled read is not a parse error")
+                .expect("already-read packet is returned");
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].data.as_slice(), &[1, 2, 3, 4]);
+            assert_eq!(batch[0].packet_ordinal, 0);
+            assert!(shutdown.load(AtomicOrdering::SeqCst));
+            assert!(
+                parser
+                    .next_batch(8)
+                    .expect("shutdown is complete")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn rejects_non_ethernet_classic_pcap_file_at_open() {
         let path = temp_test_path("packet-parser-classic-raw", "pcap");
         fs::write(
@@ -971,6 +1054,58 @@ mod tests {
         assert_eq!(packet.timestamp_micros, 1_000_002);
         assert_eq!(packet.packet_ordinal, 0);
         assert_eq!(packet.data.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_oversized_pcapng_section_before_reading_body() {
+        for (byte_order_magic, block_len) in [
+            (
+                [0x1a, 0x2b, 0x3c, 0x4d],
+                (MAX_PCAPNG_BLOCK_LEN + 4).to_be_bytes(),
+            ),
+            (
+                [0x4d, 0x3c, 0x2b, 0x1a],
+                (MAX_PCAPNG_BLOCK_LEN + 4).to_le_bytes(),
+            ),
+        ] {
+            let mut prefix = Vec::from([0x0a, 0x0d, 0x0d, 0x0a]);
+            prefix.extend_from_slice(&block_len);
+            prefix.extend_from_slice(&byte_order_magic);
+            let stream: StreamReader = Box::new(Cursor::new(prefix));
+            let error = PcapNgStreamReader::new(BufReader::new(CaptureInputReader::Stream(
+                ReplayReader::new(Vec::new(), stream),
+            )))
+            .err()
+            .expect("oversized section must fail");
+            assert!(
+                error.to_string().contains("exceeds maximum"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_pcapng_block_after_valid_section() {
+        let mut bytes = pcapng_bytes(&[]);
+        let first_block_len = match &bytes[8..12] {
+            [0x1a, 0x2b, 0x3c, 0x4d] => u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+            [0x4d, 0x3c, 0x2b, 0x1a] => u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            _ => panic!("invalid test pcapng byte order"),
+        } as usize;
+        let oversized_len = match &bytes[8..12] {
+            [0x1a, 0x2b, 0x3c, 0x4d] => (MAX_PCAPNG_BLOCK_LEN + 4).to_be_bytes(),
+            _ => (MAX_PCAPNG_BLOCK_LEN + 4).to_le_bytes(),
+        };
+        bytes[first_block_len + 4..first_block_len + 8].copy_from_slice(&oversized_len);
+
+        let mut parser = parser_from_stream(bytes);
+        let error = parser
+            .next_batch(1)
+            .expect_err("oversized interface block must fail");
+        assert!(
+            error.to_string().contains("exceeds maximum"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

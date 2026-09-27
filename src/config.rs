@@ -17,6 +17,9 @@ pub(crate) const PACKET_BATCH_SIZE: usize = 65_536;
 /// Default DNS match timeout, expressed in milliseconds.
 pub(crate) const DEFAULT_MATCH_TIMEOUT_MS: u64 = 1_200;
 
+/// Default maximum number of compression-pointer jumps in one DNS name.
+pub(crate) const DEFAULT_MAX_DNS_COMPRESSION_JUMPS: usize = 32;
+
 /// Maximum supported DNS match timeout, expressed in milliseconds.
 pub(crate) const MAX_MATCH_TIMEOUT_MS: u64 = 5_000;
 
@@ -166,6 +169,9 @@ pub(crate) struct AppConfig {
     pub(crate) bonded: usize,
     pub(crate) anonymize: Option<PathBuf>,
     pub(crate) dns_wire_fast_path: bool,
+    pub(crate) max_dns_compression_jumps: usize,
+    pub(crate) allow_fragments: bool,
+    pub(crate) full_fragments: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -258,7 +264,10 @@ impl AppConfig {
     }
 
     pub(crate) fn execution_budget(&self) -> ExecutionBudget {
-        ExecutionBudget::from_available_cpus(self.num_cpus)
+        let budget_cpus = self
+            .requested_threads
+            .map_or(self.num_cpus, |limit| self.num_cpus.min(limit));
+        ExecutionBudget::from_available_cpus(budget_cpus)
     }
 }
 
@@ -283,6 +292,9 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
+            allow_fragments: false,
+            full_fragments: false,
         }
     }
 
@@ -351,5 +363,23 @@ mod tests {
         assert_eq!(budget.staged_reserved_service_threads, 2);
         assert_eq!(budget.staged_worker_budget, 14);
         assert!(budget.uses_staged_pipeline());
+    }
+
+    #[test]
+    fn thread_limit_caps_budget_without_exceeding_available_cpus() {
+        let mut config = test_config();
+        config.num_cpus = 16;
+        config.requested_threads = Some(3);
+
+        let capped = config.execution_budget();
+        assert_eq!(capped.available_cpus, 3);
+        assert_eq!(capped.model, ExecutionModel::PhaseParallel);
+        assert_eq!(capped.rayon_threads, Some(3));
+
+        config.requested_threads = Some(32);
+        let uncapped = config.execution_budget();
+        assert_eq!(uncapped.available_cpus, 16);
+        assert_eq!(uncapped.model, ExecutionModel::Staged);
+        assert_eq!(uncapped.staged_worker_budget, 14);
     }
 }

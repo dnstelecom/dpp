@@ -52,7 +52,7 @@ threads would compete with the actual work.
 ### How the decision is made
 
 The threshold lives in `src/config.rs` as part of the `ExecutionBudget`. The
-`uses_staged_pipeline()` method returns `true` when the available CPU count is high enough to
+`uses_staged_pipeline()` method returns `true` when the effective CPU budget is high enough to
 reserve service threads (currently 2: one for parsing/routing, one implicitly for aggregation)
 and still leave meaningful worker capacity. The exact threshold is a tuned constant, not a
 CLI flag — it's an implementation detail, not a user-facing policy.
@@ -70,12 +70,13 @@ CLI flag — it's an implementation detail, not a user-facing policy.
   and passes it alongside the packet to the matcher worker, so the worker doesn't repeat L3/L4
   parsing for DNS question decode.
 
-## Why not let the user choose?
+## Why the execution model remains automatic
 
 Because the right choice depends on hardware, not on user preference. A user on a 2-core VM
 who forces staged mode gets worse performance, not better. The automatic selection removes a
 footgun without losing any capability — on high-core machines, you get the staged pipeline
-automatically.
+automatically. Operators can cap the CPU budget with `--threads` or `DPP_THREADS`; the pipeline
+model is selected from that effective budget.
 
 If future profiling shows the threshold needs tuning, it's a one-line change in `config.rs`.
 

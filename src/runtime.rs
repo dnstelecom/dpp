@@ -226,9 +226,15 @@ pub(crate) fn log_system_info(
     let formatted_os = format_os_name(std::env::consts::OS);
 
     info!("OS: {}, ARCH: {}", formatted_os, std::env::consts::ARCH);
+    let budget = args.execution_budget();
+    let budget_source = if args.requested_threads.is_some() {
+        "operator cap"
+    } else {
+        "auto"
+    };
     info!(
-        "Available parallelism: {}, execution budget: auto (all available CPUs), affinity requested: {}, effective: {}",
-        args.num_cpus, args.affinity, affinity_effective,
+        "Available parallelism: {}, execution budget: {} CPUs ({}), affinity requested: {}, effective: {}",
+        args.num_cpus, budget.available_cpus, budget_source, args.affinity, affinity_effective,
     );
     info!(
         "Available memory (system reported): {} MB",

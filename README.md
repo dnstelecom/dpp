@@ -83,7 +83,7 @@ ownership boundaries, and matcher invariants, see [docs/architecture.md](docs/ar
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.97.1 or newer; this repository is pinned by `rust-toolchain.toml`.
+- [Rust](https://rustup.rs/) 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 - Cargo
 - PCAP files for offline processing
 - `libpcap` development headers for fallback support on non-classic formats
@@ -152,11 +152,12 @@ If `output_filename` is omitted, DPP chooses the default file name from the reso
 `dns_output.csv` for `csv` and `dns_output.parquet` for `parquet` or `pq`. Use `-` only when you
 want CSV records on stdout. DPP refuses to start when the input and output paths refer to the same
 file, including hard-link aliases, so the input capture cannot be overwritten.
+The same protection applies when the output path refers to the anonymization key file.
 
 ### Create an anonymization key
 
-`--anonymize` expects a text file. DPP reads the file contents as a passphrase and derives the
-internal pseudonymization key from that value.
+`--anonymize` accepts a legacy text key file or a salted v2 key file. DPP derives the internal
+pseudonymization keys from the file's passphrase and salt.
 
 One practical way to create a key file on Linux or macOS is:
 
@@ -171,15 +172,43 @@ Then use it like this:
 dpp --anonymize /tmp/anon.key input.pcap output.csv
 ```
 
+To create a salted v2 key file instead, use Python 3:
+
+```bash
+umask 077
+python3 - <<'PY'
+import os
+from secrets import token_bytes, token_hex
+
+contents = (
+    b"\x89DPP-ANON-KEY-v2\n"
+    + token_bytes(32).hex().encode("ascii") + b"\n"
+    + token_hex(32).encode("ascii") + b"\n"
+)
+with os.fdopen(os.open("anon-v2.key", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as key:
+    key.write(contents)
+PY
+dpp --anonymize anon-v2.key input.pcap output.csv
+```
+
 Notes:
 
 - Keep the key file private. Anyone with the same file can reproduce the same pseudonymized output.
-- The key file must contain a non-empty UTF-8 passphrase. Leading and trailing whitespace is ignored.
+- A legacy key file contains a non-empty UTF-8 passphrase. A salted v2 file contains the exact
+  binary header `\x89DPP-ANON-KEY-v2\n`, a line of exactly 64 hexadecimal digits representing
+  a 32-byte salt, then a non-empty UTF-8 passphrase. Leading and trailing passphrase whitespace is
+  ignored. Malformed salted files are rejected.
 - Rotating the key changes the resulting pseudonymized IP addresses for the same input capture.
 - Matching and deduplication use the original client IP. Pseudonymization is applied only to the
-  `source_ip` field of finalized output records, so pseudonym collisions cannot merge clients.
-- DPP intentionally uses a fixed PBKDF2 salt for deterministic pseudonymization. The passphrase is
-  still the operator-controlled secret; changing it rotates the derived pseudonyms.
+  `source_ip` field of finalized output records. IPv4 pseudonymization is a keyed permutation, so
+  distinct IPv4 client addresses remain distinct in the output; network prefixes are not preserved.
+- Legacy key files retain the original fixed PBKDF2 salt and produce the same pseudonyms as before.
+  The salted v2 format limits precomputation across files that use weak passphrases; a random
+  passphrase remains essential. Reuse the entire v2 key file across runs and hosts to keep output
+  stable. Changing either its salt or passphrase rotates both IPv4 and IPv6 pseudonyms.
+- The IPv4 Feistel mapping replaces the previous truncated-AES mapping. Even with the same
+  passphrase, exports produced before and after this change cannot be joined by pseudonymized IPv4
+  `source_ip`. IPv6 pseudonyms remain unchanged.
 - If `--anonymize` or `DPP_ANONYMIZE` is configured and the key file is missing, unreadable, or
   invalid, DPP exits with an error. It does not silently fall back to pass-through IP addresses.
 
@@ -199,11 +228,15 @@ Notes:
 | `--report-format <text\|json>`    | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -`    |
 | `--match-timeout-ms <MS>`         | Set the DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`            |
 | `--monotonic-capture`             | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
+| `-t, --threads <N>`               | Cap the CPU execution budget at a positive `N`, never above available CPUs                                         |
 | `-b, --bonded <N>`                | Set I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the safe default bounded capacity |
 | `-z, --zstd`                      | Enable Zstd compression for Parquet output                                                                          |
 | `--v2`                            | Use Parquet Version 2                                                                                               |
 | `-a, --affinity`                  | Apply CPU affinity to processing threads                                                                            |
 | `--dns-wire-fast-path`            | Enable the optional question-only DNS wire fast path with `hickory` fallback                                        |
+| `--max-dns-compression-jumps <N>` | Maximum compression-pointer jumps per DNS name; defaults to `32`; `0` disables the jump limit                     |
+| `--allow-fragments`               | Opt in to matching complete queries with first IPv4 response fragments when the DNS header and question are present; no reassembly |
+| `--full-fragments`                | Reassemble IPv4 fragments into complete UDP datagrams; also enables `--allow-fragments` for incomplete responses |
 | `--anonymize <path>`              | Path to the pseudonymization key file                                                                               |
 | `-h, --help`                      | Print help                                                                                                          |
 | `-V, --version`                   | Print version                                                                                                       |
@@ -221,11 +254,13 @@ provide supported per-core thread pinning through the affinity backend.
 | `DPP_REPORT_FORMAT`      | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
 | `DPP_MATCH_TIMEOUT_MS`   | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200`                          |
 | `DPP_MONOTONIC_CAPTURE`  | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected       |
+| `DPP_THREADS`            | Maximum CPU execution budget when `--threads` is not set; must be a positive integer                                |
 | `DPP_BONDED`             | I/O channel capacity in records; internally rounded up to batched messages of up to `1024` records; `0` uses the default bounded capacity |
 | `DPP_ZSTD`               | Enable Zstd compression for Parquet output                                                                                |
 | `DPP_V2`                 | Enable Parquet Version 2                                                                                                  |
 | `DPP_AFFINITY`           | Apply CPU affinity to processing threads                                                                                  |
 | `DPP_DNS_WIRE_FAST_PATH` | Enable the optional DNS wire fast path                                                                                    |
+| `DPP_MAX_DNS_COMPRESSION_JUMPS` | Maximum compression-pointer jumps per DNS name when `--max-dns-compression-jumps` is not set; defaults to `32`; `0` disables the jump limit |
 | `DPP_ANONYMIZE`          | Path to the key file used for pseudonymization                                                                            |
 | `DPP_SILENT`             | Suppress info-level log output                                                                                            |
 
@@ -253,7 +288,9 @@ match window. Finalized transactions are never reopened. With `--monotonic-captu
 history is needed or allocated.
 
 DNS QR determines query/response direction, including valid exchanges with UDP port 53 on both
-endpoints. QCLASS and OPCODE distinguish transactions internally and do not add output columns.
+endpoints. QCLASS, OPCODE and the full VLAN/QinQ tag stack distinguish transactions internally
+and do not add output columns. VLAN identity includes each tag's TPID and VLAN ID; changes to
+priority (PCP) or drop eligibility (DEI) do not prevent matching within the same tagged segment.
 Ordinary DNS QUERY messages with more than one question are rejected under RFC 9619. Responses
 whose declared answer or authority records are truncated are also rejected before matching.
 
@@ -383,7 +420,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.046  INFO > Commercial licensing options: carrier-support@dnstele.com
 04:15:01.046  INFO > Nameto Oy (c) 2026. All rights reserved.
 04:15:01.062  INFO OS: Linux, ARCH: x86_64
-04:15:01.062  INFO Available parallelism: 4, execution budget: auto (all available CPUs), affinity requested: false, effective: false
+04:15:01.062  INFO Available parallelism: 4, execution budget: 4 CPUs (auto), affinity requested: false, effective: false
 04:15:01.062  INFO Available memory (system reported): 2,857 MB
 04:15:01.062  INFO Starting to process PCAP file: /mnt/mirror/src/dpp/server1_jul_2024.pcap
 04:15:01.062  INFO Processing mode: forward sorting with response-query matching
@@ -395,7 +432,7 @@ $ DPP_FILENAME=server1_jul_2024.pcap DPP_FORMAT=csv target/release/dpp --dns-wir
 04:15:01.076  INFO Monotonic capture mode: enabled (batched timeout eviction active; timestamp regressions abort the run)
 04:15:01.076  INFO PID: 501755
 04:15:01.147  INFO Results will be written to: /mnt/mirror/src/dpp/dns_output.csv
-04:15:01.150  INFO Execution budget: auto using 4 CPUs, phase-parallel pipeline selected for low-core host, Rayon worker budget: 4
+04:15:01.150  INFO Execution budget: 4 CPUs, phase-parallel pipeline selected for low-core budget, Rayon worker budget: 4
 04:15:16.718  INFO Total packets processed: 40,000,000
 04:15:16.718  INFO Total DNS queries processed: 19,670,037
 04:15:16.718  INFO Deduplicated duplicate queries: 23,947
@@ -424,6 +461,8 @@ What this tells you:
 - the first query for example.com A was matched with a response about 20.736 ms later;
 - the second query for example.org A had no matching response within the timeout window;
 - empty response_timestamp and response_code mean timeout.
+- a response_timestamp with an empty response_code means a first-fragment response prefix matched,
+  but the complete response code was unavailable.
 
 ### A simple AWK analysis to measure DNS traffic latency
 ```bash
@@ -499,26 +538,38 @@ Additional notes:
 - See [benches/README.md](benches/README.md) for the benchmark contract and data-handling notes.
 - For apples-to-apples performance testing, prefer the dedicated `perf` build profile:
   `cargo build --profile perf` or `DPP_BENCH_PROFILE=perf bash benches/benchmark.sh ...`.
-- DPP auto-sizes its execution budget from all available CPUs.
-- Historical `--threads` and `DPP_THREADS` inputs are accepted only as deprecated compatibility no-ops and emit a warning if used.
+- DPP auto-sizes its execution budget from available CPUs unless `--threads` or `DPP_THREADS`
+  sets a lower ceiling. The pipeline model is still selected automatically from that budget.
 - The parser fast path is opt-in through `--dns-wire-fast-path` or `DPP_DNS_WIRE_FAST_PATH=1`; without that flag DPP uses the legacy `hickory` question decoder.
+- Both parser modes limit DNS compression chains to `32` pointer jumps per name by default. Use `--max-dns-compression-jumps N` or `DPP_MAX_DNS_COMPRESSION_JUMPS=N` to change the limit; `0` disables this resource limit. Cached suffixes still count toward the full chain depth. Bounds, backward-pointer, overlap, and existing name-length validation remain active. Checked suffixes are cached within each message to avoid repeatedly walking shared chains.
+- `--allow-fragments` or `DPP_ALLOW_FRAGMENTS=1` optionally pairs a query with the observable first IPv4 fragment of a response when its DNS header and complete question are present. `response_code` is populated when there are no additional records or every declared DNS record fits in the first fragment; otherwise it is empty. The JSON metric `fragmented_response_prefix_count` (text: `Accepted first IPv4 response fragments`) counts accepted prefixes, including ones without a matching query.
+- `--full-fragments` or `DPP_FULL_FRAGMENTS=1` enables IPv4 reassembly and implicitly enables `--allow-fragments`. Complete fragmented UDP datagrams enter the existing DNS parser with the timestamp of their final IPv4 fragment (`MF=0`). An incomplete first response fragment falls back to the prefix heuristic on capacity eviction or end of input; with `--monotonic-capture`, it can also expire after the configured match timeout. The fallback keeps the first fragment's timestamp. A bounded history of completed datagrams compares the fragment key and UDP payload bytes to suppress repeated complete datagrams and prefix fallback when all observed fragments match a recent completion. A different datagram can still use the same IPv4 ID, including one with an identical first fragment but different later bytes. A fully identical new datagram, or an incomplete one whose observed fragments match a recent completion, cannot be distinguished from a duplicate and may be suppressed. A bounded non-DNS history drops later tails after a non-DNS first fragment; if a new DNS datagram reuses the same IPv4 ID and its tail arrives before its first fragment while that history is active, the tail is indistinguishable and may be dropped. Fragmented queries require complete reassembly. Overlapping, inconsistent, or UDP-length-mismatched fragment sets are rejected.
 - For captures normalized with `reordercap`, `--monotonic-capture` can reduce in-flight matcher state by enabling batched timeout eviction. If a timestamp regression is detected, DPP fails the run instead of silently weakening matching semantics.
 - Global allocator choice is a build-time concern. See [docs/allocator-guide.md](docs/allocator-guide.md) for the supported allocator matrix and [benches/allocator-benchmarking.md](benches/allocator-benchmarking.md) for the comparison protocol.
 
 ## Limitations
 
 - **UDP/53 only:** DPP currently processes DNS traffic over UDP port 53 only.
-- DPP does not reassemble IPv4 or IPv6 fragments. IPv6 Hop-by-Hop, Routing, Destination Options,
-  Authentication and atomic Fragment headers are traversed before UDP; fragments requiring
-  reassembly, ESP and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
+- By default, IPv4 fragments are skipped. `--allow-fragments` uses only an observed first IPv4
+  response fragment when its DNS header and complete question are available. This heuristic cannot
+  confirm that later fragments arrived or validate the full UDP/DNS contents; the response code
+  may be unknown if needed records are beyond the first fragment. `--full-fragments` reconstructs
+  complete IPv4 datagrams before the existing UDP/DNS checks and falls back to the first-response
+  heuristic for incomplete sets. Neither mode reassembles IPv6 fragments. IPv6 Hop-by-Hop, Routing,
+  Destination Options, Authentication and atomic Fragment headers are traversed before UDP; ESP
+  and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
+- Full IPv4 reassembly holds ready packet batches until unresolved fragments are completed or
+  released, preserving retry and response ordering across batches. This adds a retained backlog
+  of up to 65,536 packets or 64 MiB of packet payloads; exceeding either bound triggers the
+  incomplete-fragment capacity fallback. The current input batch adds transient memory on top.
 - If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
   from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
-- **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP.
-- **Ethernet linktype only:** DPP rejects captures or packets declared with non-Ethernet linktypes instead of interpreting them as Ethernet. Ethernet frames containing VLAN, QinQ, MPLS, or similar outer encapsulation layers require preprocessing first. See [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
+- **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP. Stdin PCAPNG blocks larger than 16 MiB are rejected before their body is read.
+- **Ethernet linktype only:** DPP rejects captures or packets declared with non-Ethernet linktypes instead of interpreting them as Ethernet. Ethernet frames may carry VLAN or QinQ tags (`0x8100`, `0x88a8`, `0x9100`) before IPv4 or IPv6. MPLS and other outer encapsulation layers still require preprocessing; see [docs/encapsulation-playbook.md](docs/encapsulation-playbook.md).
 - **Unsorted exported data:** CSV and Parquet outputs are not guaranteed to be timestamp-sorted.
 - **Variable RAM usage:** Memory usage depends on capture size, traffic shape, and output backpressure. Larger `--bonded` values increase peak memory usage under slow output sinks because the output channel rounds the requested record backlog up to batched messages of up to `1024` records each.
 - **Monotonic-capture mode is explicit:** Batched timeout eviction is available only with `--monotonic-capture` because it depends on globally monotonic packet timestamps. If the capture is not monotonic, DPP aborts and recommends `reordercap`.
-- **Scaling ceilings on skewed workloads:** DPP auto-sizes from all available CPUs, but flow-affinity ceilings can still limit scaling before linear speedup.
+- **Scaling ceilings on skewed workloads:** DPP auto-sizes from available CPUs or the configured CPU cap, but flow-affinity ceilings can still limit scaling before linear speedup.
 - **Duplicate query handling:** Duplicate in-flight DNS queries and responses are preserved and resolved through deterministic matcher tie-breakers derived from capture order. Duplicate-heavy workloads can still increase matcher memory usage, and Parquet output may vary byte-for-byte because writers remain asynchronous.
 - **QNAME casing trade-off:** Matcher identity preserves observed QNAME casing instead of canonicalizing names to lowercase. RFC 4343 allows ASCII-label case-only differences between a query and a valid response, and name compression can contribute to that mismatch. Community Edition still matches on observed bytes because that better reflects the caching-resolver workloads it targets. As a result, names that differ only by case may not match even on protocol-compliant traffic.
 
@@ -532,7 +583,7 @@ DPP Commercial Edition extends that foundation with broader capture support, ent
 |-------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | Offline PCAP processing                               | Native S3 integration for reading PCAP                                                          |
 | CSV and single-file Parquet export                    | Partitioned Parquet datasets, not just single-file export                                       |
-| Current encapsulation scope                           | Advanced encapsulation support: native support for VLAN, QinQ, MPLS, GRE, VXLAN, ERSPAN, Geneve |
+| Native Ethernet, VLAN and QinQ decoding               | Advanced encapsulation support: MPLS, GRE, VXLAN, ERSPAN, Geneve                                 |
 | Local file outputs                                    | Direct enterprise sinks: ClickHouse, Kafka, S3, PostgreSQL outputs                              |
 | Batch-oriented processing                             | Live/continuous ingestion                                                                       |
 | Deterministic pseudonymization with file-based keying | Commercial anonymization/compliance features                                                    |

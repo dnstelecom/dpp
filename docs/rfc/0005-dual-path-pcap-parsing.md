@@ -83,8 +83,23 @@ validated DNS offset and length. IPv4 Total Length or IPv6 Payload Length first 
 payload; UDP Length then bounds the DNS payload. Bytes outside either declared boundary, including
 Ethernet padding and trailing capture bytes, never reach a DNS decoder.
 
-DPP has no IPv4 reassembly stage. IPv4 datagrams with the More Fragments flag or a non-zero fragment
-offset are therefore skipped rather than interpreting a fragment body as a complete UDP datagram.
+By default, IPv4 datagrams with the More Fragments flag or a non-zero fragment offset are skipped.
+With `--allow-fragments`, a first IPv4 response fragment may be matched when its DNS header and
+entire question fit in the fragment. The metadata bounds DNS bytes to the observed fragment and
+marks the response as partial. This is an inference from the prefix, not validation of the full UDP
+datagram. A response code is emitted only if there are no additional records or all declared DNS
+records fit in the prefix.
+With `--full-fragments`, DPP also reconstructs complete IPv4 datagrams across packet batches. This
+mode implies `--allow-fragments`; incomplete responses may use the prefix heuristic on capacity
+eviction or end of input, and on elapsed capture-time timeout with `--monotonic-capture`.
+Fragmented queries require complete reassembly. The reassembler keys
+fragments by source, destination, protocol, and IPv4 identification, places payload bytes at the
+declared eight-octet offsets, and waits for the first fragment, final fragment, and contiguous
+coverage before sending a datagram through the existing UDP/DNS parser. Fragmented IP payload
+length must equal the declared UDP Length; mismatches are rejected. Complete datagrams carry
+the final fragment's (`MF=0`) capture timestamp; prefix fallbacks retain the first fragment's
+timestamp. The reassembler bounds incomplete state
+to prevent unbounded capture-driven memory growth. Neither mode reassembles IPv6 fragments.
 IPv6 extraction traverses Hop-by-Hop, Routing, Destination Options, Authentication and atomic
 Fragment headers with per-header bounds checks. Non-atomic fragments require reassembly and are
 skipped. The DNS offset can exceed 65535 after a long valid extension chain. Internal metadata

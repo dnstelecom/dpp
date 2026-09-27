@@ -19,6 +19,7 @@ use std::thread;
 
 use super::DnsProcessor;
 use super::parser::{CanonicalFlowKey, PacketProcessingOutcome, ParsedUdpDnsMeta};
+use super::reassembly::Ipv4FragmentReassembler;
 use super::types::{MatcherShardState, ProcessedDnsRecord, ShardProcessingResult};
 use crate::config::{ExecutionBudget, MATCHER_SHARD_FACTOR, PACKET_BATCH_SIZE};
 use crate::output::{OutputMessage, OutputRecordBatches};
@@ -30,6 +31,29 @@ const BATCH_PREFETCH_DEPTH: usize = 2;
 const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
+/// Ready packets may wait behind an unresolved fragment for at most this backlog.
+/// Reaching either bound releases incomplete datagrams using the capacity fallback.
+const FRAGMENT_READY_PACKET_LIMIT: usize = PACKET_BATCH_SIZE;
+const FRAGMENT_READY_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+
+struct WorkerShutdownSignals {
+    shutdown_requested: Arc<AtomicBool>,
+    intake_failed: Arc<AtomicBool>,
+    output_closed: Arc<AtomicBool>,
+}
+
+struct FragmentProcessingConfig {
+    allow_fragments: bool,
+    full_fragments: bool,
+    match_timeout_micros: i64,
+    monotonic_capture: bool,
+}
+
+pub(crate) struct PipelineExecutionConfig {
+    pub(crate) execution_budget: ExecutionBudget,
+    pub(crate) affinity_plan: AffinityPlan,
+    pub(crate) shard_parallelism_enabled: bool,
+}
 
 fn staged_matcher_affinity_slot(worker_idx: usize) -> usize {
     worker_idx
@@ -45,6 +69,7 @@ fn staged_aggregator_affinity_slot(worker_count: usize) -> usize {
 
 struct PipelineCounters {
     oversized_qname_message_count: usize,
+    fragmented_response_prefix_count: usize,
     dns_query_count: usize,
     duplicated_query_count: usize,
     dns_response_count: usize,
@@ -59,6 +84,7 @@ impl Default for PipelineCounters {
     fn default() -> Self {
         Self {
             oversized_qname_message_count: 0,
+            fragmented_response_prefix_count: 0,
             dns_query_count: 0,
             duplicated_query_count: 0,
             dns_response_count: 0,
@@ -76,6 +102,7 @@ pub(crate) struct ProcessingCounters {
     pub(crate) total_packets_processed: usize,
     /// DNS messages rejected because a decompressed QNAME exceeds the RFC 1035 255-octet limit.
     pub(crate) oversized_qname_message_count: usize,
+    pub(crate) fragmented_response_prefix_count: usize,
     pub(crate) dns_query_count: usize,
     pub(crate) duplicated_query_count: usize,
     pub(crate) dns_response_count: usize,
@@ -92,6 +119,7 @@ impl PipelineCounters {
         output_closed: &AtomicBool,
     ) -> bool {
         self.oversized_qname_message_count += shard_result.oversized_qname_message_count;
+        self.fragmented_response_prefix_count += shard_result.fragmented_response_prefix_count;
         self.dns_query_count += shard_result.dns_query_count;
         self.duplicated_query_count += shard_result.duplicated_query_count;
         self.dns_response_count += shard_result.dns_response_count;
@@ -118,6 +146,7 @@ impl PipelineCounters {
         ProcessingCounters {
             total_packets_processed,
             oversized_qname_message_count: self.oversized_qname_message_count,
+            fragmented_response_prefix_count: self.fragmented_response_prefix_count,
             dns_query_count: self.dns_query_count,
             duplicated_query_count: self.duplicated_query_count,
             dns_response_count: self.dns_response_count,
@@ -395,6 +424,7 @@ impl ShardRoutingPlan {
 
 fn merge_shard_results(merged: &mut ShardProcessingResult, shard_result: ShardProcessingResult) {
     merged.oversized_qname_message_count += shard_result.oversized_qname_message_count;
+    merged.fragmented_response_prefix_count += shard_result.fragmented_response_prefix_count;
     merged.dns_query_count += shard_result.dns_query_count;
     merged.duplicated_query_count += shard_result.duplicated_query_count;
     merged.dns_response_count += shard_result.dns_response_count;
@@ -519,6 +549,7 @@ fn shard_map_index(flow_key: CanonicalFlowKey, shard_count: usize) -> usize {
 fn route_batch_to_worker_batches(
     mut packet_batch: PacketBatch,
     routing_plan: &ShardRoutingPlan,
+    allow_fragments: bool,
 ) -> RoutedWorkerBatches {
     let shard_count = routing_plan.shard_count();
     debug_assert!(shard_count > 0);
@@ -541,8 +572,10 @@ fn route_batch_to_worker_batches(
         .collect();
 
     for packet_data in packet_batch {
-        let Some(udp_dns_meta) = DnsProcessor::packet_routing_meta(packet_data.data.as_slice())
-        else {
+        let Some(udp_dns_meta) = DnsProcessor::packet_routing_meta_with_fragments(
+            packet_data.data.as_slice(),
+            allow_fragments,
+        ) else {
             continue;
         };
 
@@ -555,6 +588,69 @@ fn route_batch_to_worker_batches(
     RoutedWorkerBatches {
         batch_max_timestamp_micros,
         worker_batches,
+    }
+}
+
+/// Owns only packet-stage backlog; fragment and matcher state keep their existing owners.
+struct FragmentRoutingState {
+    reassembler: Ipv4FragmentReassembler,
+    ready: PacketBatch,
+}
+
+impl FragmentRoutingState {
+    fn new(match_timeout_micros: i64, monotonic_capture: bool) -> Self {
+        Self {
+            reassembler: Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture),
+            ready: Vec::new(),
+        }
+    }
+
+    fn route_batch(
+        &mut self,
+        packet_batch: PacketBatch,
+        routing_plan: &ShardRoutingPlan,
+    ) -> RoutedWorkerBatches {
+        let input_max_timestamp_micros = packet_batch
+            .iter()
+            .map(|packet| packet.timestamp_micros)
+            .max();
+        let (packets, mut oldest_pending_timestamp_micros) =
+            self.reassembler.process_batch(packet_batch);
+        self.ready.extend(packets);
+
+        // A final fragment may precede other parts, so its eventual datagram can
+        // have an earlier event than a retry already present in `ready`. Hold the
+        // entire batch until the unresolved fragments have been decided, then
+        // apply the normal timestamp/ordinal sort to all ready packets together.
+        // An ordinal-only prefix is unsafe when timestamps regress within a batch.
+        let ready_bytes: usize = self.ready.iter().map(|packet| packet.data.len()).sum();
+        if self.ready.len() > FRAGMENT_READY_PACKET_LIMIT || ready_bytes > FRAGMENT_READY_BYTE_LIMIT
+        {
+            self.ready.extend(self.reassembler.finish());
+            oldest_pending_timestamp_micros = None;
+        }
+        let packets = if oldest_pending_timestamp_micros.is_some() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.ready)
+        };
+        let mut routed = route_batch_to_worker_batches(packets, routing_plan, true);
+        routed.batch_max_timestamp_micros = input_max_timestamp_micros.map(|timestamp| {
+            let pending_frontier =
+                oldest_pending_timestamp_micros.map_or(timestamp, |pending| timestamp.min(pending));
+            self.ready
+                .iter()
+                .map(|packet| packet.timestamp_micros)
+                .min()
+                .map_or(pending_frontier, |ready| pending_frontier.min(ready))
+        });
+        routed
+    }
+
+    fn finish(&mut self) -> PacketBatch {
+        self.ready.extend(self.reassembler.finish());
+        // Accepted packets must drain even on interrupted or failed intake.
+        std::mem::take(&mut self.ready)
     }
 }
 
@@ -593,10 +689,13 @@ fn run_phase_processing_worker(
     tx: Sender<OutputMessage>,
     shard_count: usize,
     shard_parallelism_enabled: bool,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<PipelineCounters> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let mut shard_states: Vec<MatcherShardState> = if shard_parallelism_enabled {
         (0..shard_count)
             .map(|_| MatcherShardState::default())
@@ -605,17 +704,49 @@ fn run_phase_processing_worker(
         vec![MatcherShardState::default()]
     };
     let routing_plan = ShardRoutingPlan::new(shard_count, shard_count);
+    let mut fragment_routing = dns_processor.full_fragments.then(|| {
+        FragmentRoutingState::new(
+            dns_processor.match_timeout_micros,
+            dns_processor.monotonic_capture,
+        )
+    });
 
     let mut counters = PipelineCounters::default();
-    while let Ok(packet_batch) = batch_rx.recv() {
+    loop {
+        let received = batch_rx.recv();
+        let final_flush = received.is_err();
         if output_closed.load(AtomicOrdering::Relaxed) {
             break;
         }
 
+        let routed = match received {
+            Ok(packet_batch) => {
+                if let Some(fragment_routing) = fragment_routing.as_mut() {
+                    fragment_routing.route_batch(packet_batch, &routing_plan)
+                } else {
+                    route_batch_to_worker_batches(
+                        packet_batch,
+                        &routing_plan,
+                        dns_processor.allow_fragments,
+                    )
+                }
+            }
+            Err(_) => {
+                let Some(fragment_routing) = fragment_routing.as_mut() else {
+                    break;
+                };
+                let remaining = fragment_routing.finish();
+                if remaining.is_empty() {
+                    break;
+                }
+                route_batch_to_worker_batches(remaining, &routing_plan, true)
+            }
+        };
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches: shard_batches,
-        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
+        } = routed;
 
         let mut shard_results: Vec<(usize, ShardProcessingResult)> = shard_batches
             .into_par_iter()
@@ -640,6 +771,9 @@ fn run_phase_processing_worker(
             if !counters.absorb(&tx, shard_result, output_closed.as_ref()) {
                 return Ok(counters);
             }
+        }
+        if final_flush {
+            break;
         }
     }
 
@@ -669,18 +803,49 @@ fn run_parser_stage(
     worker_txs: Vec<Sender<MatcherBatchWork>>,
     routing_plan: ShardRoutingPlan,
     output_closed: Arc<AtomicBool>,
+    fragment_config: FragmentProcessingConfig,
 ) -> anyhow::Result<()> {
+    let FragmentProcessingConfig {
+        allow_fragments,
+        full_fragments,
+        match_timeout_micros,
+        monotonic_capture,
+    } = fragment_config;
     let mut batch_seq = 0_u64;
+    let mut fragment_routing =
+        full_fragments.then(|| FragmentRoutingState::new(match_timeout_micros, monotonic_capture));
 
-    while let Ok(packet_batch) = batch_rx.recv() {
+    loop {
+        let received = batch_rx.recv();
+        let final_flush = received.is_err();
         if output_closed.load(AtomicOrdering::Relaxed) {
             break;
         }
 
+        let routed = match received {
+            Ok(packet_batch) => {
+                if let Some(fragment_routing) = fragment_routing.as_mut() {
+                    fragment_routing.route_batch(packet_batch, &routing_plan)
+                } else {
+                    route_batch_to_worker_batches(packet_batch, &routing_plan, allow_fragments)
+                }
+            }
+            Err(_) => {
+                let Some(fragment_routing) = fragment_routing.as_mut() else {
+                    break;
+                };
+                let remaining = fragment_routing.finish();
+                if remaining.is_empty() {
+                    break;
+                }
+                route_batch_to_worker_batches(remaining, &routing_plan, true)
+            }
+        };
+
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(packet_batch, &routing_plan);
+        } = routed;
 
         for (worker_idx, shard_packets) in worker_batches.into_iter().enumerate() {
             worker_txs[worker_idx]
@@ -706,6 +871,9 @@ fn run_parser_stage(
         }
 
         batch_seq = batch_seq.wrapping_add(1);
+        if final_flush {
+            break;
+        }
     }
 
     Ok(())
@@ -717,10 +885,13 @@ fn run_matcher_worker(
     shard_range: Range<usize>,
     batch_rx: Receiver<MatcherBatchWork>,
     result_tx: Sender<MatcherWorkerEvent>,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<()> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let logical_shard_count = shard_range.end.saturating_sub(shard_range.start);
     let mut shard_states: Vec<MatcherShardState> = (0..logical_shard_count)
         .map(|_| MatcherShardState::default())
@@ -865,10 +1036,13 @@ fn run_staged_processing_pipeline(
     shard_count: usize,
     worker_count: usize,
     affinity_plan: AffinityPlan,
-    shutdown_requested: Arc<AtomicBool>,
-    intake_failed: Arc<AtomicBool>,
-    output_closed: Arc<AtomicBool>,
+    signals: WorkerShutdownSignals,
 ) -> anyhow::Result<PipelineCounters> {
+    let WorkerShutdownSignals {
+        shutdown_requested,
+        intake_failed,
+        output_closed,
+    } = signals;
     let routing_plan = ShardRoutingPlan::new(shard_count, worker_count);
     let (result_tx, result_rx) =
         crossbeam::channel::bounded(MATCHER_WORKER_QUEUE_DEPTH * worker_count.max(1));
@@ -901,9 +1075,11 @@ fn run_staged_processing_pipeline(
                             shard_range,
                             worker_rx,
                             result_tx,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?,
@@ -915,13 +1091,28 @@ fn run_staged_processing_pipeline(
         .name("DPP_Parser".to_string())
         .spawn({
             let output_closed = Arc::clone(&output_closed);
+            let allow_fragments = dns_processor.allow_fragments;
+            let full_fragments = dns_processor.full_fragments;
+            let match_timeout_micros = dns_processor.match_timeout_micros;
+            let monotonic_capture = dns_processor.monotonic_capture;
             let affinity_plan = affinity_plan.clone();
             move || {
                 affinity_plan.apply_to_current_thread(
                     staged_parser_affinity_slot(worker_count),
                     "staged parser",
                 );
-                run_parser_stage(batch_rx, worker_txs, routing_plan, output_closed)
+                run_parser_stage(
+                    batch_rx,
+                    worker_txs,
+                    routing_plan,
+                    output_closed,
+                    FragmentProcessingConfig {
+                        allow_fragments,
+                        full_fragments,
+                        match_timeout_micros,
+                        monotonic_capture,
+                    },
+                )
             }
         })?;
 
@@ -951,12 +1142,15 @@ impl DnsProcessor {
         packet_parser: &mut PacketParser,
         packet_count: &Arc<AtomicUsize>,
         tx: &Sender<OutputMessage>,
-        execution_budget: ExecutionBudget,
-        affinity_plan: AffinityPlan,
-        shard_parallelism_enabled: bool,
+        config: PipelineExecutionConfig,
         shutdown_requested: Arc<AtomicBool>,
         output_closed: Arc<AtomicBool>,
     ) -> anyhow::Result<ProcessingCounters> {
+        let PipelineExecutionConfig {
+            execution_budget,
+            affinity_plan,
+            shard_parallelism_enabled,
+        } = config;
         let shard_count =
             logical_shard_count(execution_budget.available_cpus, shard_parallelism_enabled);
         let worker_count =
@@ -966,14 +1160,14 @@ impl DnsProcessor {
 
         if execution_budget.uses_staged_pipeline() {
             tracing::info!(
-                "Execution budget: auto using {} CPUs, staged worker budget: {} shard workers, {} reserved service threads",
+                "Execution budget: {} CPUs, staged worker budget: {} shard workers, {} reserved service threads",
                 execution_budget.available_cpus,
                 worker_count,
                 execution_budget.staged_reserved_service_threads
             );
         } else {
             tracing::info!(
-                "Execution budget: auto using {} CPUs, phase-parallel pipeline selected for low-core host, Rayon worker budget: {}",
+                "Execution budget: {} CPUs, phase-parallel pipeline selected for low-core budget, Rayon worker budget: {}",
                 execution_budget.available_cpus,
                 execution_budget
                     .rayon_threads
@@ -998,9 +1192,11 @@ impl DnsProcessor {
                             shard_count,
                             worker_count,
                             affinity_plan,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?
@@ -1020,9 +1216,11 @@ impl DnsProcessor {
                             output_tx,
                             shard_count,
                             shard_parallelism_enabled,
-                            shutdown_requested,
-                            intake_failed,
-                            output_closed,
+                            WorkerShutdownSignals {
+                                shutdown_requested,
+                                intake_failed,
+                                output_closed,
+                            },
                         )
                     }
                 })?
@@ -1035,7 +1233,7 @@ impl DnsProcessor {
                     break;
                 };
 
-                if stop_requested(shutdown_requested.as_ref(), output_closed.as_ref()) {
+                if output_closed.load(AtomicOrdering::Relaxed) {
                     break;
                 }
 
@@ -1098,7 +1296,7 @@ impl DnsProcessor {
 mod tests {
     use super::*;
     use crate::config::{InputSource, OUTPUT_RECORD_BATCH_SIZE};
-    use crate::packet_parser::PacketParser;
+    use crate::packet_parser::{PacketParser, PacketPayload};
     use crate::test_support::{
         classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
         make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
@@ -1106,6 +1304,241 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    fn test_worker_signals(shutdown_requested: bool) -> WorkerShutdownSignals {
+        WorkerShutdownSignals {
+            shutdown_requested: Arc::new(AtomicBool::new(shutdown_requested)),
+            intake_failed: Arc::new(AtomicBool::new(false)),
+            output_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fragment_ordering_query_response() -> (Vec<u8>, Vec<u8>) {
+        let mut payload = encode_dns_header(0x3456, 0x0100, 1);
+        payload.extend_from_slice(b"\x07example\x03com\0\0\x01\0\x01");
+        let query =
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &payload);
+        payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let response =
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &payload);
+        (query, response)
+    }
+
+    fn split_ipv4_test_packet(packet: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let first_end = 14 + 20 + 32;
+        let mut first = packet[..first_end].to_vec();
+        first[16..18].copy_from_slice(&52_u16.to_be_bytes());
+        first[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        first[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+        let mut tail = packet[..34].to_vec();
+        tail[16..18].copy_from_slice(&(20_u16 + (packet.len() - first_end) as u16).to_be_bytes());
+        tail[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        tail[20..22].copy_from_slice(&4_u16.to_be_bytes());
+        tail.extend_from_slice(&packet[first_end..]);
+        (first, tail)
+    }
+
+    fn test_packet(bytes: &[u8], timestamp_micros: i64, packet_ordinal: u64) -> PacketData {
+        PacketData {
+            data: PacketPayload::owned(bytes.into()),
+            timestamp_micros,
+            packet_ordinal,
+        }
+    }
+
+    fn run_fragment_test_batches(
+        batches: Vec<PacketBatch>,
+        staged: bool,
+        monotonic: bool,
+        signals: WorkerShutdownSignals,
+    ) -> (PipelineCounters, Vec<DnsRecord>) {
+        let processor = Arc::new(
+            DnsProcessor::new_with_runtime_options(None, false, 1_200_000, monotonic)
+                .expect("processor initializes")
+                .with_full_fragments(true),
+        );
+        let (batch_tx, batch_rx) = crossbeam::channel::unbounded();
+        for batch in batches {
+            batch_tx.send(batch).expect("test batch sends");
+        }
+        drop(batch_tx);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let counters = if staged {
+            run_staged_processing_pipeline(
+                processor,
+                batch_rx,
+                output_tx,
+                4,
+                2,
+                AffinityPlan::disabled(),
+                signals,
+            )
+        } else {
+            run_phase_processing_worker(processor, batch_rx, output_tx, 1, false, signals)
+        }
+        .expect("fragment pipeline completes");
+        let records = output_rx
+            .into_iter()
+            .flat_map(|message| match message {
+                OutputMessage::Records(records) => records,
+                other => panic!("unexpected output message: {other:?}"),
+            })
+            .collect();
+        (counters, records)
+    }
+
+    #[test]
+    fn full_fragments_preserve_delayed_query_order_in_both_pipeline_models() {
+        let (query, response) = fragment_ordering_query_response();
+        let (first, tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            for monotonic in [false, true] {
+                for with_response in [false, true] {
+                    let mut initial = vec![
+                        test_packet(&tail, 1_000_000, 0),
+                        test_packet(&query, 1_100_000, 1),
+                    ];
+                    if with_response {
+                        initial.push(test_packet(&response, 1_120_000, 2));
+                    }
+                    let (counters, records) = run_fragment_test_batches(
+                        vec![initial, vec![test_packet(&first, 1_200_000, 3)]],
+                        staged,
+                        monotonic,
+                        test_worker_signals(false),
+                    );
+                    assert_eq!(counters.dns_query_count, 2);
+                    assert_eq!(counters.duplicated_query_count, 1);
+                    assert_eq!(
+                        counters.matched_query_response_count,
+                        usize::from(with_response)
+                    );
+                    assert_eq!(counters.timeout_query_count, usize::from(!with_response));
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].request_timestamp, 1_000_000);
+                    assert_eq!(
+                        records[0].response_timestamp,
+                        with_response.then_some(1_120_000)
+                    );
+                    assert_eq!(
+                        counters.matched_rtt_sum_micros,
+                        if with_response { 120_000 } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_fragments_preserve_default_intra_batch_timestamp_order() {
+        let (query, response) = fragment_ordering_query_response();
+        let (first, tail) = split_ipv4_test_packet(&response);
+        for staged in [false, true] {
+            let (counters, records) = run_fragment_test_batches(
+                vec![
+                    vec![
+                        test_packet(&query, 1_000_000, 0),
+                        test_packet(&query, 1_300_000, 1),
+                        test_packet(&tail, 1_200_000, 2),
+                    ],
+                    vec![test_packet(&first, 1_400_000, 3)],
+                ],
+                staged,
+                false,
+                test_worker_signals(false),
+            );
+            assert_eq!(counters.duplicated_query_count, 0);
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 1);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].request_timestamp, 1_000_000);
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            assert_eq!(records[1].request_timestamp, 1_300_000);
+            assert_eq!(records[1].response_timestamp, None);
+        }
+    }
+
+    #[test]
+    fn full_fragments_hold_watermark_for_buffered_response() {
+        let (query, response) = fragment_ordering_query_response();
+        let (_, unrelated_tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            let (counters, records) = run_fragment_test_batches(
+                vec![
+                    vec![test_packet(&query, 0, 0)],
+                    vec![
+                        test_packet(&response, 1_100_000, 1),
+                        test_packet(&unrelated_tail, 1_500_000, 2),
+                    ],
+                ],
+                staged,
+                true,
+                test_worker_signals(false),
+            );
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 0);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].response_timestamp, Some(1_100_000));
+        }
+    }
+
+    #[test]
+    fn full_fragments_release_backlog_at_both_capacity_bounds() {
+        let (query, _) = fragment_ordering_query_response();
+        let (_, tail) = split_ipv4_test_packet(&query);
+        for byte_bound in [false, true] {
+            let mut routing = FragmentRoutingState::new(1_200_000, false);
+            let plan = ShardRoutingPlan::new(1, 1);
+            let blocked = routing.route_batch(
+                vec![test_packet(&tail, 0, 0), test_packet(&query, 1, 1)],
+                &plan,
+            );
+            assert!(blocked.worker_batches[0][0].packets.is_empty());
+            let ordinary = if byte_bound {
+                vec![test_packet(&vec![0; FRAGMENT_READY_BYTE_LIMIT + 1], 2, 2)]
+            } else {
+                (0..=FRAGMENT_READY_PACKET_LIMIT)
+                    .map(|ordinal| test_packet(&[], 2, ordinal as u64 + 2))
+                    .collect()
+            };
+            let routed = routing.route_batch(ordinary, &plan);
+            assert!(routing.ready.is_empty());
+            assert!(routing.reassembler.finish().is_empty());
+            assert_eq!(routed.worker_batches[0][0].packets.len(), 1);
+            assert_eq!(routed.worker_batches[0][0].packets[0].packet_ordinal, 1);
+        }
+    }
+
+    #[test]
+    fn full_fragments_drain_accepted_backlog_after_signal_or_intake_error() {
+        let (query, response) = fragment_ordering_query_response();
+        let (_, tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            for signal in [false, true] {
+                let signals = test_worker_signals(signal);
+                signals.intake_failed.store(!signal, AtomicOrdering::SeqCst);
+                let mut unmatched = query.clone();
+                unmatched[42..44].copy_from_slice(&0x9876_u16.to_be_bytes());
+                let (counters, records) = run_fragment_test_batches(
+                    vec![vec![
+                        test_packet(&tail, 1_000_000, 0),
+                        test_packet(&query, 1_100_000, 1),
+                        test_packet(&response, 1_200_000, 2),
+                        test_packet(&unmatched, 1_300_000, 3),
+                    ]],
+                    staged,
+                    true,
+                    signals,
+                );
+                assert_eq!(counters.dns_query_count, 2);
+                assert_eq!(counters.matched_query_response_count, 1);
+                assert_eq!(counters.timeout_query_count, 0);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].request_timestamp, 1_100_000);
+                assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            }
+        }
+    }
 
     fn shard_result(token: usize) -> ShardProcessingResult {
         ShardProcessingResult {
@@ -1279,9 +1712,11 @@ mod tests {
             &mut parser,
             &packet_count,
             &output_tx,
-            ExecutionBudget::from_available_cpus(5),
-            affinity_plan,
-            true,
+            PipelineExecutionConfig {
+                execution_budget: ExecutionBudget::from_available_cpus(5),
+                affinity_plan,
+                shard_parallelism_enabled: true,
+            },
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1421,9 +1856,11 @@ mod tests {
                 &mut parser,
                 &packet_count,
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             );
@@ -1467,9 +1904,11 @@ mod tests {
                 &mut parser,
                 &packet_count,
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1577,9 +2016,11 @@ mod tests {
                 &mut parser,
                 &Arc::new(AtomicUsize::new(0)),
                 &output_tx,
-                ExecutionBudget::from_available_cpus(available_cpus),
-                AffinityPlan::disabled(),
-                true,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -1609,6 +2050,138 @@ mod tests {
     }
 
     #[test]
+    fn full_ipv4_reassembly_crosses_packet_batch_boundary_in_both_pipeline_models() {
+        let path = temp_test_path("pipeline-cross-batch-ipv4-fragments", "pcap");
+        let mut query_payload = encode_dns_header(0x3456, 0x0100, 1);
+        query_payload.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        query_payload.extend_from_slice(&1_u16.to_be_bytes());
+        let mut response_payload = query_payload.clone();
+        response_payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        // The OPT record changes the full RCODE to EDNS_BADVERS and is split
+        // between the two IP fragments.
+        response_payload.extend_from_slice(&[0, 0, 41, 4, 208, 1, 0, 0, 0, 0, 0]);
+
+        let query = make_udp_dns_packet_with_payload(
+            [10, 0, 0, 1],
+            [8, 8, 8, 8],
+            53_000,
+            53,
+            &query_payload,
+        );
+        let response = make_udp_dns_packet_with_payload(
+            [8, 8, 8, 8],
+            [10, 0, 0, 1],
+            53,
+            53_000,
+            &response_payload,
+        );
+        let padding = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 123);
+        let first_end = 14 + 20 + 40;
+        let mut first_fragment = response[..first_end].to_vec();
+        first_fragment[16..18].copy_from_slice(&60_u16.to_be_bytes());
+        first_fragment[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        first_fragment[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+        let mut final_fragment = response[..34].to_vec();
+        final_fragment[16..18]
+            .copy_from_slice(&(20_u16 + (response.len() - first_end) as u16).to_be_bytes());
+        final_fragment[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        final_fragment[20..22].copy_from_slice(&5_u16.to_be_bytes());
+        final_fragment.extend_from_slice(&response[first_end..]);
+
+        let mut packets = Vec::with_capacity(PACKET_BATCH_SIZE + 1);
+        packets.push((1, 0, query.as_slice()));
+        packets.push((1, 100_000, first_fragment.as_slice()));
+        packets.extend(std::iter::repeat_n(
+            (1, 150_000, padding.as_slice()),
+            PACKET_BATCH_SIZE - packets.len(),
+        ));
+        packets.push((1, 200_000, final_fragment.as_slice()));
+        fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
+
+        // The unresolved response holds this entire batch. Its earlier buffered
+        // query must also cap the matcher watermark until both are released.
+        let mut cap_parser =
+            PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+        let first_batch = cap_parser
+            .next_batch(PACKET_BATCH_SIZE)
+            .expect("batch reads")
+            .expect("first batch exists");
+        let mut fragment_routing = FragmentRoutingState::new(1_200_000, true);
+        let routed = fragment_routing.route_batch(first_batch, &ShardRoutingPlan::new(1, 1));
+        assert_eq!(routed.batch_max_timestamp_micros, Some(1_000_000));
+
+        for available_cpus in [1, 5] {
+            let mut parser =
+                PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
+            let packet_count = Arc::new(AtomicUsize::new(0));
+            let (output_tx, output_rx) = crossbeam::channel::unbounded();
+            let counters = DnsProcessor::dns_processing_loop(
+                Arc::new(
+                    DnsProcessor::new_with_runtime_options(None, true, 1_200_000, true)
+                        .expect("processor initializes")
+                        .with_full_fragments(true),
+                ),
+                &mut parser,
+                &packet_count,
+                &output_tx,
+                PipelineExecutionConfig {
+                    execution_budget: ExecutionBudget::from_available_cpus(available_cpus),
+                    affinity_plan: AffinityPlan::disabled(),
+                    shard_parallelism_enabled: true,
+                },
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("pipeline completes");
+
+            assert_eq!(
+                counters.total_packets_processed,
+                PACKET_BATCH_SIZE + 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_query_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.dns_response_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.matched_query_response_count, 1,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(
+                counters.timeout_query_count, 0,
+                "available_cpus={available_cpus}"
+            );
+            assert_eq!(parser.non_monotonic_timestamp_count(), 0);
+
+            drop(output_tx);
+            let records = output_rx
+                .into_iter()
+                .flat_map(|message| match message {
+                    OutputMessage::Records(records) => records,
+                    other => panic!("unexpected output message: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "available_cpus={available_cpus}");
+            assert_eq!(records[0].request_timestamp, 1_000_000);
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            assert_eq!(
+                records[0].response_code.map(|code| code.to_string()),
+                Some("EDNS_BADVERS".to_string())
+            );
+        }
+
+        fs::remove_file(path).expect("test pcap removed");
+    }
+
+    #[test]
     fn routed_worker_batches_use_global_batch_max_timestamp() {
         let path = temp_test_path("pipeline-routed-batch-watermark", "pcap");
         let later_packet = make_udp_dns_packet([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53);
@@ -1630,7 +2203,7 @@ mod tests {
         let RoutedWorkerBatches {
             batch_max_timestamp_micros,
             worker_batches,
-        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1));
+        } = route_batch_to_worker_batches(batch, &ShardRoutingPlan::new(4, 1), false);
 
         let ordered_packets = worker_batches[0]
             .iter()
@@ -1676,9 +2249,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("phase worker completes");
 
@@ -1714,9 +2285,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("phase worker completes");
 
@@ -1743,9 +2312,7 @@ mod tests {
             output_tx,
             1,
             false,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(true),
         )
         .expect("phase worker completes");
 
@@ -1764,6 +2331,7 @@ mod tests {
         } = route_batch_to_worker_batches(
             oversized_qname_batch("matcher-worker-oversized-qname"),
             &ShardRoutingPlan::new(1, 1),
+            false,
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1784,9 +2352,7 @@ mod tests {
             worker_range,
             batch_rx,
             result_tx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(false),
         )
         .expect("matcher worker completes");
 
@@ -1813,6 +2379,7 @@ mod tests {
         } = route_batch_to_worker_batches(
             unresolved_query_batch("matcher-worker-signal-shutdown"),
             &ShardRoutingPlan::new(1, 1),
+            false,
         );
         let shard_packets = worker_batches.pop().expect("worker batch exists");
         let (batch_tx, batch_rx) = crossbeam::channel::bounded(1);
@@ -1833,9 +2400,7 @@ mod tests {
             worker_range,
             batch_rx,
             result_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            test_worker_signals(true),
         )
         .expect("matcher worker completes");
 

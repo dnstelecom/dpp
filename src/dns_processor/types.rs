@@ -10,6 +10,7 @@ use hickory_proto::rr::RecordType as HickoryRecordType;
 use std::collections::BTreeMap;
 use std::mem;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::mem::MaybeUninit;
@@ -19,6 +20,23 @@ use crate::output::OutputRecordBatches;
 
 const INLINE_TIMELINE_CAPACITY: usize = 1;
 
+/// Ordered Ethernet tag stack, with each tag encoded as TPID and its 12-bit VLAN ID.
+/// Untagged traffic needs no allocation; packet metadata and matcher keys share tagged stacks.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(super) struct VlanContext(Option<Arc<[u32]>>);
+
+impl VlanContext {
+    pub(super) fn from_tags(tags: Vec<u32>) -> Self {
+        Self((!tags.is_empty()).then(|| Arc::from(tags)))
+    }
+
+    pub(super) fn memory_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |tags| std::mem::size_of_val(tags.as_ref()))
+    }
+}
+
 // Matcher identity preserves the observed presentation-form QNAME bytes and does not lowercase
 // them before building in-flight keys. RFC 4343 defines ASCII label comparison as
 // case-insensitive, and a protocol-compliant response is allowed to differ from the query's 0x20
@@ -26,7 +44,8 @@ const INLINE_TIMELINE_CAPACITY: usize = 1;
 // Edition intentionally does not canonicalize names here: byte-preserving matching aligns better
 // with the real behavior we target on offline caching-resolver workloads. As a result, a
 // query/response pair that differs only by case may fail to match even on otherwise valid DNS
-// traffic. Tuple order is id, name, client IP, client port, query type, resolver IP, query class, opcode.
+// traffic. Tuple order is id, name, client IP, client port, query type, resolver IP, query class,
+// opcode, VLAN context. QoS bits (PCP and DEI) do not distinguish network segments.
 pub(super) type MatcherIdentityKey = (
     u16,
     DnsNameBuf,
@@ -36,6 +55,7 @@ pub(super) type MatcherIdentityKey = (
     IpAddr,
     u16,
     u8,
+    VlanContext,
 );
 pub(super) type QueryIdentityKey = MatcherIdentityKey;
 pub(super) type ResponseIdentityKey = MatcherIdentityKey;
@@ -108,7 +128,8 @@ impl QueryEventPayload {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ResponseEventPayload {
-    pub(super) response_code: ProtoResponseCode,
+    /// None means a response was inferred from its first IPv4 fragment.
+    pub(super) response_code: Option<ProtoResponseCode>,
 }
 
 pub(super) enum Timeline<Record> {
@@ -401,6 +422,7 @@ pub(super) struct ShardProcessingResult {
     pub(super) dns_query_count: usize,
     pub(super) duplicated_query_count: usize,
     pub(super) dns_response_count: usize,
+    pub(super) fragmented_response_prefix_count: usize,
     pub(super) matched_query_response_count: usize,
     pub(super) timeout_query_count: usize,
     pub(super) matched_rtt_sum_micros: u64,
@@ -423,6 +445,10 @@ pub(super) struct ProcessedDnsRecord {
     pub(super) query_class: u16,
     pub(super) opcode: u8,
     pub(super) response_code: ProtoResponseCode,
+    pub(super) vlan_context: VlanContext,
+    pub(super) partial_first_ipv4_fragment: bool,
+    /// Known only when all records needed to determine the response code are in the prefix.
+    pub(super) partial_response_code: Option<ProtoResponseCode>,
 }
 
 #[cfg(test)]

@@ -44,6 +44,14 @@ identity is approximately 312 bytes on the measured target. A safe eagerly cance
 index must either share that identity through another allocation or introduce stable handles and
 an arena/reverse index.
 
+On 2026-09-26, the inline `DnsNameBuf` capacity was separately reduced from 255 to 64 bytes;
+the size above describes the original experiment. In five alternating paired runs on one macOS
+ARM64 host (`perf` profile, 16-CPU budget), the smaller layout improved processing speed by a
+paired geometric mean of `1.095x` on an 18.0 M packet synthetic capture and `1.316x` on a 500,612
+query-only subset. Median peak child RSS fell from 307 to 187 MiB and from 407 to 234 MiB,
+respectively. CSV output for the query-only subset was byte-identical. These measurements are
+specific to the tested host and captures; they do not establish a gain for every QNAME distribution.
+
 ## Decision
 
 Keep the current matcher state and eviction behavior.
