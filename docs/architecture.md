@@ -83,6 +83,13 @@ and uses the remaining CPU budget for shard workers. Routed DNS packets also car
 metadata into shard workers so the worker path can reuse the first L3/L4 parse instead of
 repeating it for full DNS question decoding.
 
+Ethernet decoding also produces one canonical VLAN context: the ordered stack of tag TPIDs and
+12-bit VLAN IDs. PCP and DEI are QoS metadata and do not distinguish transactions. This context is
+shared by fragment keys and matcher identities, keeping overlapping IP endpoints in different
+VLANs separate. Routing still uses the coarser client/resolver endpoint tuple, so different VLANs
+with the same endpoints can share a worker without sharing matcher state. Untagged packets allocate
+no tag storage; tagged stacks use shared immutable storage and remain internal to processing.
+
 Flow routing buffers the existing tuple's `Hash` writes on the stack and runs SeaHash once over
 the resulting bytes. The integer encoding and digest remain identical to the streaming hasher,
 so shard assignment and output order are preserved. If a future tuple encoding exceeds the
@@ -204,8 +211,9 @@ or second encoding of canonical addresses and ports.
   a nonfinal fragment cannot reach or exceed that boundary, regardless of arrival order.
   A first non-DNS UDP fragment removes any earlier tails for its datagram key. A separate bounded
   history drops later non-DNS tails without evicting the completed-DNS history; a new DNS first
-  fragment with a reused IPv4 ID removes that non-DNS mark. Ethernet VLAN tags are part of the
-  fragment key so traffic from different tagged segments is not assembled together. A new DNS tail
+  fragment with a reused IPv4 ID removes that non-DNS mark. The canonical VLAN context is part of
+  the fragment key so traffic from different tagged segments is not assembled together, while
+  priority or drop-eligibility changes do not split a datagram. A new DNS tail
   that arrives before its first fragment while the old non-DNS mark is active is indistinguishable
   from an old non-DNS tail and may be dropped.
   The optional runtime flag
@@ -355,8 +363,9 @@ The DNS matcher must preserve these invariants:
 - Routing and in-flight matching use the original observed client IP, client port, and resolver IP.
   The resolver remains internal; deterministic client-IP pseudonymization is applied exactly once
   when the matcher constructs a finalized `DnsRecord`.
-- DNS ID, observed QNAME, QTYPE, QCLASS and OPCODE also distinguish in-flight identities. QCLASS,
-  OPCODE and resolver identity remain internal and do not change the exported record schema.
+- DNS ID, observed QNAME, QTYPE, QCLASS, OPCODE and the full canonical VLAN tag stack also distinguish
+  in-flight identities. QCLASS, OPCODE, VLAN context and resolver identity remain internal and do
+  not change the exported record schema.
 - Repeated pending queries with the same match identity inside the configured timeout window
   (`1200ms` by default) are deduplicated to the earliest canonical query. Later duplicates are
   counted separately and must not create extra matched or timeout records.

@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::DnsProcessor;
 use super::parser::PacketProcessingOutcome;
-use super::types::{MatcherShardState, ProcessedDnsRecord};
+use super::types::{MatcherShardState, ProcessedDnsRecord, VlanContext};
 use crate::custom_types::DnsNameBuf;
 use crate::test_support::{
     encode_dns_header, make_udp_dns_packet, make_udp_dns_packet_with_payload, temp_test_path,
@@ -436,6 +436,7 @@ fn insert_query(
         query.resolver_ip,
         query.query_class,
         query.opcode,
+        VlanContext::default(),
     );
     let key = super::types::TimelineKey::new(
         query.timestamp_micros,
@@ -459,6 +460,7 @@ fn insert_response(
         response.resolver_ip,
         response.query_class,
         response.opcode,
+        VlanContext::default(),
     );
     let key = super::types::TimelineKey::new(
         response.timestamp_micros,
@@ -492,6 +494,7 @@ fn make_query_record_with_timestamp(
         query_class: 1,
         opcode: 0,
         response_code: HickoryResponseCode::ServFail.into(),
+        vlan_context: VlanContext::default(),
         partial_first_ipv4_fragment: false,
         partial_response_code: None,
     }
@@ -517,6 +520,7 @@ fn make_response_record_with_timestamp(
         query_class: 1,
         opcode: 0,
         response_code: HickoryResponseCode::NoError.into(),
+        vlan_context: VlanContext::default(),
         partial_first_ipv4_fragment: false,
         partial_response_code: None,
     }
@@ -560,7 +564,7 @@ fn packet_routing_meta_preserves_standard_packet_processing_output() {
         .expect("standard parser succeeds");
     let routing_meta = DnsProcessor::packet_routing_meta(&packet).expect("routing metadata exists");
     let meta_records =
-        match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta) {
+        match processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta.clone()) {
             PacketProcessingOutcome::Records(records) => records,
             outcome => panic!("metadata-assisted parser failed: {outcome:?}"),
         };
@@ -610,7 +614,7 @@ fn packet_processing_appends_records_with_final_ordinals() {
             &packet,
             1_234_567,
             42,
-            routing_meta,
+            routing_meta.clone(),
             &mut records,
         );
 
@@ -665,7 +669,7 @@ fn packet_processing_failure_does_not_append_partial_records() {
                 &packet,
                 1_234_567,
                 42,
-                routing_meta,
+                routing_meta.clone(),
                 &mut records,
             );
 
@@ -700,7 +704,7 @@ fn packet_processing_zero_questions_leaves_destination_unchanged() {
             &packet,
             1_234_567,
             42,
-            routing_meta,
+            routing_meta.clone(),
             &mut records,
         );
 
@@ -734,7 +738,7 @@ fn packet_processing_response_appends_only_first_question() {
             &packet,
             1_234_567,
             42,
-            routing_meta,
+            routing_meta.clone(),
             &mut records,
         );
 
@@ -775,7 +779,7 @@ fn parser_bounds_dns_decode_to_udp_length() {
     ] {
         assert!(
             matches!(
-                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta,),
+                processor.process_packet_batch_with_meta(&packet, 1_234_567, routing_meta.clone(),),
                 PacketProcessingOutcome::Invalid
             ),
             "fast_path={fast_path}"

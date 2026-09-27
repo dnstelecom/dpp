@@ -5,6 +5,9 @@
 This document explains how to convert a capture that contains MPLS or another unsupported outer
 encapsulation layer into a flat Ethernet plus IPv4 or IPv6 capture that DPP can read directly.
 Ethernet VLAN and QinQ stacks with TPIDs `0x8100`, `0x88a8`, or `0x9100` are decoded natively.
+Matching and IPv4 reassembly preserve the complete ordered TPID/VLAN-ID stack, so overlapping
+IP endpoints on different tagged segments remain separate. PCP and DEI changes are ignored for
+this identity; no VLAN column is added to exported records.
 
 Target output shape:
 

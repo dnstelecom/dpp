@@ -15,8 +15,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use super::types::VlanContext;
 use crate::packet_parser::{PacketBatch, PacketData, PacketPayload};
 
+#[cfg(test)]
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
@@ -45,7 +47,7 @@ struct FragmentKey {
     source: [u8; 4],
     destination: [u8; 4],
     identification: u16,
-    l2_tags: Option<Arc<[u8]>>,
+    vlan_context: VlanContext,
 }
 
 struct FragmentPart {
@@ -208,13 +210,16 @@ impl PendingDatagram {
                 || self
                     .final_payload_length
                     .is_some_and(|last| last != udp_length)
-                || self.segments.last_key_value().is_some_and(|(offset, segment)| {
-                    // Disjoint intervals have increasing ends, so the last retained
-                    // tail is enough to validate the newly known UDP boundary.
-                    let segment_end = offset + segment.payload.len();
-                    segment_end > udp_length
-                        || (segment.more_fragments && segment_end == udp_length)
-                })
+                || self
+                    .segments
+                    .last_key_value()
+                    .is_some_and(|(offset, segment)| {
+                        // Disjoint intervals have increasing ends, so the last retained
+                        // tail is enough to validate the newly known UDP boundary.
+                        let segment_end = offset + segment.payload.len();
+                        segment_end > udp_length
+                            || (segment.more_fragments && segment_end == udp_length)
+                    })
             {
                 return Err(());
             }
@@ -525,16 +530,14 @@ impl Ipv4FragmentReassembler {
     }
 
     fn insert_entry(&mut self, key: FragmentKey, entry: PendingDatagram) {
-        self.pending_bytes +=
-            entry.memory_bytes() + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.pending_bytes += entry.memory_bytes() + key.vlan_context.memory_bytes();
         self.arrival_order.insert(entry.arrival_order, key.clone());
         self.pending.insert(key, entry);
     }
 
     fn take_entry(&mut self, key: &FragmentKey) -> Option<PendingDatagram> {
         let entry = self.pending.remove(key)?;
-        self.pending_bytes -=
-            entry.memory_bytes() + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.pending_bytes -= entry.memory_bytes() + key.vlan_context.memory_bytes();
         self.arrival_order.remove(&entry.arrival_order);
         Some(entry)
     }
@@ -553,8 +556,7 @@ impl Ipv4FragmentReassembler {
             observed_timestamp,
             arrival_order,
         };
-        self.completed_bytes +=
-            completed.memory_bytes() + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.completed_bytes += completed.memory_bytes() + key.vlan_context.memory_bytes();
         self.completed_order.insert(arrival_order, key.clone());
         self.recently_completed.insert(key, completed);
         while self.recently_completed.len() > MAX_RECENT_COMPLETIONS
@@ -570,8 +572,7 @@ impl Ipv4FragmentReassembler {
 
     fn take_completion(&mut self, key: &FragmentKey) -> Option<CompletedDatagram> {
         let completed = self.recently_completed.remove(key)?;
-        self.completed_bytes -=
-            completed.memory_bytes() + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.completed_bytes -= completed.memory_bytes() + key.vlan_context.memory_bytes();
         self.completed_order.remove(&completed.arrival_order);
         Some(completed)
     }
@@ -580,8 +581,7 @@ impl Ipv4FragmentReassembler {
         self.take_non_dns(&key);
         let arrival_order = self.next_non_dns_order;
         self.next_non_dns_order = self.next_non_dns_order.wrapping_add(1);
-        self.non_dns_bytes +=
-            RECENT_ENTRY_OVERHEAD_ESTIMATE + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.non_dns_bytes += RECENT_ENTRY_OVERHEAD_ESTIMATE + key.vlan_context.memory_bytes();
         self.non_dns_order.insert(arrival_order, key.clone());
         self.known_non_dns.insert(
             key,
@@ -602,8 +602,7 @@ impl Ipv4FragmentReassembler {
 
     fn take_non_dns(&mut self, key: &FragmentKey) -> Option<NonDnsKey> {
         let known = self.known_non_dns.remove(key)?;
-        self.non_dns_bytes -=
-            RECENT_ENTRY_OVERHEAD_ESTIMATE + key.l2_tags.as_ref().map_or(0, |tags| tags.len());
+        self.non_dns_bytes -= RECENT_ENTRY_OVERHEAD_ESTIMATE + key.vlan_context.memory_bytes();
         self.non_dns_order.remove(&known.arrival_order);
         Some(known)
     }
@@ -740,7 +739,8 @@ impl Ipv4FragmentReassembler {
 
 fn classify_fragment(packet: &PacketData) -> FragmentInput {
     let bytes = packet.data.as_slice();
-    let Ok((ethertype, l3_offset)) = super::parser::ethernet_ethertype_and_payload_offset(bytes)
+    let Ok((ethertype, l3_offset, vlan_context)) =
+        super::parser::ethernet_ethertype_and_payload_offset(bytes)
     else {
         return FragmentInput::Ordinary;
     };
@@ -785,8 +785,7 @@ fn classify_fragment(packet: &PacketData) -> FragmentInput {
         source: ip[12..16].try_into().expect("IPv4 minimum header checked"),
         destination: ip[16..20].try_into().expect("IPv4 minimum header checked"),
         identification: u16::from_be_bytes([ip[4], ip[5]]),
-        l2_tags: (l3_offset > ETHERNET_HEADER_LEN)
-            .then(|| Arc::<[u8]>::from(&bytes[12..l3_offset])),
+        vlan_context,
     };
     let first_udp_length = if offset == 0 {
         if payload.len() < UDP_HEADER_LEN {
@@ -972,6 +971,26 @@ mod tests {
     }
 
     #[test]
+    fn tagged_fragments_ignore_priority_and_drop_eligibility_bits() {
+        let mut assembler = Ipv4FragmentReassembler::new(1_200_000, false);
+        let first = tagged_packet(packet(0, true, 1, 100), &[(0x88a8, 10), (0x8100, 100)]);
+        let last = tagged_packet(
+            packet(24, false, 2, 101),
+            &[(0x88a8, 0xb00a), (0x8100, 0xf064)],
+        );
+        let (output, pending) = assembler.process_batch(vec![first, last]);
+        assert_eq!(pending, None);
+        assert_eq!(
+            output.len(),
+            1,
+            "QoS changes do not change the fragment key"
+        );
+        let meta = super::super::DnsProcessor::packet_routing_meta(output[0].data.as_slice())
+            .expect("reassembled tagged datagram routes");
+        assert!(!meta.partial_first_ipv4_fragment);
+    }
+
+    #[test]
     fn assembles_across_batches_once_at_final_fragment_time() {
         let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
         let (first, pending) = reassembler.process_batch(vec![packet(0, true, 4, 100)]);
@@ -1117,7 +1136,7 @@ mod tests {
                     source: [192, 0, 2, 1],
                     destination: [192, 0, 2, 53],
                     identification: id as u16,
-                    l2_tags: None,
+                    vlan_context: VlanContext::default(),
                 },
                 Arc::<[u8]>::from(&b"payload"[..]),
                 5_000_103,
@@ -1340,7 +1359,10 @@ mod tests {
                 };
 
                 let (output, pending) = reassembler.process_batch(input);
-                assert!(output.is_empty(), "offset={offset}, tail_first={tail_first}");
+                assert!(
+                    output.is_empty(),
+                    "offset={offset}, tail_first={tail_first}"
+                );
                 assert_eq!(pending, None, "offset={offset}, tail_first={tail_first}");
                 assert!(
                     reassembler.finish().is_empty(),

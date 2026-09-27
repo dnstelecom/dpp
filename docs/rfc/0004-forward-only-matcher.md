@@ -24,7 +24,9 @@ order within each shard and never backtracks. The key design choices:
    `CanonicalFlowKey` (observed client IP, client port and resolver IP, oriented by DNS QR)
    and hashes it to a shard index. This includes the valid case where both ports are 53 and
    guarantees that a query and its
-   matching response always land in the same shard.
+   matching response always land in the same shard. This is a coarser partition than matcher
+   identity: VLANs with overlapping endpoints may share a worker, but their transaction state
+   remains distinct.
 
 3. **Deterministic ordering.** Within a shard, packets are processed in strict
    `(timestamp, packet_ordinal, record_ordinal)` order. Tie-breaks are explicit — scheduler
@@ -59,8 +61,11 @@ order within each shard and never backtracks. The key design choices:
    of retry history, with no secondary matcher map.
 
    Match identity includes the DNS ID, observed name, client IP and port, resolver IP, query
-   type, query class and opcode. Resolver identity, query class and opcode remain internal and are
-   not added to the exported `DnsRecord` schema.
+   type, query class, opcode and canonical VLAN context. Ethernet decoding owns the ordered
+   TPID/12-bit-VID stack used by both matcher and fragment keys; PCP and DEI bits are excluded.
+   Untagged traffic needs no tag allocation, while tagged metadata and keys share immutable tag
+   storage. Resolver identity, query class, opcode and VLAN context remain internal and are not
+   added to the exported `DnsRecord` schema.
 
    The current Community Edition identity key preserves the observed presentation-form QNAME bytes
    and does not lowercase them before matching. This is a deliberate Community Edition trade-off,

@@ -286,7 +286,9 @@ match window. Finalized transactions are never reopened. With `--monotonic-captu
 history is needed or allocated.
 
 DNS QR determines query/response direction, including valid exchanges with UDP port 53 on both
-endpoints. QCLASS and OPCODE distinguish transactions internally and do not add output columns.
+endpoints. QCLASS, OPCODE and the full VLAN/QinQ tag stack distinguish transactions internally
+and do not add output columns. VLAN identity includes each tag's TPID and VLAN ID; changes to
+priority (PCP) or drop eligibility (DEI) do not prevent matching within the same tagged segment.
 Ordinary DNS QUERY messages with more than one question are rejected under RFC 9619. Responses
 whose declared answer or authority records are truncated are also rejected before matching.
 

@@ -16,7 +16,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
-use super::types::ProcessedDnsRecord;
+use super::types::{ProcessedDnsRecord, VlanContext};
 use crate::custom_types::{DnsNameBuf, DnsNameTooLong, ProtoResponseCode};
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -49,16 +49,17 @@ const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
 const DNS_TSIG_RECORD_TYPE: u16 = 250;
 
-/// Return the encapsulated EtherType and the start of its payload. Reassembly uses the
-/// same VLAN traversal so fragment classification and DNS routing agree on the L3 offset.
+/// Decode the encapsulated EtherType, payload start and canonical VLAN context once.
+/// Reassembly and DNS matching share this traversal and its VLAN identity semantics.
 pub(super) fn ethernet_ethertype_and_payload_offset(
     data: &[u8],
-) -> Result<(u16, usize), &'static str> {
+) -> Result<(u16, usize, VlanContext), &'static str> {
     let ethernet = data
         .get(..ETHERNET_HEADER_LEN)
         .ok_or("Failed to parse Ethernet packet")?;
     let mut ethertype = u16::from_be_bytes([ethernet[12], ethernet[13]]);
     let mut payload_offset = ETHERNET_HEADER_LEN;
+    let mut tags = Vec::new();
 
     while matches!(
         ethertype,
@@ -67,11 +68,13 @@ pub(super) fn ethernet_ethertype_and_payload_offset(
         let tag = data
             .get(payload_offset..payload_offset + 4)
             .ok_or("Failed to parse Ethernet VLAN tag")?;
+        let vlan_id = u16::from_be_bytes([tag[0], tag[1]]) & 0x0fff;
+        tags.push((u32::from(ethertype) << 16) | u32::from(vlan_id));
         ethertype = u16::from_be_bytes([tag[2], tag[3]]);
         payload_offset += 4;
     }
 
-    Ok((ethertype, payload_offset))
+    Ok((ethertype, payload_offset, VlanContext::from_tags(tags)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,9 +84,10 @@ pub(super) struct CanonicalFlowKey {
     pub(super) resolver_ip: IpAddr,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ParsedUdpDnsMeta {
     pub(super) flow_key: CanonicalFlowKey,
+    vlan_context: VlanContext,
     // DNS starts at least at byte 42. A maximum IPv6 frame ends at byte 65589;
     // reserving the validated 12-byte DNS header bounds this delta to 65535.
     dns_offset_delta: u16,
@@ -94,11 +98,11 @@ pub(super) struct ParsedUdpDnsMeta {
 }
 
 impl ParsedUdpDnsMeta {
-    fn dns_offset(self) -> usize {
+    fn dns_offset(&self) -> usize {
         MIN_DNS_OFFSET + usize::from(self.dns_offset_delta)
     }
 
-    fn src_ip(self) -> IpAddr {
+    fn src_ip(&self) -> IpAddr {
         if self.is_response {
             self.flow_key.resolver_ip
         } else {
@@ -106,7 +110,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dst_ip(self) -> IpAddr {
+    fn dst_ip(&self) -> IpAddr {
         if self.is_response {
             self.flow_key.client_ip
         } else {
@@ -114,7 +118,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn src_port(self) -> u16 {
+    fn src_port(&self) -> u16 {
         if self.is_response {
             DNS_PORT
         } else {
@@ -122,7 +126,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dst_port(self) -> u16 {
+    fn dst_port(&self) -> u16 {
         if self.is_response {
             self.flow_key.client_port
         } else {
@@ -130,7 +134,7 @@ impl ParsedUdpDnsMeta {
         }
     }
 
-    fn dns_data(self, data: &[u8]) -> Result<&[u8], &'static str> {
+    fn dns_data<'a>(&self, data: &'a [u8]) -> Result<&'a [u8], &'static str> {
         let start = self.dns_offset();
         let end = start
             .checked_add(usize::from(self.dns_len))
@@ -435,6 +439,7 @@ impl DnsProcessor {
                 query_class: query.query_class,
                 opcode: header.opcode,
                 response_code,
+                vlan_context: meta.vlan_context.clone(),
                 partial_first_ipv4_fragment: meta.partial_first_ipv4_fragment,
                 partial_response_code: header.partial_response_code,
             });
@@ -1054,10 +1059,10 @@ impl DnsProcessor {
         data: &[u8],
         allow_first_ipv4_response_fragment: bool,
     ) -> Result<Option<ParsedUdpDnsMeta>, &'static str> {
-        let (ethertype, l3_offset) = ethernet_ethertype_and_payload_offset(data)?;
+        let (ethertype, l3_offset, vlan_context) = ethernet_ethertype_and_payload_offset(data)?;
         let payload = &data[l3_offset..];
 
-        match ethertype {
+        let mut meta = match ethertype {
             ETHER_TYPE_IPV4 => Self::extract_udp_dns_from_ipv4(
                 payload,
                 l3_offset,
@@ -1065,7 +1070,11 @@ impl DnsProcessor {
             ),
             ETHER_TYPE_IPV6 => Self::extract_udp_dns_from_ipv6(payload, l3_offset),
             _ => Ok(None),
+        }?;
+        if let Some(meta) = meta.as_mut() {
+            meta.vlan_context = vlan_context;
         }
+        Ok(meta)
     }
 
     fn extract_udp_dns_from_ipv4(
@@ -1280,6 +1289,7 @@ impl DnsProcessor {
 
         Ok(Some(ParsedUdpDnsMeta {
             flow_key: Self::canonical_flow_key(src_ip, dst_ip, src_port, dst_port, is_response),
+            vlan_context: VlanContext::default(),
             dns_offset_delta: u16::try_from(
                 dns_offset
                     .checked_sub(MIN_DNS_OFFSET)
@@ -1504,7 +1514,8 @@ mod protocol_regression_tests {
         assert_eq!(meta.dns_data(&first).unwrap().len(), 32);
 
         for processor in processors() {
-            let records = match processor.process_packet_batch_with_meta(&first, 100, meta) {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
                 PacketProcessingOutcome::Records(records) => records,
                 other => panic!("partial response rejected: {other:?}"),
             };
@@ -1521,7 +1532,7 @@ mod protocol_regression_tests {
             .expect("header-only first fragment routes for decode validation");
         for processor in processors() {
             assert!(matches!(
-                processor.process_packet_batch_with_meta(&incomplete_question, 100, meta),
+                processor.process_packet_batch_with_meta(&incomplete_question, 100, meta.clone()),
                 PacketProcessingOutcome::Invalid
             ));
         }
@@ -1569,7 +1580,7 @@ mod protocol_regression_tests {
         assert!(!meta.partial_first_ipv4_fragment);
         for processor in processors() {
             assert!(matches!(
-                processor.process_packet_batch_with_meta(&full_packet, 100, meta),
+                processor.process_packet_batch_with_meta(&full_packet, 100, meta.clone()),
                 PacketProcessingOutcome::Invalid
             ));
         }
@@ -1584,7 +1595,8 @@ mod protocol_regression_tests {
         let first = first_ipv4_fragment(ipv4(&no_additionals, true, 53000), 40);
         let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
         for processor in processors() {
-            let records = match processor.process_packet_batch_with_meta(&first, 100, meta) {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
                 PacketProcessingOutcome::Records(records) => records,
                 other => panic!("partial response rejected: {other:?}"),
             };
@@ -1598,7 +1610,8 @@ mod protocol_regression_tests {
         let first = first_ipv4_fragment(ipv4(&with_opt, true, 53000), 48);
         let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
         for processor in processors() {
-            let records = match processor.process_packet_batch_with_meta(&first, 100, meta) {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
                 PacketProcessingOutcome::Records(records) => records,
                 other => panic!("partial response rejected: {other:?}"),
             };
@@ -1611,7 +1624,8 @@ mod protocol_regression_tests {
         let first = first_ipv4_fragment(ipv4(&with_tsig, true, 53000), fragment_payload_len);
         let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
         for processor in processors() {
-            let records = match processor.process_packet_batch_with_meta(&first, 100, meta) {
+            let records = match processor.process_packet_batch_with_meta(&first, 100, meta.clone())
+            {
                 PacketProcessingOutcome::Records(records) => records,
                 other => panic!("partial response rejected: {other:?}"),
             };
@@ -1636,7 +1650,7 @@ mod protocol_regression_tests {
         let meta = DnsProcessor::packet_routing_meta_with_fragments(&first, true).unwrap();
         for processor in processors() {
             assert!(matches!(
-                processor.process_packet_batch_with_meta(&first, 100, meta),
+                processor.process_packet_batch_with_meta(&first, 100, meta.clone()),
                 PacketProcessingOutcome::Invalid
             ));
         }

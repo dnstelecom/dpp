@@ -494,6 +494,7 @@ impl DnsProcessor {
             resolver_ip,
             record.query_class,
             record.opcode,
+            record.vlan_context.clone(),
         )
     }
 
@@ -513,6 +514,7 @@ impl DnsProcessor {
             resolver_ip,
             record.query_class,
             record.opcode,
+            record.vlan_context.clone(),
         )
     }
 
@@ -527,6 +529,7 @@ impl DnsProcessor {
             query.resolver_ip,
             query.query_class,
             query.opcode,
+            super::types::VlanContext::default(),
         )
     }
 
