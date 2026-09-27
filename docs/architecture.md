@@ -201,7 +201,9 @@ or second encoding of canonical addresses and ports.
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
   pointers must target prior, nonoverlapping names; enabling the fast path must not weaken that
-  validation. For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
+  validation. Both wire-name walkers bound traversal by strictly decreasing pointer targets,
+  allowing valid chains longer than 32 pointers while rejecting cycles and overlaps.
+  For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
   RFC 9619. A complete response cannot claim answer or authority records that are absent from its DNS
   payload, whether or not it has additional records. TSIG status extraction consumes and
   bounds-checks the declared Other Data, including the six-byte server time in BADTIME responses.

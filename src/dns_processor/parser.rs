@@ -45,7 +45,6 @@ const DNS_PORT: u16 = 53;
 const DNS_POINTER_MASK: u8 = 0b1100_0000;
 const DNS_POINTER_TAG: u8 = 0b1100_0000;
 const DNS_LABEL_LEN_MASK: u8 = 0b0011_1111;
-const DNS_COMPRESSION_JUMP_LIMIT: usize = 32;
 const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
 const DNS_TSIG_RECORD_TYPE: u16 = 250;
@@ -895,7 +894,6 @@ impl DnsProcessor {
         let start = *cursor;
         let mut position = *cursor;
         let mut resume_position = None;
-        let mut jump_count = 0;
         let mut segment_start = position;
         let mut segment_end = dns_data.len();
 
@@ -927,11 +925,8 @@ impl DnsProcessor {
                         resume_position = Some(position + 2);
                     }
 
-                    jump_count += 1;
-                    if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err("DNS compression pointer loop");
-                    }
-
+                    // Every pointer strictly decreases this boundary, so traversal is
+                    // finite without rejecting valid chains after an arbitrary hop count.
                     segment_end = segment_start;
                     segment_start = offset;
                     position = offset;
@@ -959,7 +954,6 @@ impl DnsProcessor {
         let mut position = *cursor;
         let mut resume_position = None;
         let mut wrote_label = false;
-        let mut jump_count = 0;
         let mut expanded_wire_len = 1_usize;
         let mut oversized = false;
         let mut segment_start = position;
@@ -1004,11 +998,7 @@ impl DnsProcessor {
                         resume_position = Some(position + 2);
                     }
 
-                    jump_count += 1;
-                    if jump_count > DNS_COMPRESSION_JUMP_LIMIT {
-                        return Err(DnsQuestionDecodeError::Invalid);
-                    }
-
+                    // Strictly decreasing segment starts also bound pointer-only chains.
                     segment_end = segment_start;
                     segment_start = offset;
                     position = offset;
@@ -1732,6 +1722,7 @@ mod protocol_regression_tests {
     fn compression_rejects_overlapping_names_but_accepts_prior_questions() {
         let overlap = [4, b'a', b'b', 0xc0, 0, 0];
         assert!(DnsProcessor::read_wire_domain_name(&overlap, &mut 3).is_err());
+        assert!(DnsProcessor::skip_wire_domain_name(&overlap, &mut 3).is_err());
         assert!(Name::read(&mut BinDecoder::new(&overlap).clone(3)).is_err());
 
         let mut dns = question(0x0900, 1);
@@ -1743,6 +1734,57 @@ mod protocol_regression_tests {
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].name, records[1].name);
             assert_eq!(records[1].query_type, HickoryRecordType::AAAA);
+        }
+    }
+
+    #[test]
+    fn response_accepts_long_backward_compression_chains() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&33_u16.to_be_bytes());
+        let mut previous_owner = DNS_HEADER_LEN;
+        let mut last_owner = 0;
+        for index in 0..33_u8 {
+            last_owner = dns.len();
+            dns.extend_from_slice(&(0xc000 | previous_owner as u16).to_be_bytes());
+            // Distinct TXT records keep the complete response below 512 bytes.
+            dns.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, b'a' + index]);
+            previous_owner = last_owner;
+        }
+        assert_eq!(Message::from_vec(&dns).unwrap().answers.len(), 33);
+
+        for processor in processors() {
+            let records = processor
+                .process_packet_batch(&ipv4(&dns, true, 53000), 100)
+                .expect("valid response with 33 backward pointers");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].response_code.as_u16(), 0);
+        }
+        assert_eq!(
+            DnsProcessor::read_wire_domain_name(&dns, &mut last_owner)
+                .unwrap()
+                .as_str(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn compression_walkers_reject_cycles_and_truncation() {
+        for (case, bytes, offset) in [
+            ("self pointer", &[0xc0, 0][..], 0),
+            ("pointer cycle", &[0xc0, 2, 0xc0, 0][..], 2),
+            ("truncated pointer", &[0xc0][..], 0),
+            ("truncated label", &[2, b'a'][..], 0),
+        ] {
+            let mut read_cursor = offset;
+            assert!(
+                DnsProcessor::read_wire_domain_name(bytes, &mut read_cursor).is_err(),
+                "{case}"
+            );
+            let mut skip_cursor = offset;
+            assert!(
+                DnsProcessor::skip_wire_domain_name(bytes, &mut skip_cursor).is_err(),
+                "{case}"
+            );
         }
     }
 
