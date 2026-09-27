@@ -4,6 +4,21 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild (for example v0.4.0)
+        required: true
+        type: string
+      runner:
+        description: Release platform to rebuild
+        required: true
+        type: choice
+        default: ubuntu-22.04
+        options:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
 
 permissions:
   contents: write
@@ -13,28 +28,36 @@ env:
 
 jobs:
   build-ubuntu:
-    name: Build on ${{ matrix.os_label }}
+    name: Build on ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      ARTIFACT_SUFFIX: ${{ fromJSON('{"ubuntu-22.04":"ubuntu_22.04_x86_64","ubuntu-24.04":"ubuntu_24.04_x86_64","ubuntu-24.04-arm":"ubuntu_24.04_arm64"}')[matrix.runner] }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-22.04
-            os_label: Ubuntu 22.04 x86_64
-            artifact_suffix: ubuntu_22.04_x86_64
-          - runner: ubuntu-24.04 
-            os_label: Ubuntu 24.04 x86_64
-            artifact_suffix: ubuntu_24.04_x86_64
-          - runner: ubuntu-24.04-arm
-            os_label: Ubuntu 24.04 arm64
-            rust_target: aarch64-unknown-linux-gnu
-            artifact_suffix: ubuntu_24.04_arm64
+        runner: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.runner) || '["ubuntu-22.04","ubuntu-24.04","ubuntu-24.04-arm"]') }}
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a release tag such as v0.4.0" >&2
+            exit 1
+          fi
 
-      - name: Install PCAP lib (only on Linux)
-        run: sudo apt-get install -y libpcap-dev
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Show source revision
+        run: git rev-parse HEAD
+
+      - name: Install libpcap development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
 
       - name: Set up Rust 1.98.1
         uses: dtolnay/rust-toolchain@1.98.1
@@ -45,15 +68,18 @@ jobs:
           echo "PACKAGE_VERSION=$(cargo pkgid | cut -d# -f2 | cut -d: -f2 | sed 's/\./_/g')" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --verbose
+        run: cargo build --release --locked --verbose
 
       - name: Create tar.bz2 archive
         run: |
-          tar -cjf dpp_${PACKAGE_VERSION}_${{ matrix.artifact_suffix }}.tar.bz2 -C target/release dpp
+          tar -cjf "dpp_${PACKAGE_VERSION}_${ARTIFACT_SUFFIX}.tar.bz2" -C target/release dpp
 
       - name: Upload Linux binary to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: "dpp_${{ env.PACKAGE_VERSION }}_${{ matrix.artifact_suffix }}.tar.bz2"
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: "dpp_${{ env.PACKAGE_VERSION }}_${{ env.ARTIFACT_SUFFIX }}.tar.bz2"
+          fail_on_unmatched_files: true
+          overwrite_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
