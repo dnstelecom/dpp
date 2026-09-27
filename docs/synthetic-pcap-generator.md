@@ -73,6 +73,12 @@ cargo run -p dns-catalog-builder --release -- \
   --top 10000
 ```
 
+The catalog builder writes and syncs a separate temporary file beside the destination before
+replacing the output. Concurrent builds targeting the same path cannot truncate each other's
+temporary files; the last successful replacement supplies the complete catalog. Ordinary I/O
+errors preserve the previous output and trigger best-effort removal of that build's temporary
+file. A process crash or a filesystem cleanup error can leave a temporary file behind.
+
 The generator loads `fitted-generator.toml` from `--profile-dir`, verifies the referenced
 `catalog_data.tsv` digest, and then uses the artifact directory as the runtime source of truth.
 The checked-in `server1-jul-2024` profile points its `catalog_path` at the workspace-level
