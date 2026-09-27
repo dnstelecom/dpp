@@ -709,6 +709,9 @@ impl Ipv4FragmentReassembler {
     }
 
     fn expire_key_at(&mut self, key: &FragmentKey, timestamp: i64, output: &mut PacketBatch) {
+        if !self.monotonic_capture {
+            return;
+        }
         let expired = self.pending.get(key).is_some_and(|entry| {
             timestamp.saturating_sub(entry.first_seen_timestamp) > self.timeout_micros
         });
@@ -1221,6 +1224,47 @@ mod tests {
         );
         assert_eq!(pending, Some(201));
         assert!(reassembler.finish().is_empty());
+    }
+
+    #[test]
+    fn fragment_expiration_requires_monotonic_capture() {
+        for monotonic_capture in [false, true] {
+            for final_first in [false, true] {
+                let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, monotonic_capture);
+                let (first_ordinal, final_ordinal) = if final_first { (2, 1) } else { (1, 2) };
+                let first_timestamp = 1_100_000 + (first_ordinal as i64 - 1) * 1_300_000;
+                let final_timestamp = 1_100_000 + (final_ordinal as i64 - 1) * 1_300_000;
+                let first = packet(0, true, first_ordinal, first_timestamp);
+                let final_fragment = packet(24, false, final_ordinal, final_timestamp);
+                let input = if final_first {
+                    vec![final_fragment, first]
+                } else {
+                    vec![first, final_fragment]
+                };
+
+                let (mut output, pending) = reassembler.process_batch(input);
+                assert_eq!(
+                    pending,
+                    monotonic_capture.then_some(2_400_000),
+                    "monotonic_capture={monotonic_capture}, final_first={final_first}"
+                );
+                output.extend(reassembler.finish());
+                assert_eq!(output.len(), 1);
+                if monotonic_capture {
+                    // Expiration retains only the first-fragment fallback in either order.
+                    assert_eq!(output[0].timestamp_micros, first_timestamp);
+                    assert_eq!(&output[0].data[20..22], &MORE_FRAGMENTS.to_be_bytes());
+                } else {
+                    assert_eq!(output[0].timestamp_micros, final_timestamp);
+                    assert_eq!(output[0].packet_ordinal, final_ordinal);
+                    assert_eq!(&output[0].data[20..22], &[0, 0]);
+                    assert_eq!(
+                        output[0].data.len(),
+                        ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 40
+                    );
+                }
+            }
+        }
     }
 
     #[test]

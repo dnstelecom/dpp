@@ -179,7 +179,9 @@ or second encoding of canonical addresses and ports.
   existing UDP/DNS validation path only after the first and last fragments establish its bounds
   and every byte is present. Incomplete responses may use the first-fragment inference on capacity
   eviction or end of input; with monotonic capture, entries can also expire after the match
-  timeout. Fragmented queries require a complete datagram. A complete datagram
+  timeout. Without monotonic capture, timestamp gaps between fragments of the same datagram
+  do not expire it; capacity limits and end of input still bound its lifetime.
+  Fragmented queries require a complete datagram. A complete datagram
   uses the final fragment's (`MF=0`) capture timestamp, while inferred responses use the first
   fragment's timestamp. The reassembler retains a bounded history of completed datagrams and
   compares the fragment key and UDP payload bytes before suppressing repeated complete datagrams
