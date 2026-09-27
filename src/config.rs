@@ -17,6 +17,9 @@ pub(crate) const PACKET_BATCH_SIZE: usize = 65_536;
 /// Default DNS match timeout, expressed in milliseconds.
 pub(crate) const DEFAULT_MATCH_TIMEOUT_MS: u64 = 1_200;
 
+/// Default maximum number of compression-pointer jumps in one DNS name.
+pub(crate) const DEFAULT_MAX_DNS_COMPRESSION_JUMPS: usize = 32;
+
 /// Maximum supported DNS match timeout, expressed in milliseconds.
 pub(crate) const MAX_MATCH_TIMEOUT_MS: u64 = 5_000;
 
@@ -166,6 +169,7 @@ pub(crate) struct AppConfig {
     pub(crate) bonded: usize,
     pub(crate) anonymize: Option<PathBuf>,
     pub(crate) dns_wire_fast_path: bool,
+    pub(crate) max_dns_compression_jumps: usize,
     pub(crate) allow_fragments: bool,
     pub(crate) full_fragments: bool,
 }
@@ -288,6 +292,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         }

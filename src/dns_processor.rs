@@ -7,6 +7,7 @@
 
 mod anonymizer;
 mod matcher;
+mod name_decoder;
 mod parser;
 mod pipeline;
 mod reassembly;
@@ -16,6 +17,7 @@ mod types;
 
 #[cfg(test)]
 use crate::config::DEFAULT_MATCH_TIMEOUT_MS;
+use crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS;
 pub(crate) use pipeline::{PipelineExecutionConfig, ProcessingCounters};
 use std::io;
 use std::net::IpAddr;
@@ -24,6 +26,7 @@ use std::path::Path;
 pub struct DnsProcessor {
     anonymizer: anonymizer::Anonymizer,
     dns_wire_fast_path: bool,
+    max_dns_compression_jumps: usize,
     match_timeout_micros: i64,
     monotonic_capture: bool,
     allow_fragments: bool,
@@ -66,6 +69,7 @@ impl DnsProcessor {
         Ok(DnsProcessor {
             anonymizer: anonymizer::Anonymizer::new(anonymize_key_path)?,
             dns_wire_fast_path,
+            max_dns_compression_jumps: DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             match_timeout_micros,
             monotonic_capture,
             allow_fragments: false,
@@ -75,6 +79,11 @@ impl DnsProcessor {
 
     pub fn with_allow_fragments(mut self, allow_fragments: bool) -> Self {
         self.allow_fragments = allow_fragments;
+        self
+    }
+
+    pub fn with_max_dns_compression_jumps(mut self, limit: usize) -> Self {
+        self.max_dns_compression_jumps = limit;
         self
     }
 

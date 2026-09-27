@@ -220,8 +220,25 @@ or second encoding of canonical addresses and ports.
   `--dns-wire-fast-path` may enable a custom question-only wire fast path, but `hickory` remains
   the semantic fallback for rare DNS messages that the fast path does not accept. Compression
   pointers must target prior, nonoverlapping names; enabling the fast path must not weaken that
-  validation. Both wire-name walkers bound traversal by strictly decreasing pointer targets,
-  allowing valid chains longer than 32 pointers while rejecting cycles and overlaps.
+  validation. `--max-dns-compression-jumps` (environment: `DPP_MAX_DNS_COMPRESSION_JUMPS`)
+  limits each decoded name to 32 pointer transitions by default; `0` disables this resource
+  limit. The limit applies to questions, scanned RR owners and TSIG algorithm names in both
+  decoder modes, including partial responses and fast-path fallback. A cached suffix contributes
+  its full pointer depth to this limit. Even when unlimited, strictly backward, nonoverlapping
+  segments prevent cycles. This is a resource policy, not a claim that longer chains violate DNS.
+  One immutable-message name decoder caches fully validated pointer targets and their encoded
+  segment end, expanded wire length, pointer depth and first label. Every cache hit rechecks the
+  segment end against the current name's start so a previously valid target cannot authorize an
+  overlap. Only referenced suffixes are retained; ordinary flat record lists do not grow the cache
+  per record. RR/TSIG name skipping validates short walks directly (up to eight jumps and 64
+  literal bytes per referenced segment), switching to the shared cached walker when either
+  threshold or the configured jump limit would be exceeded. These thresholds choose a cheaper
+  validation strategy; they never relax the limit or accept an otherwise invalid name.
+  Small caches and traversal stacks use inline storage; larger ones allocate within
+  the message and are bounded by the 14-bit pointer address space. Label materialization skips
+  pointer-only segments. Compressed questions are passed to Hickory already expanded, avoiding
+  a second recursive traversal without replacing Hickory's question semantics. Literal-root
+  validation for OPT remains distinct from a compressed name that expands to root.
   For ordinary QUERY messages (OPCODE 0), more than one question is rejected under
   RFC 9619. A complete response cannot claim answer or authority records that are absent from its DNS
   payload, whether or not it has additional records. TSIG status extraction consumes and

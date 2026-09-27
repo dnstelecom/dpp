@@ -387,6 +387,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };
@@ -427,6 +428,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };
@@ -467,6 +469,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };
@@ -509,6 +512,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };
@@ -550,6 +554,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };
@@ -616,6 +621,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         };

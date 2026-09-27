@@ -7,6 +7,7 @@
 
 use hickory_proto::ProtoError;
 use hickory_proto::op::Header;
+#[cfg(test)]
 use hickory_proto::op::Message;
 use hickory_proto::op::Query;
 use hickory_proto::op::ResponseCode as HickoryResponseCode;
@@ -16,6 +17,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, DecodeError};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::DnsProcessor;
+use super::name_decoder::DnsNameDecoder;
 use super::types::{ProcessedDnsRecord, VlanContext};
 use crate::custom_types::{DnsNameBuf, DnsNameTooLong, ProtoResponseCode};
 
@@ -42,9 +44,6 @@ const IPV4_DONT_FRAGMENT: u16 = 0x4000;
 const IPV4_RESERVED_FLAG: u16 = 0x8000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 const DNS_PORT: u16 = 53;
-const DNS_POINTER_MASK: u8 = 0b1100_0000;
-const DNS_POINTER_TAG: u8 = 0b1100_0000;
-const DNS_LABEL_LEN_MASK: u8 = 0b0011_1111;
 const DNS_RESOURCE_RECORD_FIXED_LEN: usize = 10;
 const DNS_OPT_RECORD_TYPE: u16 = 41;
 const DNS_TSIG_RECORD_TYPE: u16 = 250;
@@ -452,15 +451,18 @@ impl DnsProcessor {
         decode_extended_rcode: bool,
         partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
+        let mut names = DnsNameDecoder::new(dns_data, self.max_dns_compression_jumps);
         if self.dns_wire_fast_path {
             Self::decode_dns_questions_fast(
                 dns_data,
+                &mut names,
                 decode_extended_rcode,
                 partial_first_ipv4_fragment,
             )
             .or_else(|_| {
                 Self::decode_dns_questions_hickory(
                     dns_data,
+                    &mut names,
                     decode_extended_rcode,
                     partial_first_ipv4_fragment,
                 )
@@ -468,6 +470,7 @@ impl DnsProcessor {
         } else {
             Self::decode_dns_questions_hickory(
                 dns_data,
+                &mut names,
                 decode_extended_rcode,
                 partial_first_ipv4_fragment,
             )
@@ -489,8 +492,15 @@ impl DnsProcessor {
         opcode == 0 && query_count > 1
     }
 
+    fn question_capacity(dns_len: usize, count: usize) -> usize {
+        // Even a root question occupies five bytes. An untrusted count alone
+        // must not reserve tens of MiB for presentation-form names.
+        count.min(dns_len.saturating_sub(DNS_HEADER_LEN) / 5)
+    }
+
     fn decode_dns_questions_fast(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         decode_extended_rcode: bool,
         partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
@@ -512,9 +522,9 @@ impl DnsProcessor {
         }
 
         let mut cursor = DNS_HEADER_LEN;
-        let mut queries = Vec::with_capacity(query_count);
+        let mut queries = Vec::with_capacity(Self::question_capacity(dns_data.len(), query_count));
         for _ in 0..query_count {
-            let name = Self::read_wire_domain_name(dns_data, &mut cursor)?;
+            let name = Self::read_wire_domain_name(names, &mut cursor)?;
             let query_type = HickoryRecordType::from(Self::parse_u16_at(
                 dns_data,
                 cursor,
@@ -554,6 +564,7 @@ impl DnsProcessor {
             if partial_first_ipv4_fragment {
                 partial_response_code = Self::decode_partial_response_code_with_sections(
                     dns_data,
+                    names,
                     cursor,
                     section_counts,
                     low_response_code,
@@ -564,6 +575,7 @@ impl DnsProcessor {
             {
                 response_code = Self::decode_response_code_with_sections(
                     dns_data,
+                    names,
                     cursor,
                     section_counts,
                     low_response_code,
@@ -582,6 +594,7 @@ impl DnsProcessor {
 
     fn decode_dns_questions_hickory(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         decode_extended_rcode: bool,
         partial_first_ipv4_fragment: bool,
     ) -> Result<(DecodedDnsHeader, Vec<DecodedDnsQuestion>), DnsQuestionDecodeError> {
@@ -591,8 +604,20 @@ impl DnsProcessor {
         if Self::invalid_question_count(opcode, header.counts.queries as usize) {
             return Err(DnsQuestionDecodeError::Invalid);
         }
-        let queries = Message::read_queries(&mut decoder, header.counts.queries as usize)
-            .map_err(Self::classify_hickory_question_error)?;
+        let mut cursor = decoder.index();
+        let mut queries = Vec::with_capacity(Self::question_capacity(
+            dns_data.len(),
+            header.counts.queries as usize,
+        ));
+        for _ in 0..header.counts.queries {
+            let query = Self::read_hickory_question(dns_data, names, &mut cursor)?;
+            queries.push(DecodedDnsQuestion {
+                name: Self::format_domain_name(query.name())
+                    .map_err(|_| DnsQuestionDecodeError::Invalid)?,
+                query_type: query.query_type(),
+                query_class: query.query_class().into(),
+            });
+        }
         let mut response_code = ProtoResponseCode::from(header.response_code);
         let mut partial_response_code = None;
         if decode_extended_rcode {
@@ -604,7 +629,8 @@ impl DnsProcessor {
             if partial_first_ipv4_fragment {
                 partial_response_code = Self::decode_partial_response_code_with_sections(
                     dns_data,
-                    decoder.index(),
+                    names,
+                    cursor,
                     section_counts,
                     header.response_code.low(),
                 )?;
@@ -614,7 +640,8 @@ impl DnsProcessor {
             {
                 response_code = Self::decode_response_code_with_sections(
                     dns_data,
-                    decoder.index(),
+                    names,
+                    cursor,
                     section_counts,
                     header.response_code.low(),
                 )?;
@@ -628,22 +655,13 @@ impl DnsProcessor {
                 response_code,
                 partial_response_code,
             },
-            queries
-                .into_iter()
-                .map(|query: Query| {
-                    Ok(DecodedDnsQuestion {
-                        name: Self::format_domain_name(query.name())
-                            .map_err(|_| DnsQuestionDecodeError::Invalid)?,
-                        query_type: query.query_type(),
-                        query_class: query.query_class().into(),
-                    })
-                })
-                .collect::<Result<Vec<_>, DnsQuestionDecodeError>>()?,
+            queries,
         ))
     }
 
     fn decode_response_code_with_sections(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         mut cursor: usize,
         section_counts: DnsSectionCounts,
         low_response_code: u8,
@@ -651,10 +669,23 @@ impl DnsProcessor {
         let response_code =
             ProtoResponseCode::from(HickoryResponseCode::from(0, low_response_code));
 
-        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.answers, true)?;
-        Self::skip_dns_resource_records(dns_data, &mut cursor, section_counts.authorities, true)?;
+        Self::skip_dns_resource_records(
+            dns_data,
+            names,
+            &mut cursor,
+            section_counts.answers,
+            true,
+        )?;
+        Self::skip_dns_resource_records(
+            dns_data,
+            names,
+            &mut cursor,
+            section_counts.authorities,
+            true,
+        )?;
         let additional_fields = Self::read_additional_response_code_fields(
             dns_data,
+            names,
             &mut cursor,
             section_counts.additionals,
         )?;
@@ -677,6 +708,7 @@ impl DnsProcessor {
 
     fn decode_partial_response_code_with_sections(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: usize,
         section_counts: DnsSectionCounts,
         low_response_code: u8,
@@ -687,7 +719,7 @@ impl DnsProcessor {
             section_counts.answers + section_counts.authorities + section_counts.additionals;
         let mut additional_fields = AdditionalResponseCodeFields::default();
         for index in 0..record_count {
-            match Self::read_dns_resource_record_meta(dns_data, &mut boundary_cursor) {
+            match Self::read_dns_resource_record_meta(dns_data, names, &mut boundary_cursor) {
                 Ok(meta) => {
                     if index < section_counts.answers + section_counts.authorities {
                         if meta.record_type == DNS_OPT_RECORD_TYPE {
@@ -698,6 +730,7 @@ impl DnsProcessor {
                             index - section_counts.answers - section_counts.authorities;
                         Self::include_additional_response_code_fields(
                             dns_data,
+                            names,
                             &mut additional_fields,
                             &meta,
                             additional_index,
@@ -719,6 +752,7 @@ impl DnsProcessor {
         // context, including OPT and TSIG, using the same validation as full datagrams.
         Self::decode_response_code_with_sections(
             dns_data,
+            names,
             cursor,
             section_counts,
             low_response_code,
@@ -739,12 +773,13 @@ impl DnsProcessor {
 
     fn skip_dns_resource_records(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         count: usize,
         reject_opt: bool,
     ) -> Result<(), &'static str> {
         for _ in 0..count {
-            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
+            let meta = Self::read_dns_resource_record_meta(dns_data, names, cursor)?;
             if reject_opt && meta.record_type == DNS_OPT_RECORD_TYPE {
                 return Err("OPT record outside additional section");
             }
@@ -755,14 +790,16 @@ impl DnsProcessor {
 
     fn read_additional_response_code_fields(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         additional_count: usize,
     ) -> Result<AdditionalResponseCodeFields, &'static str> {
         let mut fields = AdditionalResponseCodeFields::default();
         for index in 0..additional_count {
-            let meta = Self::read_dns_resource_record_meta(dns_data, cursor)?;
+            let meta = Self::read_dns_resource_record_meta(dns_data, names, cursor)?;
             Self::include_additional_response_code_fields(
                 dns_data,
+                names,
                 &mut fields,
                 &meta,
                 index,
@@ -775,6 +812,7 @@ impl DnsProcessor {
 
     fn include_additional_response_code_fields(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         fields: &mut AdditionalResponseCodeFields,
         meta: &DnsResourceRecordMeta,
         index: usize,
@@ -797,18 +835,22 @@ impl DnsProcessor {
                 if index + 1 != additional_count {
                     return Err("TSIG record must be last additional");
                 }
-                fields.tsig_error = Some(Self::read_tsig_error(dns_data, meta)?);
+                fields.tsig_error = Some(Self::read_tsig_error(dns_data, names, meta)?);
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn read_tsig_error(dns_data: &[u8], meta: &DnsResourceRecordMeta) -> Result<u16, &'static str> {
+    fn read_tsig_error(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        meta: &DnsResourceRecordMeta,
+    ) -> Result<u16, &'static str> {
         let mut cursor = meta.rdata_start;
         let rdata_end = meta.rdata_end;
 
-        Self::skip_wire_domain_name_in_range(dns_data, &mut cursor, rdata_end)?;
+        Self::skip_wire_domain_name_in_range(names, &mut cursor, rdata_end)?;
         Self::skip_bytes_in_range(&mut cursor, rdata_end, 6 + 2)?;
         let mac_size = usize::from(Self::parse_u16_at(
             dns_data,
@@ -835,9 +877,10 @@ impl DnsProcessor {
 
     fn read_dns_resource_record_meta(
         dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
     ) -> Result<DnsResourceRecordMeta, &'static str> {
-        let owner_is_root = Self::skip_wire_domain_name(dns_data, cursor)?;
+        let owner_is_root = names.skip(cursor)?;
         let fixed_start = *cursor;
         let fixed_end = fixed_start
             .checked_add(DNS_RESOURCE_RECORD_FIXED_LEN)
@@ -866,7 +909,7 @@ impl DnsProcessor {
     }
 
     fn skip_wire_domain_name_in_range(
-        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
         limit: usize,
     ) -> Result<(), &'static str> {
@@ -874,7 +917,7 @@ impl DnsProcessor {
             return Err("DNS name truncated");
         }
 
-        Self::skip_wire_domain_name(dns_data, cursor)?;
+        names.skip(cursor)?;
         if *cursor > limit {
             return Err("DNS name truncated");
         }
@@ -895,148 +938,67 @@ impl DnsProcessor {
         Ok(())
     }
 
-    fn skip_wire_domain_name(dns_data: &[u8], cursor: &mut usize) -> Result<bool, &'static str> {
-        let start = *cursor;
-        let mut position = *cursor;
-        let mut resume_position = None;
-        let mut segment_start = position;
-        let mut segment_end = dns_data.len();
-
-        loop {
-            let length = *dns_data
-                .get(..segment_end)
-                .and_then(|segment| segment.get(position))
-                .ok_or("DNS name truncated")?;
-
-            match length {
-                0 => {
-                    position += 1;
-                    *cursor = resume_position.unwrap_or(position);
-                    return Ok(resume_position.is_none() && position == start + 1);
-                }
-                _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
-                    let next = *dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1))
-                        .ok_or("DNS compression pointer truncated")?;
-                    let offset =
-                        (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
-
-                    if offset >= segment_start {
-                        return Err("DNS compression pointer is not prior to name");
-                    }
-
-                    if resume_position.is_none() {
-                        resume_position = Some(position + 2);
-                    }
-
-                    // Every pointer strictly decreases this boundary, so traversal is
-                    // finite without rejecting valid chains after an arbitrary hop count.
-                    segment_end = segment_start;
-                    segment_start = offset;
-                    position = offset;
-                }
-                _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err("Unsupported DNS label encoding");
-                }
-                _ => {
-                    let label_len = usize::from(length);
-                    dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
-                        .ok_or("DNS label truncated")?;
-                    position += 1 + label_len;
-                }
-            }
-        }
-    }
-
     fn read_wire_domain_name(
-        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
         cursor: &mut usize,
     ) -> Result<DnsNameBuf, DnsQuestionDecodeError> {
         let mut output = DnsNameBuf::default();
-        let mut position = *cursor;
-        let mut resume_position = None;
-        let mut wrote_label = false;
-        let mut expanded_wire_len = 1_usize;
-        let mut oversized = false;
-        let mut segment_start = position;
-        let mut segment_end = dns_data.len();
-
-        loop {
-            let length = *dns_data
-                .get(..segment_end)
-                .and_then(|segment| segment.get(position))
-                .ok_or("DNS name truncated")?;
-
-            match length {
-                0 => {
-                    position += 1;
-                    if oversized {
-                        return Err(DnsQuestionDecodeError::OversizedQname);
-                    }
-                    if !wrote_label {
-                        output
-                            .try_push('.')
-                            .map_err(|_| DnsQuestionDecodeError::Invalid)?;
-                    }
-
-                    *cursor = resume_position.unwrap_or(position);
-                    return Ok(output);
+        let mut presentation_valid = true;
+        let name = names.read_with_labels(cursor, |label| {
+            if presentation_valid {
+                if !output.as_str().is_empty() {
+                    presentation_valid = output.try_push('.').is_ok();
                 }
-                _ if (length & DNS_POINTER_MASK) == DNS_POINTER_TAG => {
-                    let next = *dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1))
-                        .ok_or("DNS compression pointer truncated")?;
-                    let offset =
-                        (((length & DNS_LABEL_LEN_MASK) as usize) << 8) | usize::from(next);
-
-                    // Each pointer must refer to an earlier, nonoverlapping name,
-                    // matching Hickory's question decoder (RFC 1035 section 4.1.4).
-                    if offset >= segment_start {
-                        return Err(DnsQuestionDecodeError::Invalid);
-                    }
-
-                    if resume_position.is_none() {
-                        resume_position = Some(position + 2);
-                    }
-
-                    // Strictly decreasing segment starts also bound pointer-only chains.
-                    segment_end = segment_start;
-                    segment_start = offset;
-                    position = offset;
-                }
-                _ if (length & DNS_POINTER_MASK) != 0 => {
-                    return Err(DnsQuestionDecodeError::Invalid);
-                }
-                _ => {
-                    let label_len = usize::from(length);
-                    let label = dns_data
-                        .get(..segment_end)
-                        .and_then(|segment| segment.get(position + 1..position + 1 + label_len))
-                        .ok_or("DNS label truncated")?;
-
-                    expanded_wire_len = expanded_wire_len.saturating_add(1 + label_len);
-                    oversized |= expanded_wire_len > Name::MAX_LENGTH;
-
-                    if !oversized {
-                        if wrote_label {
-                            output
-                                .try_push('.')
-                                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
-                        }
-                        if !Self::write_label_ascii(label, &mut output) {
-                            return Err(DnsQuestionDecodeError::Invalid);
-                        }
-                    }
-
-                    wrote_label = true;
-                    position += 1 + label_len;
-                }
+                presentation_valid &= Self::write_label_ascii(label, &mut output);
             }
+        })?;
+        if name.expanded_wire_len > Name::MAX_LENGTH {
+            return Err(DnsQuestionDecodeError::OversizedQname);
         }
+        if !presentation_valid {
+            return Err(DnsQuestionDecodeError::Invalid);
+        }
+        if output.as_str().is_empty() {
+            output
+                .try_push('.')
+                .map_err(|_| DnsQuestionDecodeError::Invalid)?;
+        }
+        Ok(output)
+    }
+
+    fn read_hickory_question(
+        dns_data: &[u8],
+        names: &mut DnsNameDecoder<'_>,
+        cursor: &mut usize,
+    ) -> Result<Query, DnsQuestionDecodeError> {
+        let start = *cursor;
+        let name = names.read(cursor)?;
+        if name.expanded_wire_len > Name::MAX_LENGTH {
+            return Err(DnsQuestionDecodeError::OversizedQname);
+        }
+        let fields = dns_data
+            .get(*cursor..*cursor + 4)
+            .ok_or("DNS question truncated")?;
+        *cursor += 4;
+        if name.jumps == 0 {
+            return Query::read(&mut BinDecoder::new(&dns_data[start..*cursor]))
+                .map_err(|error| Self::classify_hickory_question_error(error.into()));
+        }
+
+        // Hickory keeps semantic ownership of questions, but never recursively
+        // follows the original chain again. The validated name fits on the stack.
+        let mut expanded = [0_u8; Name::MAX_LENGTH + 4];
+        let mut end = 0;
+        for label in names.labels(name) {
+            expanded[end] = label.len() as u8;
+            end += 1;
+            expanded[end..end + label.len()].copy_from_slice(label);
+            end += label.len();
+        }
+        end += 1; // terminating root, already zeroed
+        expanded[end..end + 4].copy_from_slice(fields);
+        Query::read(&mut BinDecoder::new(&expanded[..end + 4]))
+            .map_err(|error| Self::classify_hickory_question_error(error.into()))
     }
 
     #[inline]
@@ -1735,8 +1697,11 @@ mod protocol_regression_tests {
     #[test]
     fn compression_rejects_overlapping_names_but_accepts_prior_questions() {
         let overlap = [4, b'a', b'b', 0xc0, 0, 0];
-        assert!(DnsProcessor::read_wire_domain_name(&overlap, &mut 3).is_err());
-        assert!(DnsProcessor::skip_wire_domain_name(&overlap, &mut 3).is_err());
+        assert!(
+            DnsProcessor::read_wire_domain_name(&mut DnsNameDecoder::new(&overlap, 0), &mut 3)
+                .is_err()
+        );
+        assert!(DnsNameDecoder::new(&overlap, 0).skip(&mut 3).is_err());
         assert!(Name::read(&mut BinDecoder::new(&overlap).clone(3)).is_err());
 
         let mut dns = question(0x0900, 1);
@@ -1751,34 +1716,150 @@ mod protocol_regression_tests {
         }
     }
 
-    #[test]
-    fn response_accepts_long_backward_compression_chains() {
+    fn response_with_compression_chain(count: u16) -> (Vec<u8>, usize) {
         let mut dns = question(0x8180, 1);
-        dns[6..8].copy_from_slice(&33_u16.to_be_bytes());
+        dns[6..8].copy_from_slice(&count.to_be_bytes());
         let mut previous_owner = DNS_HEADER_LEN;
         let mut last_owner = 0;
-        for index in 0..33_u8 {
+        for index in 0..count {
             last_owner = dns.len();
             dns.extend_from_slice(&(0xc000 | previous_owner as u16).to_be_bytes());
-            // Distinct TXT records keep the complete response below 512 bytes.
-            dns.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, b'a' + index]);
+            dns.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, index as u8]);
             previous_owner = last_owner;
         }
-        assert_eq!(Message::from_vec(&dns).unwrap().answers.len(), 33);
+        (dns, last_owner)
+    }
 
-        for processor in processors() {
-            let records = processor
-                .process_packet_batch(&ipv4(&dns, true, 53000), 100)
-                .expect("valid response with 33 backward pointers");
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].response_code.as_u16(), 0);
+    #[test]
+    fn compression_limit_counts_cached_suffixes_in_both_decoders() {
+        for count in [1, 2, 32, 33, 256] {
+            let (dns, _) = response_with_compression_chain(count);
+            if count == 33 {
+                assert_eq!(Message::from_vec(&dns).unwrap().answers.len(), 33);
+            }
+            for limit in [1, 32, 33, 0] {
+                for processor in processors() {
+                    let fast = processor.dns_wire_fast_path;
+                    let result = processor
+                        .with_max_dns_compression_jumps(limit)
+                        .process_packet_batch(&ipv4(&dns, true, 53000), 100);
+                    assert_eq!(
+                        result.is_some(),
+                        limit == 0 || usize::from(count) <= limit,
+                        "depth={count}, limit={limit}, fast={fast}"
+                    );
+                }
+            }
         }
-        assert_eq!(
-            DnsProcessor::read_wire_domain_name(&dns, &mut last_owner)
-                .unwrap()
-                .as_str(),
-            "example.com"
-        );
+        let (dns, _) = response_with_compression_chain(33);
+        for processor in processors() {
+            assert!(
+                processor
+                    .process_packet_batch(&ipv4(&dns, true, 53000), 100)
+                    .is_none(),
+                "default limit must be 32, including after fast-path fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_limit_applies_to_questions_and_unlimited_avoids_recursive_decoding() {
+        for count in [32, 33, 2700] {
+            let mut dns = question(0x0900, 1); // IQUERY permits multiple questions.
+            dns[4..6].copy_from_slice(&(count + 1_u16).to_be_bytes());
+            let mut previous = DNS_HEADER_LEN;
+            for _ in 0..count {
+                let current = dns.len();
+                dns.extend_from_slice(&(0xc000 | previous as u16).to_be_bytes());
+                dns.extend_from_slice(&[0, 1, 0, 1]);
+                previous = current;
+            }
+            for limit in [32, 0] {
+                for processor in processors() {
+                    let result = processor
+                        .with_max_dns_compression_jumps(limit)
+                        .process_packet_batch(&ipv4(&dns, false, 53000), 0);
+                    assert_eq!(result.is_some(), limit == 0 || count <= 32);
+                    if let Some(records) = result {
+                        assert_eq!(records.len(), usize::from(count) + 1);
+                        assert!(
+                            records
+                                .iter()
+                                .all(|record| record.name.as_str() == "example.com")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compression_limit_applies_to_tsig_algorithm_and_partial_responses() {
+        let (mut dns, last_owner) = response_with_compression_chain(32);
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 18]);
+        dns.extend_from_slice(&(0xc000 | last_owner as u16).to_be_bytes());
+        dns.extend_from_slice(&[0; 12]); // time, fudge, MAC length and original ID
+        dns.extend_from_slice(&[0, 16, 0, 0]); // TSIG error and Other Data length
+        for limit in [32, 33, 0] {
+            for processor in processors() {
+                let result = processor
+                    .with_max_dns_compression_jumps(limit)
+                    .decode_dns_questions(&dns, true, false);
+                assert_eq!(result.is_ok(), limit != 32);
+                if let Ok((header, _)) = result {
+                    assert_eq!(header.response_code.as_u16(), 16);
+                }
+            }
+        }
+        let (mut partial, last_owner) = response_with_compression_chain(33);
+        partial.truncate(last_owner + 2); // complete owner, absent RR fields/data
+        for processor in processors() {
+            assert!(matches!(
+                processor.decode_dns_questions(&partial, true, true),
+                Err(DnsQuestionDecodeError::Invalid)
+            ));
+            let (header, _) = processor
+                .with_max_dns_compression_jumps(0)
+                .decode_dns_questions(&partial, true, true)
+                .unwrap();
+            assert_eq!(header.partial_response_code.unwrap().as_u16(), 0);
+        }
+    }
+
+    #[test]
+    fn cached_expanded_root_does_not_allow_compressed_opt_owner() {
+        let mut dns = encode_dns_header(0xbeef, 0x8180, 1);
+        dns[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        dns.extend_from_slice(&[0, 0, 1, 0, 1]); // root question
+        dns.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0]);
+        dns.extend_from_slice(&[0xc0, 12, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        for processor in processors() {
+            assert!(
+                processor
+                    .process_packet_batch(&ipv4(&dns, true, 53000), 0)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_compression_is_not_treated_as_an_incomplete_fragment() {
+        let mut dns = question(0x8180, 1);
+        dns[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        dns.extend_from_slice(&[0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 0, 0, 3]);
+        let target = dns.len();
+        dns.extend_from_slice(&[4, b'a', b'b']);
+        // The preceding bytes pretend to be a label crossing this owner's
+        // pointer. Those bytes are present; this is overlap, not missing data.
+        dns.extend_from_slice(&(0xc000 | target as u16).to_be_bytes());
+        for processor in processors() {
+            assert!(matches!(
+                processor.decode_dns_questions(&dns, true, true),
+                Err(DnsQuestionDecodeError::Invalid)
+            ));
+        }
     }
 
     #[test]
@@ -1791,12 +1872,18 @@ mod protocol_regression_tests {
         ] {
             let mut read_cursor = offset;
             assert!(
-                DnsProcessor::read_wire_domain_name(bytes, &mut read_cursor).is_err(),
+                DnsProcessor::read_wire_domain_name(
+                    &mut DnsNameDecoder::new(bytes, 0),
+                    &mut read_cursor
+                )
+                .is_err(),
                 "{case}"
             );
             let mut skip_cursor = offset;
             assert!(
-                DnsProcessor::skip_wire_domain_name(bytes, &mut skip_cursor).is_err(),
+                DnsNameDecoder::new(bytes, 0)
+                    .skip(&mut skip_cursor)
+                    .is_err(),
                 "{case}"
             );
         }

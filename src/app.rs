@@ -149,6 +149,14 @@ fn display_parser_mode(args: &AppConfig) {
     } else {
         info!("DNS wire fast path: disabled");
     }
+    if args.max_dns_compression_jumps == 0 {
+        info!("DNS compression-pointer jump limit: disabled");
+    } else {
+        info!(
+            "DNS compression-pointer jump limit: {} per name",
+            args.max_dns_compression_jumps
+        );
+    }
 }
 
 fn display_fragment_mode(args: &AppConfig) {
@@ -197,6 +205,7 @@ struct RunConfigSummary {
     match_timeout_ms: u64,
     monotonic_capture: bool,
     dns_wire_fast_path: bool,
+    max_dns_compression_jumps: usize,
     allow_fragments: bool,
     full_fragments: bool,
     anonymization_enabled: bool,
@@ -397,6 +406,7 @@ fn build_run_summary(
             match_timeout_ms: args.match_timeout_ms,
             monotonic_capture: args.monotonic_capture,
             dns_wire_fast_path: args.dns_wire_fast_path,
+            max_dns_compression_jumps: args.max_dns_compression_jumps,
             allow_fragments: args.allow_fragments,
             full_fragments: args.full_fragments,
             anonymization_enabled: args.anonymize_key_path().is_some(),
@@ -614,6 +624,7 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
             args.monotonic_capture,
         )
         .map_err(|source| AppRunError::DnsProcessorInit { source })?
+        .with_max_dns_compression_jumps(args.max_dns_compression_jumps)
         .with_allow_fragments(args.allow_fragments)
         .with_full_fragments(args.full_fragments),
     );
@@ -778,6 +789,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         }
@@ -997,6 +1009,7 @@ mod tests {
             bonded: 0,
             anonymize: None,
             dns_wire_fast_path: false,
+            max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
         }

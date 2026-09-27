@@ -6,8 +6,8 @@
  */
 
 use crate::config::{
-    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, InputSource, MAX_MATCH_TIMEOUT_MS, OutputFormat,
-    OutputTarget, ReportFormat, output_target_for_path,
+    AppConfig, DEFAULT_MATCH_TIMEOUT_MS, DEFAULT_MAX_DNS_COMPRESSION_JUMPS, InputSource,
+    MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget, ReportFormat, output_target_for_path,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -30,6 +30,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_v2 = parse_env_bool("DPP_V2");
     let env_affinity = parse_env_bool("DPP_AFFINITY");
     let env_dns_wire_fast_path = parse_env_bool("DPP_DNS_WIRE_FAST_PATH");
+    let env_max_dns_compression_jumps = env::var_os("DPP_MAX_DNS_COMPRESSION_JUMPS");
     let env_allow_fragments = parse_env_bool("DPP_ALLOW_FRAGMENTS");
     let env_full_fragments = parse_env_bool("DPP_FULL_FRAGMENTS");
     let env_monotonic_capture = parse_env_bool("DPP_MONOTONIC_CAPTURE");
@@ -70,6 +71,8 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let requested_threads = resolve_thread_limit(&matches, env_threads.as_deref())?;
 
     let bonded = resolve_bonded(&matches, env_bonded.as_deref())?;
+    let max_dns_compression_jumps =
+        resolve_max_dns_compression_jumps(&matches, env_max_dns_compression_jumps.as_deref())?;
 
     let output_filename = matches
         .get_one::<String>("output_filename")
@@ -110,6 +113,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         bonded,
         anonymize,
         dns_wire_fast_path,
+        max_dns_compression_jumps,
         allow_fragments,
         full_fragments,
     })
@@ -128,6 +132,8 @@ fn build_cli(version: &'static str) -> Command {
   DPP_AFFINITY          Set to 'true' to apply CPU affinity to processing threads
   DPP_DNS_WIRE_FAST_PATH
                         Set to 'true' to enable the optional question-only DNS wire fast path with hickory fallback
+  DPP_MAX_DNS_COMPRESSION_JUMPS
+                        Maximum compression-pointer jumps per DNS name; default is 32, 0 disables the limit (used if --max-dns-compression-jumps is not specified)
   DPP_ALLOW_FRAGMENTS   Set to 'true' to match queries with observable first IPv4 response fragments without reassembly
   DPP_FULL_FRAGMENTS    Set to 'true' to reassemble IPv4 fragments and enable first-fragment response matching
   DPP_MONOTONIC_CAPTURE
@@ -239,6 +245,14 @@ LICENSE INFORMATION:
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("max_dns_compression_jumps")
+                .long("max-dns-compression-jumps")
+                .help("Maximum compression-pointer jumps per DNS name (default: 32; 0 disables the limit)")
+                .value_name("N")
+                .num_args(1)
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
             Arg::new("allow_fragments")
                 .long("allow-fragments")
                 .help("Match queries with observable first IPv4 response fragments without reassembly; full UDP/DNS content remains unverified")
@@ -337,6 +351,29 @@ fn resolve_bonded(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<usi
             .parse::<usize>()
             .with_context(|| format!("Failed to parse DPP_BONDED from '{}'", value.display())),
         None => Ok(0),
+    }
+}
+
+fn resolve_max_dns_compression_jumps(
+    matches: &ArgMatches,
+    env_value: Option<&OsStr>,
+) -> Result<usize> {
+    if let Some(value) = matches.get_one::<usize>("max_dns_compression_jumps") {
+        return Ok(*value);
+    }
+
+    match env_value {
+        Some(value) => value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_MAX_DNS_COMPRESSION_JUMPS must contain valid UTF-8"))?
+            .parse::<usize>()
+            .with_context(|| {
+                format!(
+                    "Failed to parse DPP_MAX_DNS_COMPRESSION_JUMPS from '{}'",
+                    value.display()
+                )
+            }),
+        None => Ok(DEFAULT_MAX_DNS_COMPRESSION_JUMPS),
     }
 }
 
@@ -677,6 +714,71 @@ mod tests {
         let resolved = resolve_match_timeout_ms(&matches, None).expect("timeout resolves");
 
         assert_eq!(resolved, DEFAULT_MATCH_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn compression_jump_limit_defaults_to_32_and_accepts_zero() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_max_dns_compression_jumps(&defaults, None).unwrap(),
+            DEFAULT_MAX_DNS_COMPRESSION_JUMPS
+        );
+        assert_eq!(DEFAULT_MAX_DNS_COMPRESSION_JUMPS, 32);
+        for value in ["0", "64"] {
+            let expected = value.parse::<usize>().unwrap();
+            assert_eq!(
+                resolve_max_dns_compression_jumps(&defaults, Some(OsStr::new(value))).unwrap(),
+                expected
+            );
+            let cli = build_cli("test")
+                .try_get_matches_from(["dpp", "--max-dns-compression-jumps", value, "input.pcap"])
+                .expect("cli parses");
+            assert_eq!(
+                resolve_max_dns_compression_jumps(&cli, Some(OsStr::new("invalid"))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_compression_jump_limits_are_rejected() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for value in ["-1", "invalid", "184467440737095516160"] {
+            assert!(
+                build_cli("test")
+                    .try_get_matches_from([
+                        "dpp",
+                        &format!("--max-dns-compression-jumps={value}"),
+                        "input.pcap",
+                    ])
+                    .is_err()
+            );
+            assert!(resolve_max_dns_compression_jumps(&defaults, Some(OsStr::new(value))).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_compression_jump_env_is_rejected_unless_cli_overrides_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0xff]);
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_max_dns_compression_jumps(&defaults, Some(invalid)).is_err());
+
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--max-dns-compression-jumps", "0", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_max_dns_compression_jumps(&cli, Some(invalid)).unwrap(),
+            0
+        );
     }
 
     #[test]
