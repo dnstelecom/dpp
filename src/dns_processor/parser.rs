@@ -771,6 +771,9 @@ impl DnsProcessor {
         )
     }
 
+    // Inline the section loop together with the metadata reader so callers can
+    // keep the cursor local and discard unused RR fields in the hot scan.
+    #[inline(always)]
     fn skip_dns_resource_records(
         dns_data: &[u8],
         names: &mut DnsNameDecoder<'_>,
@@ -875,6 +878,8 @@ impl DnsProcessor {
         Ok(error)
     }
 
+    // Inlining lets answer/authority scans omit TTL and metadata materialization.
+    #[inline(always)]
     fn read_dns_resource_record_meta(
         dns_data: &[u8],
         names: &mut DnsNameDecoder<'_>,
