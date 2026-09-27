@@ -85,7 +85,10 @@ impl Old {
 mod candidate;
 #[inline(never)]
 fn old(data: &[u8], limit: usize) -> usize {
-    let count = u16::from_be_bytes([data[6], data[7]]);
+    let count: usize = [6, 8, 10]
+        .into_iter()
+        .map(|offset| usize::from(u16::from_be_bytes([data[offset], data[offset + 1]])))
+        .sum();
     let mut cursor = 12;
     black_box(Old::skip_wire_domain_name(data, &mut cursor, limit).unwrap());
     cursor += 4;
@@ -100,7 +103,10 @@ fn old(data: &[u8], limit: usize) -> usize {
 #[inline(never)]
 fn new(data: &[u8], limit: usize) -> usize {
     let mut decoder = candidate::DnsNameDecoder::new(data, limit);
-    let count = u16::from_be_bytes([data[6], data[7]]);
+    let count: usize = [6, 8, 10]
+        .into_iter()
+        .map(|offset| usize::from(u16::from_be_bytes([data[offset], data[offset + 1]])))
+        .sum();
     let mut cursor = 12;
     black_box(decoder.skip(&mut cursor).unwrap());
     cursor += 4;

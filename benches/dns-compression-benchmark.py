@@ -44,7 +44,11 @@ def dns_messages(case):
         qname = (b"\x14abcdefghijklmnopqrst" * 10) + b"\x00"
     question = qname + struct.pack("!HH", 16, 1)
     query = struct.pack("!6H", 0, 0x0100, 1, 0, 0, 0) + question
-    response = bytearray(struct.pack("!6H", 0, 0x8180, 1, count, 0, 0) + question)
+    answer_count = 0 if case in ("authority-eight", "additional-eight") else count
+    authority_count = count if case == "authority-eight" else 0
+    additional_count = count if case == "additional-eight" else 0
+    response = bytearray(struct.pack("!6H", 0, 0x8180, 1, answer_count,
+                                     authority_count, additional_count) + question)
     previous, depth = 12, 0
     max_depth = 0
     for index in range(count):
@@ -79,6 +83,8 @@ CASES = {
     "one": (1, "direct"),
     "two": (2, "direct"),
     "eight": (8, "direct"),
+    "authority-eight": (8, "direct"),
+    "additional-eight": (8, "direct"),
     "three-label-eight": (8, "direct"),
     "long-name-eight": (8, "direct"),
     "literal-eight": (8, "literal"),
