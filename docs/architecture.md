@@ -183,7 +183,16 @@ or second encoding of canonical addresses and ports.
   do not expire it; capacity limits and end of input still bound its lifetime.
   Fragmented queries require a complete datagram. A complete datagram
   uses the final fragment's (`MF=0`) capture timestamp, while inferred responses use the first
-  fragment's timestamp. The reassembler retains a bounded history of completed datagrams and
+  fragment's timestamp. While any datagram is unresolved, routing retains its ready packet
+  batches so a delayed reconstruction cannot arrive after a retry or response that it should
+  precede. Released packets are sorted together by timestamp and capture ordinal before matching.
+  The eviction watermark cannot advance beyond either unresolved fragments or retained ready
+  packets. The additional ready backlog is bounded between batches to 65,536 packets or 64 MiB
+  of packet payloads; exceeding either bound resolves pending datagrams through the existing
+  capacity fallback before releasing the backlog. The current input batch and fallback packets
+  can temporarily exceed that retained-state bound. This buffering is owned by the routing stage
+  and contains no query/response pairing state.
+  The reassembler retains a bounded history of completed datagrams and
   compares the fragment key and UDP payload bytes before suppressing repeated complete datagrams
   or prefix fallback from fragments matching a recent completion. A reused IPv4 ID with different
   content can still produce a new datagram, even when its first fragment is identical. An incomplete

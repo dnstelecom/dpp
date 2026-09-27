@@ -553,6 +553,10 @@ Additional notes:
   heuristic for incomplete sets. Neither mode reassembles IPv6 fragments. IPv6 Hop-by-Hop, Routing,
   Destination Options, Authentication and atomic Fragment headers are traversed before UDP; ESP
   and IPv6 jumbograms are unsupported. Flow identity uses observed IP endpoints.
+- Full IPv4 reassembly holds ready packet batches until unresolved fragments are completed or
+  released, preserving retry and response ordering across batches. This adds a retained backlog
+  of up to 65,536 packets or 64 MiB of packet payloads; exceeding either bound triggers the
+  incomplete-fragment capacity fallback. The current input batch adds transient memory on top.
 - If capture parsing fails after processing begins, DPP flushes valid partial (not atomic) output
   from complete accepted batches and exits with an error; pending queries are not emitted as timeouts.
 - **PCAPNG support level:** DPP supports PCAPNG on stream input and via `libpcap` on regular-file fallback paths, but the performance-critical pure-Rust fast path remains focused on classic PCAP. Stdin PCAPNG blocks larger than 16 MiB are rejected before their body is read.

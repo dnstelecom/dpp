@@ -31,6 +31,10 @@ const BATCH_PREFETCH_DEPTH: usize = 2;
 const MATCHER_WORKER_QUEUE_DEPTH: usize = 2;
 const AGGREGATOR_REORDER_BUFFER_CAPACITY: usize =
     BATCH_PREFETCH_DEPTH + MATCHER_WORKER_QUEUE_DEPTH + 2;
+/// Ready packets may wait behind an unresolved fragment for at most this backlog.
+/// Reaching either bound releases incomplete datagrams using the capacity fallback.
+const FRAGMENT_READY_PACKET_LIMIT: usize = PACKET_BATCH_SIZE;
+const FRAGMENT_READY_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
 struct WorkerShutdownSignals {
     shutdown_requested: Arc<AtomicBool>,
@@ -587,21 +591,67 @@ fn route_batch_to_worker_batches(
     }
 }
 
-fn route_batch_with_reassembly(
-    packet_batch: PacketBatch,
-    routing_plan: &ShardRoutingPlan,
-    reassembler: &mut Ipv4FragmentReassembler,
-) -> RoutedWorkerBatches {
-    let input_max_timestamp_micros = packet_batch
-        .iter()
-        .map(|packet| packet.timestamp_micros)
-        .max();
-    let (packets, oldest_pending_timestamp_micros) = reassembler.process_batch(packet_batch);
-    let mut routed = route_batch_to_worker_batches(packets, routing_plan, true);
-    routed.batch_max_timestamp_micros = input_max_timestamp_micros.map(|timestamp| {
-        oldest_pending_timestamp_micros.map_or(timestamp, |pending| timestamp.min(pending))
-    });
-    routed
+/// Owns only packet-stage backlog; fragment and matcher state keep their existing owners.
+struct FragmentRoutingState {
+    reassembler: Ipv4FragmentReassembler,
+    ready: PacketBatch,
+}
+
+impl FragmentRoutingState {
+    fn new(match_timeout_micros: i64, monotonic_capture: bool) -> Self {
+        Self {
+            reassembler: Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture),
+            ready: Vec::new(),
+        }
+    }
+
+    fn route_batch(
+        &mut self,
+        packet_batch: PacketBatch,
+        routing_plan: &ShardRoutingPlan,
+    ) -> RoutedWorkerBatches {
+        let input_max_timestamp_micros = packet_batch
+            .iter()
+            .map(|packet| packet.timestamp_micros)
+            .max();
+        let (packets, mut oldest_pending_timestamp_micros) =
+            self.reassembler.process_batch(packet_batch);
+        self.ready.extend(packets);
+
+        // A final fragment may precede other parts, so its eventual datagram can
+        // have an earlier event than a retry already present in `ready`. Hold the
+        // entire batch until the unresolved fragments have been decided, then
+        // apply the normal timestamp/ordinal sort to all ready packets together.
+        // An ordinal-only prefix is unsafe when timestamps regress within a batch.
+        let ready_bytes: usize = self.ready.iter().map(|packet| packet.data.len()).sum();
+        if self.ready.len() > FRAGMENT_READY_PACKET_LIMIT || ready_bytes > FRAGMENT_READY_BYTE_LIMIT
+        {
+            self.ready.extend(self.reassembler.finish());
+            oldest_pending_timestamp_micros = None;
+        }
+        let packets = if oldest_pending_timestamp_micros.is_some() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.ready)
+        };
+        let mut routed = route_batch_to_worker_batches(packets, routing_plan, true);
+        routed.batch_max_timestamp_micros = input_max_timestamp_micros.map(|timestamp| {
+            let pending_frontier =
+                oldest_pending_timestamp_micros.map_or(timestamp, |pending| timestamp.min(pending));
+            self.ready
+                .iter()
+                .map(|packet| packet.timestamp_micros)
+                .min()
+                .map_or(pending_frontier, |ready| pending_frontier.min(ready))
+        });
+        routed
+    }
+
+    fn finish(&mut self) -> PacketBatch {
+        self.ready.extend(self.reassembler.finish());
+        // Accepted packets must drain even on interrupted or failed intake.
+        std::mem::take(&mut self.ready)
+    }
 }
 
 fn parse_shard_packets(
@@ -654,8 +704,8 @@ fn run_phase_processing_worker(
         vec![MatcherShardState::default()]
     };
     let routing_plan = ShardRoutingPlan::new(shard_count, shard_count);
-    let mut reassembler = dns_processor.full_fragments.then(|| {
-        Ipv4FragmentReassembler::new(
+    let mut fragment_routing = dns_processor.full_fragments.then(|| {
+        FragmentRoutingState::new(
             dns_processor.match_timeout_micros,
             dns_processor.monotonic_capture,
         )
@@ -671,8 +721,8 @@ fn run_phase_processing_worker(
 
         let routed = match received {
             Ok(packet_batch) => {
-                if let Some(reassembler) = reassembler.as_mut() {
-                    route_batch_with_reassembly(packet_batch, &routing_plan, reassembler)
+                if let Some(fragment_routing) = fragment_routing.as_mut() {
+                    fragment_routing.route_batch(packet_batch, &routing_plan)
                 } else {
                     route_batch_to_worker_batches(
                         packet_batch,
@@ -682,10 +732,10 @@ fn run_phase_processing_worker(
                 }
             }
             Err(_) => {
-                let Some(reassembler) = reassembler.as_mut() else {
+                let Some(fragment_routing) = fragment_routing.as_mut() else {
                     break;
                 };
-                let remaining = reassembler.finish();
+                let remaining = fragment_routing.finish();
                 if remaining.is_empty() {
                     break;
                 }
@@ -762,8 +812,8 @@ fn run_parser_stage(
         monotonic_capture,
     } = fragment_config;
     let mut batch_seq = 0_u64;
-    let mut reassembler = full_fragments
-        .then(|| Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture));
+    let mut fragment_routing =
+        full_fragments.then(|| FragmentRoutingState::new(match_timeout_micros, monotonic_capture));
 
     loop {
         let received = batch_rx.recv();
@@ -774,17 +824,17 @@ fn run_parser_stage(
 
         let routed = match received {
             Ok(packet_batch) => {
-                if let Some(reassembler) = reassembler.as_mut() {
-                    route_batch_with_reassembly(packet_batch, &routing_plan, reassembler)
+                if let Some(fragment_routing) = fragment_routing.as_mut() {
+                    fragment_routing.route_batch(packet_batch, &routing_plan)
                 } else {
                     route_batch_to_worker_batches(packet_batch, &routing_plan, allow_fragments)
                 }
             }
             Err(_) => {
-                let Some(reassembler) = reassembler.as_mut() else {
+                let Some(fragment_routing) = fragment_routing.as_mut() else {
                     break;
                 };
-                let remaining = reassembler.finish();
+                let remaining = fragment_routing.finish();
                 if remaining.is_empty() {
                     break;
                 }
@@ -1246,7 +1296,7 @@ impl DnsProcessor {
 mod tests {
     use super::*;
     use crate::config::{InputSource, OUTPUT_RECORD_BATCH_SIZE};
-    use crate::packet_parser::PacketParser;
+    use crate::packet_parser::{PacketParser, PacketPayload};
     use crate::test_support::{
         classic_pcap_bytes, encode_dns_header, make_udp_dns_packet,
         make_udp_dns_packet_with_payload, temp_test_path, test_dns_record,
@@ -1260,6 +1310,233 @@ mod tests {
             shutdown_requested: Arc::new(AtomicBool::new(shutdown_requested)),
             intake_failed: Arc::new(AtomicBool::new(false)),
             output_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fragment_ordering_query_response() -> (Vec<u8>, Vec<u8>) {
+        let mut payload = encode_dns_header(0x3456, 0x0100, 1);
+        payload.extend_from_slice(b"\x07example\x03com\0\0\x01\0\x01");
+        let query =
+            make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &payload);
+        payload[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let response =
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &payload);
+        (query, response)
+    }
+
+    fn split_ipv4_test_packet(packet: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let first_end = 14 + 20 + 32;
+        let mut first = packet[..first_end].to_vec();
+        first[16..18].copy_from_slice(&52_u16.to_be_bytes());
+        first[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        first[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+        let mut tail = packet[..34].to_vec();
+        tail[16..18].copy_from_slice(&(20_u16 + (packet.len() - first_end) as u16).to_be_bytes());
+        tail[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+        tail[20..22].copy_from_slice(&4_u16.to_be_bytes());
+        tail.extend_from_slice(&packet[first_end..]);
+        (first, tail)
+    }
+
+    fn test_packet(bytes: &[u8], timestamp_micros: i64, packet_ordinal: u64) -> PacketData {
+        PacketData {
+            data: PacketPayload::owned(bytes.into()),
+            timestamp_micros,
+            packet_ordinal,
+        }
+    }
+
+    fn run_fragment_test_batches(
+        batches: Vec<PacketBatch>,
+        staged: bool,
+        monotonic: bool,
+        signals: WorkerShutdownSignals,
+    ) -> (PipelineCounters, Vec<DnsRecord>) {
+        let processor = Arc::new(
+            DnsProcessor::new_with_runtime_options(None, false, 1_200_000, monotonic)
+                .expect("processor initializes")
+                .with_full_fragments(true),
+        );
+        let (batch_tx, batch_rx) = crossbeam::channel::unbounded();
+        for batch in batches {
+            batch_tx.send(batch).expect("test batch sends");
+        }
+        drop(batch_tx);
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let counters = if staged {
+            run_staged_processing_pipeline(
+                processor,
+                batch_rx,
+                output_tx,
+                4,
+                2,
+                AffinityPlan::disabled(),
+                signals,
+            )
+        } else {
+            run_phase_processing_worker(processor, batch_rx, output_tx, 1, false, signals)
+        }
+        .expect("fragment pipeline completes");
+        let records = output_rx
+            .into_iter()
+            .flat_map(|message| match message {
+                OutputMessage::Records(records) => records,
+                other => panic!("unexpected output message: {other:?}"),
+            })
+            .collect();
+        (counters, records)
+    }
+
+    #[test]
+    fn full_fragments_preserve_delayed_query_order_in_both_pipeline_models() {
+        let (query, response) = fragment_ordering_query_response();
+        let (first, tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            for monotonic in [false, true] {
+                for with_response in [false, true] {
+                    let mut initial = vec![
+                        test_packet(&tail, 1_000_000, 0),
+                        test_packet(&query, 1_100_000, 1),
+                    ];
+                    if with_response {
+                        initial.push(test_packet(&response, 1_120_000, 2));
+                    }
+                    let (counters, records) = run_fragment_test_batches(
+                        vec![initial, vec![test_packet(&first, 1_200_000, 3)]],
+                        staged,
+                        monotonic,
+                        test_worker_signals(false),
+                    );
+                    assert_eq!(counters.dns_query_count, 2);
+                    assert_eq!(counters.duplicated_query_count, 1);
+                    assert_eq!(
+                        counters.matched_query_response_count,
+                        usize::from(with_response)
+                    );
+                    assert_eq!(counters.timeout_query_count, usize::from(!with_response));
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].request_timestamp, 1_000_000);
+                    assert_eq!(
+                        records[0].response_timestamp,
+                        with_response.then_some(1_120_000)
+                    );
+                    assert_eq!(
+                        counters.matched_rtt_sum_micros,
+                        if with_response { 120_000 } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_fragments_preserve_default_intra_batch_timestamp_order() {
+        let (query, response) = fragment_ordering_query_response();
+        let (first, tail) = split_ipv4_test_packet(&response);
+        for staged in [false, true] {
+            let (counters, records) = run_fragment_test_batches(
+                vec![
+                    vec![
+                        test_packet(&query, 1_000_000, 0),
+                        test_packet(&query, 1_300_000, 1),
+                        test_packet(&tail, 1_200_000, 2),
+                    ],
+                    vec![test_packet(&first, 1_400_000, 3)],
+                ],
+                staged,
+                false,
+                test_worker_signals(false),
+            );
+            assert_eq!(counters.duplicated_query_count, 0);
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 1);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].request_timestamp, 1_000_000);
+            assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            assert_eq!(records[1].request_timestamp, 1_300_000);
+            assert_eq!(records[1].response_timestamp, None);
+        }
+    }
+
+    #[test]
+    fn full_fragments_hold_watermark_for_buffered_response() {
+        let (query, response) = fragment_ordering_query_response();
+        let (_, unrelated_tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            let (counters, records) = run_fragment_test_batches(
+                vec![
+                    vec![test_packet(&query, 0, 0)],
+                    vec![
+                        test_packet(&response, 1_100_000, 1),
+                        test_packet(&unrelated_tail, 1_500_000, 2),
+                    ],
+                ],
+                staged,
+                true,
+                test_worker_signals(false),
+            );
+            assert_eq!(counters.matched_query_response_count, 1);
+            assert_eq!(counters.timeout_query_count, 0);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].response_timestamp, Some(1_100_000));
+        }
+    }
+
+    #[test]
+    fn full_fragments_release_backlog_at_both_capacity_bounds() {
+        let (query, _) = fragment_ordering_query_response();
+        let (_, tail) = split_ipv4_test_packet(&query);
+        for byte_bound in [false, true] {
+            let mut routing = FragmentRoutingState::new(1_200_000, false);
+            let plan = ShardRoutingPlan::new(1, 1);
+            let blocked = routing.route_batch(
+                vec![test_packet(&tail, 0, 0), test_packet(&query, 1, 1)],
+                &plan,
+            );
+            assert!(blocked.worker_batches[0][0].packets.is_empty());
+            let ordinary = if byte_bound {
+                vec![test_packet(&vec![0; FRAGMENT_READY_BYTE_LIMIT + 1], 2, 2)]
+            } else {
+                (0..=FRAGMENT_READY_PACKET_LIMIT)
+                    .map(|ordinal| test_packet(&[], 2, ordinal as u64 + 2))
+                    .collect()
+            };
+            let routed = routing.route_batch(ordinary, &plan);
+            assert!(routing.ready.is_empty());
+            assert!(routing.reassembler.finish().is_empty());
+            assert_eq!(routed.worker_batches[0][0].packets.len(), 1);
+            assert_eq!(routed.worker_batches[0][0].packets[0].packet_ordinal, 1);
+        }
+    }
+
+    #[test]
+    fn full_fragments_drain_accepted_backlog_after_signal_or_intake_error() {
+        let (query, response) = fragment_ordering_query_response();
+        let (_, tail) = split_ipv4_test_packet(&query);
+        for staged in [false, true] {
+            for signal in [false, true] {
+                let signals = test_worker_signals(signal);
+                signals.intake_failed.store(!signal, AtomicOrdering::SeqCst);
+                let mut unmatched = query.clone();
+                unmatched[42..44].copy_from_slice(&0x9876_u16.to_be_bytes());
+                let (counters, records) = run_fragment_test_batches(
+                    vec![vec![
+                        test_packet(&tail, 1_000_000, 0),
+                        test_packet(&query, 1_100_000, 1),
+                        test_packet(&response, 1_200_000, 2),
+                        test_packet(&unmatched, 1_300_000, 3),
+                    ]],
+                    staged,
+                    true,
+                    signals,
+                );
+                assert_eq!(counters.dns_query_count, 2);
+                assert_eq!(counters.matched_query_response_count, 1);
+                assert_eq!(counters.timeout_query_count, 0);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].request_timestamp, 1_100_000);
+                assert_eq!(records[0].response_timestamp, Some(1_200_000));
+            }
         }
     }
 
@@ -1825,21 +2102,17 @@ mod tests {
         packets.push((1, 200_000, final_fragment.as_slice()));
         fs::write(&path, classic_pcap_bytes(&packets)).expect("test pcap written");
 
-        // A pending first fragment holds the monotonic matcher watermark at
-        // its timestamp even when later unrelated packets fill the batch.
+        // The unresolved response holds this entire batch. Its earlier buffered
+        // query must also cap the matcher watermark until both are released.
         let mut cap_parser =
             PacketParser::new(&InputSource::File(path.clone()), false).expect("parser opens");
         let first_batch = cap_parser
             .next_batch(PACKET_BATCH_SIZE)
             .expect("batch reads")
             .expect("first batch exists");
-        let mut reassembler = Ipv4FragmentReassembler::new(1_200_000, true);
-        let routed = route_batch_with_reassembly(
-            first_batch,
-            &ShardRoutingPlan::new(1, 1),
-            &mut reassembler,
-        );
-        assert_eq!(routed.batch_max_timestamp_micros, Some(1_100_000));
+        let mut fragment_routing = FragmentRoutingState::new(1_200_000, true);
+        let routed = fragment_routing.route_batch(first_batch, &ShardRoutingPlan::new(1, 1));
+        assert_eq!(routed.batch_max_timestamp_micros, Some(1_000_000));
 
         for available_cpus in [1, 5] {
             let mut parser =

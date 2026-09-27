@@ -30,6 +30,20 @@ order within each shard and never backtracks. The key design choices:
    `(timestamp, packet_ordinal, record_ordinal)` order. Tie-breaks are explicit — scheduler
    interleaving and container iteration order are not valid tie-breaks.
 
+   With full IPv4 reassembly, routing retains ready packet batches while fragment sets remain
+   unresolved. A reconstructed datagram can carry an earlier final-fragment timestamp, so merely
+   limiting timeout eviction would still let a retry or response finalize before that datagram.
+   Routing releases the retained packets and reconstructed datagrams together for the existing
+   timestamp/ordinal sort. This also preserves ordering within a batch whose timestamps regress
+   in default mode; it does not impose global monotonicity on that mode.
+
+   This packet backlog is separate from matcher state and bounded between batches to one packet
+   batch (65,536 packets) or 64 MiB of payloads. On overflow, pending fragment sets use the existing
+   capacity fallback before routing releases the backlog. Processing the current input batch and
+   fallback packets can temporarily exceed those retained-state limits. EOF and interrupted
+   intake drain accepted ready packets through the existing shutdown policy. The matcher eviction
+   watermark is capped by both the oldest unresolved fragment and the oldest retained ready packet.
+
 4. **Retry deduplication.** If a query with the same identity arrives while an earlier one is
    still pending inside the match-timeout window (1200 ms by default), the duplicate is counted
    but doesn't create a second canonical query. One canonical query → one terminal outcome
