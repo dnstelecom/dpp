@@ -356,8 +356,8 @@ The datagram bounds must agree:
 
 Incomplete responses may fall back to first-fragment inference on capacity eviction or EOF.
 With monotonic capture, entries can also expire after the match timeout. Without it, timestamp
-gaps between fragments of the same datagram do not expire the entry; capacity and EOF still bound
-its lifetime.
+gaps alone do not expire an entry; capacity and EOF still bound its lifetime. Explicit pending-ID
+recovery is described below.
 
 - Complete datagrams use the final fragment's (`MF=0`) capture timestamp.
 - Inferred responses use the first fragment's timestamp.
@@ -372,7 +372,7 @@ no record.
 ```mermaid
 flowchart TB
     Input["Packet batches"] --> Reassembly["IPv4 reassembly<br/>pending fragment sets"]
-    Resolve["EOF / capacity pressure<br/>expiry only in monotonic mode"] -.-> Reassembly
+    Resolve["EOF / capacity pressure<br/>monotonic expiry / opted-in first-led reuse"] -.-> Reassembly
     Reassembly -->|"unfragmented packets, complete datagrams,<br/>or fallback prefixes"| Ready["Retained ready packets<br/>held while fragments are unresolved"]
     Ready -.->|"backlog limit exceeded:<br/>resolve pending sets"| Reassembly
     Ready -->|"after pending sets are resolved"| Route["Sort by timestamp and ordinal<br/>validate packet metadata and route"]
@@ -395,8 +395,8 @@ Reassembly keeps a bounded history of completed datagrams. Fragment keys and UDP
 are compared before suppressing repeated complete datagrams or prefix fallback matching a recent
 completion.
 
-A reused IPv4 ID with different content can form a new datagram, even if its first
-fragment is identical. An incomplete new datagram whose observed fragments match a recent
+After completion, a reused IPv4 ID with different content can form a new datagram, even if its
+first fragment is identical. An incomplete new datagram whose observed fragments match a recent
 completion is indistinguishable from a duplicate and may be suppressed, as may a fully identical
 new datagram.
 
@@ -410,6 +410,36 @@ active is indistinguishable from an old non-DNS tail and may be dropped.
 The canonical VLAN context is part of each fragment key: different tagged segments cannot be
 assembled together, while PCP or DEI changes do not split a datagram. All reassembly state must
 remain bounded in memory.
+
+### Opt-in pending-ID recovery
+
+`--ipv4-fragment-reuse-gap-ms` (environment: `DPP_IPV4_FRAGMENT_REUSE_GAP_MS`) supplies an explicit
+capture-time interval for recovering an unresolved or rejected IPv4 fragment set. It requires
+`--full-fragments`, conflicts with `--monotonic-capture`, and is unset by default. CLI values take
+precedence over the environment; the supported range is `1..=9223372036854775` milliseconds.
+
+The routing stage retains one reassembler across batches. Each pending candidate records the
+maximum timestamp of admitted fragments, including duplicate and rejection events. A valid DNS
+first fragment here means a structurally valid IPv4/UDP first fragment with a port 53 endpoint;
+DNS semantic validation remains downstream. Interval-based recovery starts a new candidate only
+when its timestamp is strictly greater than the old maximum plus the configured interval.
+Identical first-fragment bytes can also initiate this recovery. Completed and non-DNS history
+alone cannot initiate it.
+
+Recovery removes the old segments and completion history. An old usable first-response prefix
+passes through the existing fallback path once; rejected candidates and candidates whose bytes
+still match a recent completion produce no prefix. A retained cutoff, equal to the old maximum
+plus the interval, rejects first fragments, tails, and non-DNS first fragments at or before it
+before they can change state. The existing pending, completed, and non-DNS records carry this
+cutoff, taking the maximum when boundaries meet. No additional history table is required.
+First-seen timestamps continue to govern the existing ordering policy. Saturated timestamps at
+the signed 64-bit limits cannot initiate recovery.
+
+This policy relies on the operator's hypothesis that capture timestamps and the chosen interval
+separate generations; it does not establish a universal datagram lifetime. Tail-before-first
+recovery across generations is not guaranteed. The cutoff is retained only while some bounded
+history for the key remains; after its eviction, old replay can be accepted again. Structural
+fragment validation and exported record formats retain their existing semantics.
 
 ## DNS validation
 

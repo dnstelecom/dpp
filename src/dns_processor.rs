@@ -28,6 +28,7 @@ pub struct DnsProcessor {
     dns_wire_fast_path: bool,
     max_dns_compression_jumps: usize,
     match_timeout_micros: i64,
+    ipv4_fragment_reuse_gap_micros: Option<i64>,
     monotonic_capture: bool,
     allow_fragments: bool,
     full_fragments: bool,
@@ -71,6 +72,7 @@ impl DnsProcessor {
             dns_wire_fast_path,
             max_dns_compression_jumps: DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             match_timeout_micros,
+            ipv4_fragment_reuse_gap_micros: None,
             monotonic_capture,
             allow_fragments: false,
             full_fragments: false,
@@ -84,6 +86,11 @@ impl DnsProcessor {
 
     pub fn with_max_dns_compression_jumps(mut self, limit: usize) -> Self {
         self.max_dns_compression_jumps = limit;
+        self
+    }
+
+    pub fn with_ipv4_fragment_reuse_gap_micros(mut self, gap_micros: Option<i64>) -> Self {
+        self.ipv4_fragment_reuse_gap_micros = gap_micros;
         self
     }
 

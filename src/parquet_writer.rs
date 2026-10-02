@@ -390,6 +390,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -431,6 +432,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -472,6 +474,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let writer = create_parquet_writer(
             SharedSink {
@@ -515,6 +518,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -557,6 +561,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let writer = create_parquet_writer(file, &config).expect("creates parquet writer");
@@ -624,6 +629,7 @@ mod tests {
             max_dns_compression_jumps: crate::config::DEFAULT_MAX_DNS_COMPRESSION_JUMPS,
             allow_fragments: false,
             full_fragments: false,
+            ipv4_fragment_reuse_gap_ms: None,
         };
         let file = File::create(&filename).expect("creates parquet file");
         let mut writer = create_parquet_writer(file, &config).expect("creates parquet writer");

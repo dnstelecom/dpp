@@ -115,6 +115,28 @@ With `--full-fragments`, incomplete responses may use prefix inference on capaci
 EOF. Elapsed capture-time timeout can also trigger fallback when `--monotonic-capture` is enabled.
 Fragmented queries require complete reassembly.
 
+`--ipv4-fragment-reuse-gap-ms <MS>` opts in to recovering an existing pending fragment set when
+a valid DNS first fragment arrives strictly more than `MS` after its maximum admitted timestamp.
+The maximum includes duplicates and rejection events, so rejected sets can also recover. The
+first fragment must be structurally valid IPv4/UDP with a port 53 endpoint; DNS semantic
+validation remains downstream. The option is unset by default, accepts `1..=9223372036854775`
+milliseconds, requires full reassembly, and conflicts with monotonic-capture mode.
+`DPP_IPV4_FRAGMENT_REUSE_GAP_MS` supplies the value when the CLI option is absent. Mode
+requirements are checked after CLI and environment resolution.
+
+Recovery retires old segments and completion history, and releases an old usable response prefix
+through the existing fallback at most once. Rejected sets and candidates whose observed bytes
+match a recent completion do not release a prefix. The old maximum plus the interval becomes a
+cutoff: first fragments, tails, and non-DNS first fragments at or before it are ignored before
+changing state. Existing bounded pending, completed, and non-DNS history carries the maximum
+retained cutoff. Completed or non-DNS records alone never initiate interval-based recovery.
+
+The interval is an operator's hypothesis about timestamps and generation separation, not a
+universal maximum datagram lifetime or an automatic expiry timer. Tail-before-first recovery
+across generations is not guaranteed; replay protection ends when all retained history for the
+key is evicted. Saturated signed 64-bit timestamps cannot initiate recovery. Without this option,
+the existing fragment policy is unchanged.
+
 The reassembler keys fragments by source, destination, protocol, and IPv4 identification. Payload
 bytes use the declared eight-octet offsets. A datagram reaches the existing UDP/DNS parser only
 when the first fragment, final fragment, and contiguous coverage are present. Its fragmented IP

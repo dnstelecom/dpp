@@ -164,6 +164,11 @@ fn display_fragment_mode(args: &AppConfig) {
         info!(
             "IPv4 fragment reassembly: enabled (incomplete responses may use first-fragment matching)"
         );
+        if let Some(gap_ms) = args.ipv4_fragment_reuse_gap_ms {
+            info!(
+                "IPv4 ID reuse recovery gap: {gap_ms} ms (per-key forward capture timestamp assumption)"
+            );
+        }
     } else if args.allow_fragments {
         info!(
             "IPv4 response fragment prefix matching: enabled (no reassembly; full UDP/DNS content unverified)"
@@ -203,6 +208,8 @@ struct RunConfigSummary {
     output_format: OutputFormat,
     report_format: ReportFormat,
     match_timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4_fragment_reuse_gap_ms: Option<u64>,
     monotonic_capture: bool,
     dns_wire_fast_path: bool,
     max_dns_compression_jumps: usize,
@@ -404,6 +411,7 @@ fn build_run_summary(
             output_format: args.format,
             report_format: args.report_format,
             match_timeout_ms: args.match_timeout_ms,
+            ipv4_fragment_reuse_gap_ms: args.ipv4_fragment_reuse_gap_ms,
             monotonic_capture: args.monotonic_capture,
             dns_wire_fast_path: args.dns_wire_fast_path,
             max_dns_compression_jumps: args.max_dns_compression_jumps,
@@ -626,7 +634,8 @@ pub(crate) fn run(args: AppConfig) -> Result<(), AppRunError> {
         .map_err(|source| AppRunError::DnsProcessorInit { source })?
         .with_max_dns_compression_jumps(args.max_dns_compression_jumps)
         .with_allow_fragments(args.allow_fragments)
-        .with_full_fragments(args.full_fragments),
+        .with_full_fragments(args.full_fragments)
+        .with_ipv4_fragment_reuse_gap_micros(args.ipv4_fragment_reuse_gap_micros()),
     );
     let mut packet_parser = match PacketParser::new_with_shutdown(
         &args.input_source,
@@ -779,6 +788,7 @@ mod tests {
             format: OutputFormat::Csv,
             report_format: crate::config::ReportFormat::Text,
             match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            ipv4_fragment_reuse_gap_ms: None,
             monotonic_capture: false,
             zstd: false,
             v2: false,
@@ -829,6 +839,11 @@ mod tests {
         );
 
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
+        assert!(
+            serialized["config"]
+                .get("ipv4_fragment_reuse_gap_ms")
+                .is_none()
+        );
         let config = serialized
             .get("config")
             .and_then(serde_json::Value::as_object)
@@ -857,6 +872,7 @@ mod tests {
         let mut config = test_config();
         config.allow_fragments = true;
         config.full_fragments = true;
+        config.ipv4_fragment_reuse_gap_ms = Some(120_000);
         let summary = build_run_summary(
             &config,
             config.execution_budget(),
@@ -872,6 +888,7 @@ mod tests {
         let serialized = serde_json::to_value(&summary).expect("summary serializes");
         assert_eq!(serialized["config"]["allow_fragments"], true);
         assert_eq!(serialized["config"]["full_fragments"], true);
+        assert_eq!(serialized["config"]["ipv4_fragment_reuse_gap_ms"], 120_000);
         assert_eq!(serialized["metrics"]["fragmented_response_prefix_count"], 2);
     }
 
@@ -999,6 +1016,7 @@ mod tests {
             format,
             report_format: crate::config::ReportFormat::Text,
             match_timeout_ms: crate::config::DEFAULT_MATCH_TIMEOUT_MS,
+            ipv4_fragment_reuse_gap_ms: None,
             monotonic_capture: false,
             zstd: false,
             v2: false,

@@ -156,6 +156,7 @@ dpp --report-format json input.pcap output.csv > dpp-summary.json
 | `--max-dns-compression-jumps <N>` | Maximum compression-pointer jumps per DNS name; defaults to `32`; `0` disables the jump limit |
 | `--allow-fragments` | Opt in to matching complete queries with first IPv4 response fragments when the DNS header and question are present; no reassembly |
 | `--full-fragments` | Reassemble IPv4 fragments into complete UDP datagrams; also enables `--allow-fragments` for incomplete responses |
+| `--ipv4-fragment-reuse-gap-ms <MS>` | Recover a pending IPv4 ID when a new first fragment is separated by more than this capture-time interval; requires `--full-fragments`, conflicts with `--monotonic-capture`; range `1..=9223372036854775`, unset by default |
 | `--anonymize <path>` | Path to the pseudonymization key file |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
@@ -182,6 +183,7 @@ provide supported per-core thread pinning through the affinity backend.
 | `DPP_MAX_DNS_COMPRESSION_JUMPS` | Maximum compression-pointer jumps per DNS name when `--max-dns-compression-jumps` is not set; defaults to `32`; `0` disables the jump limit |
 | `DPP_ALLOW_FRAGMENTS` | Enable first-fragment IPv4 response matching without reassembly. |
 | `DPP_FULL_FRAGMENTS` | Enable IPv4 reassembly and first-fragment response matching. |
+| `DPP_IPV4_FRAGMENT_REUSE_GAP_MS` | IPv4 pending-ID recovery interval in milliseconds when `--ipv4-fragment-reuse-gap-ms` is absent; same range and mode requirements as the CLI option; unset by default. |
 | `DPP_ANONYMIZE` | Path to the key file used for pseudonymization |
 | `DPP_SILENT` | Suppress info-level log output |
 
@@ -284,10 +286,27 @@ mode. Fallback uses the first fragment's timestamp.
 Fragmented queries need complete reassembly;
 overlapping, inconsistent, or UDP-length-mismatched fragment sets are rejected.
 
+In ordinary full-fragment mode, an unresolved or rejected fragment set can retain its IPv4 ID
+until capacity eviction or EOF. For captures where a chosen time interval can separate reused
+IDs, opt in with `--ipv4-fragment-reuse-gap-ms <MS>` or `DPP_IPV4_FRAGMENT_REUSE_GAP_MS`.
+The option requires full reassembly and cannot be combined with monotonic-capture mode.
+
+Recovery starts only when a valid DNS first fragment arrives more than the configured interval
+after the maximum timestamp admitted to the old pending set, including duplicates and rejected
+fragments. It also works after a collision has rejected that set. The old usable response prefix
+may fall back once. The retained cutoff is the old maximum plus the interval; fragments with
+timestamps at or before it are ignored while the key's history remains retained. Completed
+datagrams alone do not trigger recovery, and the interval does not expire a set by itself.
+
+The interval expresses an operator's hypothesis about capture timestamps and generation
+separation; it is not a universal maximum datagram lifetime. Recovery does not guarantee
+tail-before-first handling across generations, and protection against old replay ends after all
+bounded history for the key has been evicted. Without the option, existing behavior is unchanged.
+
 Duplicate suppression uses bounded history and compares the fragment key and UDP payload bytes:
 
-- A reused IPv4 ID with different content can form a new datagram, even with an identical first
-  fragment.
+- After completion, a reused IPv4 ID with different content can form a new datagram, even with an
+  identical first fragment.
 - A fully identical new datagram, or an incomplete one whose observed fragments match a recent
   completion, may be suppressed because it is indistinguishable from a duplicate.
 - A separate bounded history drops tails after a non-DNS first fragment. If a new DNS datagram
