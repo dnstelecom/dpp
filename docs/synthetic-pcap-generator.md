@@ -19,7 +19,7 @@ clients talking to one or more resolvers. Output is deterministic for a fixed `-
 
 ## Build and generate a capture
 
-Requires Rust 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
+Requires Rust 1.99.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 
 Build the standalone binary:
 

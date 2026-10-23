@@ -28,7 +28,7 @@ exclusive.
 
 ## Build Matrix
 
-Requires Rust 1.98.1 or newer; the repository is pinned by
+Requires Rust 1.99.1 or newer; the repository is pinned by
 [`rust-toolchain.toml`](../rust-toolchain.toml).
 
 Build each variant into a separate binary path.
