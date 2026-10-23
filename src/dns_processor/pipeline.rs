@@ -46,6 +46,7 @@ struct FragmentProcessingConfig {
     allow_fragments: bool,
     full_fragments: bool,
     match_timeout_micros: i64,
+    ipv4_fragment_reuse_gap_micros: Option<i64>,
     monotonic_capture: bool,
 }
 
@@ -636,9 +637,14 @@ struct FragmentRoutingState {
 }
 
 impl FragmentRoutingState {
-    fn new(match_timeout_micros: i64, monotonic_capture: bool) -> Self {
+    fn new(
+        match_timeout_micros: i64,
+        monotonic_capture: bool,
+        reuse_gap_micros: Option<i64>,
+    ) -> Self {
         Self {
-            reassembler: Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture),
+            reassembler: Ipv4FragmentReassembler::new(match_timeout_micros, monotonic_capture)
+                .with_reuse_gap_micros(reuse_gap_micros),
             ready: Vec::new(),
         }
     }
@@ -746,6 +752,7 @@ fn run_phase_processing_worker(
         FragmentRoutingState::new(
             dns_processor.match_timeout_micros,
             dns_processor.monotonic_capture,
+            dns_processor.ipv4_fragment_reuse_gap_micros,
         )
     });
 
@@ -847,11 +854,17 @@ fn run_parser_stage(
         allow_fragments,
         full_fragments,
         match_timeout_micros,
+        ipv4_fragment_reuse_gap_micros,
         monotonic_capture,
     } = fragment_config;
     let mut batch_seq = 0_u64;
-    let mut fragment_routing =
-        full_fragments.then(|| FragmentRoutingState::new(match_timeout_micros, monotonic_capture));
+    let mut fragment_routing = full_fragments.then(|| {
+        FragmentRoutingState::new(
+            match_timeout_micros,
+            monotonic_capture,
+            ipv4_fragment_reuse_gap_micros,
+        )
+    });
 
     loop {
         let received = batch_rx.recv();
@@ -1161,6 +1174,7 @@ fn run_staged_processing_pipeline_with_spawner(
         let allow_fragments = dns_processor.allow_fragments;
         let full_fragments = dns_processor.full_fragments;
         let match_timeout_micros = dns_processor.match_timeout_micros;
+        let ipv4_fragment_reuse_gap_micros = dns_processor.ipv4_fragment_reuse_gap_micros;
         let monotonic_capture = dns_processor.monotonic_capture;
         let affinity_plan = affinity_plan.clone();
         move || {
@@ -1177,6 +1191,7 @@ fn run_staged_processing_pipeline_with_spawner(
                     allow_fragments,
                     full_fragments,
                     match_timeout_micros,
+                    ipv4_fragment_reuse_gap_micros,
                     monotonic_capture,
                 },
             )
@@ -1580,10 +1595,21 @@ mod tests {
         monotonic: bool,
         signals: WorkerShutdownSignals,
     ) -> (PipelineCounters, Vec<DnsRecord>) {
+        run_fragment_test_batches_with_reuse_gap(batches, staged, monotonic, signals, None)
+    }
+
+    fn run_fragment_test_batches_with_reuse_gap(
+        batches: Vec<PacketBatch>,
+        staged: bool,
+        monotonic: bool,
+        signals: WorkerShutdownSignals,
+        reuse_gap_micros: Option<i64>,
+    ) -> (PipelineCounters, Vec<DnsRecord>) {
         let processor = Arc::new(
             DnsProcessor::new_with_runtime_options(None, false, 1_200_000, monotonic)
                 .expect("processor initializes")
-                .with_full_fragments(true),
+                .with_full_fragments(true)
+                .with_ipv4_fragment_reuse_gap_micros(reuse_gap_micros),
         );
         let (batch_tx, batch_rx) = crossbeam::channel::unbounded();
         for batch in batches {
@@ -1613,6 +1639,47 @@ mod tests {
             })
             .collect();
         (counters, records)
+    }
+
+    #[test]
+    fn ipv4_fragment_reuse_gap_reaches_both_pipeline_models() {
+        let (mut new_query, old_response) = fragment_ordering_query_response();
+        let mut new_response = old_response.clone();
+        // Same flow and fragment key; a different QNAME distinguishes the DNS outcomes.
+        new_query[55] = b'a';
+        new_response[55] = b'a';
+        let (old_first, _) = split_ipv4_test_packet(&old_response);
+        let (new_first, new_tail) = split_ipv4_test_packet(&new_response);
+        for staged in [false, true] {
+            for reuse_gap_micros in [None, Some(120_000_000)] {
+                let (counters, records) = run_fragment_test_batches_with_reuse_gap(
+                    vec![
+                        vec![test_packet(&old_first, 1_100_000, 0)],
+                        vec![
+                            test_packet(&new_query, 122_000_000, 1),
+                            test_packet(&new_first, 122_100_000, 2),
+                            test_packet(&new_tail, 122_100_001, 3),
+                        ],
+                    ],
+                    staged,
+                    false,
+                    test_worker_signals(false),
+                    reuse_gap_micros,
+                );
+                let recovered = reuse_gap_micros.is_some();
+                assert_eq!(
+                    counters.matched_query_response_count,
+                    usize::from(recovered)
+                );
+                assert_eq!(counters.timeout_query_count, usize::from(!recovered));
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].name.as_str(), "axample.com");
+                assert_eq!(
+                    records[0].response_timestamp,
+                    recovered.then_some(122_100_001)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1715,7 +1782,7 @@ mod tests {
         let (query, _) = fragment_ordering_query_response();
         let (_, tail) = split_ipv4_test_packet(&query);
         for byte_bound in [false, true] {
-            let mut routing = FragmentRoutingState::new(1_200_000, false);
+            let mut routing = FragmentRoutingState::new(1_200_000, false, None);
             let plan = ShardRoutingPlan::new(1, 1);
             let blocked = routing.route_batch(
                 vec![test_packet(&tail, 0, 0), test_packet(&query, 1, 1)],
@@ -1743,27 +1810,106 @@ mod tests {
         let (_, tail) = split_ipv4_test_packet(&query);
         for staged in [false, true] {
             for signal in [false, true] {
+                for (monotonic, reuse_gap_micros) in
+                    [(true, None), (false, None), (false, Some(120_000_000))]
+                {
+                    let signals = test_worker_signals(signal);
+                    signals.intake_failed.store(!signal, AtomicOrdering::SeqCst);
+                    let mut unmatched = query.clone();
+                    unmatched[42..44].copy_from_slice(&0x9876_u16.to_be_bytes());
+                    let (counters, records) = run_fragment_test_batches_with_reuse_gap(
+                        vec![vec![
+                            test_packet(&tail, 1_000_000, 0),
+                            test_packet(&query, 1_100_000, 1),
+                            test_packet(&response, 1_200_000, 2),
+                            test_packet(&unmatched, 1_300_000, 3),
+                        ]],
+                        staged,
+                        monotonic,
+                        signals,
+                        reuse_gap_micros,
+                    );
+                    assert_eq!(counters.dns_query_count, 2);
+                    assert_eq!(counters.matched_query_response_count, 1);
+                    assert_eq!(counters.timeout_query_count, 0);
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].request_timestamp, 1_100_000);
+                    assert_eq!(records[0].response_timestamp, Some(1_200_000));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_reuse_recovery_drains_both_prefixes_without_timeouts_after_interruption() {
+        let (old_query, response) = fragment_ordering_query_response();
+        let mut dns = response[42..].to_vec();
+        dns[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        // A complete question fits in the first fragment; the OPT tail is absent.
+        dns.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        let old_response =
+            make_udp_dns_packet_with_payload([8, 8, 8, 8], [10, 0, 0, 1], 53, 53_000, &dns);
+        let mut new_query = old_query.clone();
+        let mut new_response = old_response.clone();
+        new_query[55] = b'a';
+        new_response[55] = b'a';
+        let first_prefix = |response: &[u8]| {
+            let mut first = response[..74].to_vec();
+            first[16..18].copy_from_slice(&60_u16.to_be_bytes());
+            first[18..20].copy_from_slice(&0x4321_u16.to_be_bytes());
+            first[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+            first
+        };
+        let old_first = first_prefix(&old_response);
+        let new_first = first_prefix(&new_response);
+        let mut unmatched = new_query.clone();
+        unmatched[42..44].copy_from_slice(&0x9876_u16.to_be_bytes());
+
+        for staged in [false, true] {
+            for signal in [false, true] {
                 let signals = test_worker_signals(signal);
                 signals.intake_failed.store(!signal, AtomicOrdering::SeqCst);
-                let mut unmatched = query.clone();
-                unmatched[42..44].copy_from_slice(&0x9876_u16.to_be_bytes());
-                let (counters, records) = run_fragment_test_batches(
-                    vec![vec![
-                        test_packet(&tail, 1_000_000, 0),
-                        test_packet(&query, 1_100_000, 1),
-                        test_packet(&response, 1_200_000, 2),
-                        test_packet(&unmatched, 1_300_000, 3),
-                    ]],
+                let (counters, records) = run_fragment_test_batches_with_reuse_gap(
+                    vec![
+                        vec![
+                            test_packet(&old_query, 1_000_000, 0),
+                            test_packet(&old_first, 1_100_000, 1),
+                        ],
+                        vec![
+                            test_packet(&new_query, 122_000_000, 2),
+                            test_packet(&new_first, 122_100_000, 3),
+                            test_packet(&unmatched, 122_200_000, 4),
+                        ],
+                    ],
                     staged,
-                    true,
+                    false,
                     signals,
+                    Some(120_000_000),
                 );
-                assert_eq!(counters.dns_query_count, 2);
-                assert_eq!(counters.matched_query_response_count, 1);
+                assert_eq!(counters.dns_query_count, 3);
+                assert_eq!(counters.dns_response_count, 2);
+                assert_eq!(counters.fragmented_response_prefix_count, 2);
+                assert_eq!(counters.matched_query_response_count, 2);
                 assert_eq!(counters.timeout_query_count, 0);
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0].request_timestamp, 1_100_000);
-                assert_eq!(records[0].response_timestamp, Some(1_200_000));
+                assert_eq!(records.len(), 2);
+                let outcomes = records
+                    .iter()
+                    .map(|record| {
+                        assert!(record.response_code.is_none());
+                        (
+                            record.name.as_str(),
+                            record.request_timestamp,
+                            record.response_timestamp,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    outcomes,
+                    vec![
+                        ("example.com", 1_000_000, Some(1_100_000)),
+                        ("axample.com", 122_000_000, Some(122_100_000)),
+                    ]
+                );
             }
         }
     }
@@ -2338,7 +2484,7 @@ mod tests {
             .next_batch(PACKET_BATCH_SIZE)
             .expect("batch reads")
             .expect("first batch exists");
-        let mut fragment_routing = FragmentRoutingState::new(1_200_000, true);
+        let mut fragment_routing = FragmentRoutingState::new(1_200_000, true, None);
         let routed = fragment_routing.route_batch(first_batch, &ShardRoutingPlan::new(1, 1));
         assert_eq!(routed.batch_max_timestamp_micros, Some(1_000_000));
 

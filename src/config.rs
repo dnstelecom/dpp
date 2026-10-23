@@ -23,6 +23,9 @@ pub(crate) const DEFAULT_MAX_DNS_COMPRESSION_JUMPS: usize = 32;
 /// Maximum supported DNS match timeout, expressed in milliseconds.
 pub(crate) const MAX_MATCH_TIMEOUT_MS: u64 = 5_000;
 
+/// Maximum IPv4 reuse gap that can be converted to signed microseconds.
+pub(crate) const MAX_IPV4_FRAGMENT_REUSE_GAP_MS: u64 = (i64::MAX / 1_000) as u64;
+
 /// Logical shard multiplier used to reduce hot-shard skew relative to worker count.
 pub(crate) const MATCHER_SHARD_FACTOR: usize = 4;
 
@@ -159,6 +162,7 @@ pub(crate) struct AppConfig {
     pub(crate) format: OutputFormat,
     pub(crate) report_format: ReportFormat,
     pub(crate) match_timeout_ms: u64,
+    pub(crate) ipv4_fragment_reuse_gap_ms: Option<u64>,
     pub(crate) monotonic_capture: bool,
     pub(crate) zstd: bool,
     pub(crate) v2: bool,
@@ -239,6 +243,15 @@ impl AppConfig {
             .expect("validated timeout milliseconds fit into microseconds")
     }
 
+    pub(crate) fn ipv4_fragment_reuse_gap_micros(&self) -> Option<i64> {
+        self.ipv4_fragment_reuse_gap_ms.map(|gap_ms| {
+            i64::try_from(gap_ms)
+                .expect("validated IPv4 fragment reuse gap fits into i64")
+                .checked_mul(1_000)
+                .expect("validated IPv4 fragment reuse gap fits into microseconds")
+        })
+    }
+
     pub(crate) fn anonymize_key_path(&self) -> Option<&Path> {
         self.anonymize.as_deref()
     }
@@ -282,6 +295,7 @@ mod tests {
             format: OutputFormat::Csv,
             report_format: ReportFormat::Text,
             match_timeout_ms: DEFAULT_MATCH_TIMEOUT_MS,
+            ipv4_fragment_reuse_gap_ms: None,
             monotonic_capture: false,
             zstd: false,
             v2: false,
@@ -339,6 +353,19 @@ mod tests {
         let config = test_config();
 
         assert_eq!(config.match_timeout_micros(), 1_200_000);
+    }
+
+    #[test]
+    fn ipv4_fragment_reuse_gap_conversion_preserves_option_and_range_boundaries() {
+        let mut config = test_config();
+        assert_eq!(config.ipv4_fragment_reuse_gap_micros(), None);
+        config.ipv4_fragment_reuse_gap_ms = Some(1);
+        assert_eq!(config.ipv4_fragment_reuse_gap_micros(), Some(1_000));
+        config.ipv4_fragment_reuse_gap_ms = Some(MAX_IPV4_FRAGMENT_REUSE_GAP_MS);
+        assert_eq!(
+            config.ipv4_fragment_reuse_gap_micros(),
+            Some(i64::MAX - i64::MAX % 1_000)
+        );
     }
 
     #[test]

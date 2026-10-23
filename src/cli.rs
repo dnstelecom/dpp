@@ -7,7 +7,8 @@
 
 use crate::config::{
     AppConfig, DEFAULT_MATCH_TIMEOUT_MS, DEFAULT_MAX_DNS_COMPRESSION_JUMPS, InputSource,
-    MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget, ReportFormat, output_target_for_path,
+    MAX_IPV4_FRAGMENT_REUSE_GAP_MS, MAX_MATCH_TIMEOUT_MS, OutputFormat, OutputTarget, ReportFormat,
+    output_target_for_path,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -33,6 +34,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let env_max_dns_compression_jumps = env::var_os("DPP_MAX_DNS_COMPRESSION_JUMPS");
     let env_allow_fragments = parse_env_bool("DPP_ALLOW_FRAGMENTS");
     let env_full_fragments = parse_env_bool("DPP_FULL_FRAGMENTS");
+    let env_ipv4_fragment_reuse_gap_ms = env::var_os("DPP_IPV4_FRAGMENT_REUSE_GAP_MS");
     let env_monotonic_capture = parse_env_bool("DPP_MONOTONIC_CAPTURE");
     let env_threads = env::var_os("DPP_THREADS");
     let env_bonded = env::var_os("DPP_BONDED");
@@ -94,6 +96,12 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     let (allow_fragments, full_fragments) =
         resolve_fragment_flags(&matches, env_allow_fragments, env_full_fragments);
     let monotonic_capture = matches.get_flag("monotonic_capture") || env_monotonic_capture;
+    let ipv4_fragment_reuse_gap_ms = resolve_ipv4_fragment_reuse_gap_ms(
+        &matches,
+        env_ipv4_fragment_reuse_gap_ms.as_deref(),
+        full_fragments,
+        monotonic_capture,
+    )?;
 
     validate_parquet_only_flags(format, zstd, v2)?;
 
@@ -103,6 +111,7 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
         format,
         report_format,
         match_timeout_ms,
+        ipv4_fragment_reuse_gap_ms,
         monotonic_capture,
         zstd,
         v2,
@@ -136,6 +145,8 @@ fn build_cli(version: &'static str) -> Command {
                         Maximum compression-pointer jumps per DNS name; default is 32, 0 disables the limit (used if --max-dns-compression-jumps is not specified)
   DPP_ALLOW_FRAGMENTS   Set to 'true' to match queries with observable first IPv4 response fragments without reassembly
   DPP_FULL_FRAGMENTS    Set to 'true' to reassemble IPv4 fragments and enable first-fragment response matching
+  DPP_IPV4_FRAGMENT_REUSE_GAP_MS
+                        Optional per-key forward timestamp gap for IPv4 ID reuse recovery in milliseconds; range 1..=9223372036854775, disabled by default; requires full fragments and conflicts with monotonic capture (used if --ipv4-fragment-reuse-gap-ms is not specified)
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
   DPP_THREADS           Maximum CPU execution budget (positive integer, capped to available CPUs; used if --threads is not specified)
@@ -265,6 +276,14 @@ LICENSE INFORMATION:
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("ipv4_fragment_reuse_gap_ms")
+                .long("ipv4-fragment-reuse-gap-ms")
+                .help("Recover reused IPv4 IDs after a per-key forward timestamp gap in milliseconds (opt-in capture assumption; requires --full-fragments and conflicts with --monotonic-capture)")
+                .value_name("MS")
+                .num_args(1)
+                .value_parser(parse_ipv4_fragment_reuse_gap_ms),
+        )
+        .arg(
             Arg::new("anonymize")
                 .long("anonymize")
                 .help("Name of the key file")
@@ -320,6 +339,50 @@ fn resolve_match_timeout_ms(matches: &ArgMatches, env_value: Option<&str>) -> Re
         Some(value) => parse_match_timeout_ms(value),
         None => Ok(DEFAULT_MATCH_TIMEOUT_MS),
     }
+}
+
+fn resolve_ipv4_fragment_reuse_gap_ms(
+    matches: &ArgMatches,
+    env_value: Option<&OsStr>,
+    full_fragments: bool,
+    monotonic_capture: bool,
+) -> Result<Option<u64>> {
+    let gap_ms = if let Some(value) = matches.get_one::<u64>("ipv4_fragment_reuse_gap_ms") {
+        Some(*value)
+    } else if let Some(value) = env_value {
+        let value = value
+            .to_str()
+            .ok_or_else(|| anyhow!("DPP_IPV4_FRAGMENT_REUSE_GAP_MS must contain valid UTF-8"))?;
+        Some(parse_ipv4_fragment_reuse_gap_ms(value)?)
+    } else {
+        None
+    };
+    if gap_ms.is_some() {
+        if !full_fragments {
+            bail!(
+                "'--ipv4-fragment-reuse-gap-ms' requires '--full-fragments' (or DPP_FULL_FRAGMENTS)."
+            );
+        }
+        if monotonic_capture {
+            bail!(
+                "'--ipv4-fragment-reuse-gap-ms' cannot be combined with '--monotonic-capture' (or DPP_MONOTONIC_CAPTURE)."
+            );
+        }
+    }
+    Ok(gap_ms)
+}
+
+fn parse_ipv4_fragment_reuse_gap_ms(value: &str) -> Result<u64> {
+    let gap_ms = value
+        .parse::<u64>()
+        .with_context(|| format!("Failed to parse IPv4 fragment reuse gap from '{value}'"))?;
+    if gap_ms == 0 || gap_ms > MAX_IPV4_FRAGMENT_REUSE_GAP_MS {
+        bail!(
+            "IPv4 fragment reuse gap must be in 1..={} milliseconds.",
+            MAX_IPV4_FRAGMENT_REUSE_GAP_MS
+        );
+    }
+    Ok(gap_ms)
 }
 
 fn resolve_thread_limit(matches: &ArgMatches, env_value: Option<&OsStr>) -> Result<Option<usize>> {
@@ -893,6 +956,152 @@ mod tests {
         assert_eq!(
             resolve_fragment_flags(&default_matches, false, false),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn ipv4_fragment_reuse_gap_is_disabled_by_default_and_cli_overrides_env() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_ipv4_fragment_reuse_gap_ms(&defaults, None, false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_ipv4_fragment_reuse_gap_ms(&defaults, Some(OsStr::new("120000")), true, false)
+                .unwrap(),
+            Some(120_000)
+        );
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--ipv4-fragment-reuse-gap-ms", "1000", "input.pcap"])
+            .expect("cli parses");
+        for env_value in ["120000", "invalid", "0"] {
+            assert_eq!(
+                resolve_ipv4_fragment_reuse_gap_ms(&cli, Some(OsStr::new(env_value)), true, false)
+                    .unwrap(),
+                Some(1_000)
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_fragment_reuse_gap_accepts_exact_conversion_range_in_cli_and_env() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for expected in [1, MAX_IPV4_FRAGMENT_REUSE_GAP_MS] {
+            let value = expected.to_string();
+            let cli = build_cli("test")
+                .try_get_matches_from([
+                    "dpp",
+                    "--ipv4-fragment-reuse-gap-ms",
+                    value.as_str(),
+                    "input.pcap",
+                ])
+                .expect("boundary parses");
+            assert_eq!(
+                resolve_ipv4_fragment_reuse_gap_ms(&cli, None, true, false).unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                resolve_ipv4_fragment_reuse_gap_ms(
+                    &defaults,
+                    Some(OsStr::new(&value)),
+                    true,
+                    false
+                )
+                .unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_ipv4_fragment_reuse_gaps_are_rejected_in_cli_and_env() {
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        for value in [
+            "0",
+            "-1",
+            "9223372036854776",
+            "18446744073709551616",
+            "invalid",
+            "",
+        ] {
+            assert!(
+                build_cli("test")
+                    .try_get_matches_from([
+                        "dpp",
+                        &format!("--ipv4-fragment-reuse-gap-ms={value}"),
+                        "input.pcap",
+                    ])
+                    .is_err(),
+                "invalid CLI value {value:?} must not fall back to ENV"
+            );
+            assert!(
+                resolve_ipv4_fragment_reuse_gap_ms(&defaults, Some(OsStr::new(value)), true, false)
+                    .is_err(),
+                "invalid ENV value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_fragment_reuse_gap_validates_resolved_cli_and_env_modes() {
+        for cli_full in [false, true] {
+            for env_full in [false, true] {
+                for cli_monotonic in [false, true] {
+                    for env_monotonic in [false, true] {
+                        for env_gap in [false, true] {
+                            let mut argv = vec!["dpp", "input.pcap"];
+                            if cli_full {
+                                argv.push("--full-fragments");
+                            }
+                            if cli_monotonic {
+                                argv.push("--monotonic-capture");
+                            }
+                            if !env_gap {
+                                argv.extend(["--ipv4-fragment-reuse-gap-ms", "120000"]);
+                            }
+                            let matches = build_cli("test")
+                                .try_get_matches_from(argv)
+                                .expect("cli parses");
+                            let (_, full) = resolve_fragment_flags(&matches, false, env_full);
+                            let monotonic = matches.get_flag("monotonic_capture") || env_monotonic;
+                            let result = resolve_ipv4_fragment_reuse_gap_ms(
+                                &matches,
+                                env_gap.then_some(OsStr::new("120000")),
+                                full,
+                                monotonic,
+                            );
+                            assert_eq!(result.is_ok(), full && !monotonic);
+                            if full && !monotonic {
+                                assert_eq!(result.unwrap(), Some(120_000));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ipv4_fragment_reuse_gap_env_requires_cli_override() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = OsStr::from_bytes(&[0xff]);
+        let defaults = build_cli("test")
+            .try_get_matches_from(["dpp", "input.pcap"])
+            .expect("cli parses");
+        assert!(resolve_ipv4_fragment_reuse_gap_ms(&defaults, Some(invalid), true, false).is_err());
+        let cli = build_cli("test")
+            .try_get_matches_from(["dpp", "--ipv4-fragment-reuse-gap-ms", "1", "input.pcap"])
+            .expect("cli parses");
+        assert_eq!(
+            resolve_ipv4_fragment_reuse_gap_ms(&cli, Some(invalid), true, false).unwrap(),
+            Some(1)
         );
     }
 

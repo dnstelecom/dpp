@@ -36,9 +36,13 @@ fn dpp_binary() -> &'static str {
 }
 
 fn append_example_a_query(dns_payload: &mut Vec<u8>) {
-    dns_payload.extend_from_slice(&[
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
-    ]);
+    append_com_a_query(dns_payload, b"example");
+}
+
+fn append_com_a_query(dns_payload: &mut Vec<u8>, label: &[u8]) {
+    dns_payload.push(u8::try_from(label.len()).expect("test label length fits into u8"));
+    dns_payload.extend_from_slice(label);
+    dns_payload.extend_from_slice(&[3, b'c', b'o', b'm', 0]);
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
     dns_payload.extend_from_slice(&1_u16.to_be_bytes());
 }
@@ -92,6 +96,92 @@ fn fragment_ipv4_udp_packet(packet: &[u8], first_payload_len: usize) -> (Vec<u8>
     later_fragment.extend_from_slice(remaining_payload);
 
     (first_fragment, later_fragment)
+}
+
+fn fragment_reuse_transaction(id: u16, label: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    assert_eq!(
+        label.len(),
+        7,
+        "fixture question must fit in the first fragment"
+    );
+    let mut query_payload = encode_dns_header(id, 0x0100, 1);
+    append_com_a_query(&mut query_payload, label);
+    let query_packet =
+        make_udp_dns_packet_with_payload([10, 0, 0, 1], [8, 8, 8, 8], 53_000, 53, &query_payload);
+
+    let mut response_payload = encode_dns_header(id, 0x8180, 1);
+    response_payload[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    append_com_a_query(&mut response_payload, label);
+    append_opt_record(&mut response_payload, 1, 0);
+    let response_packet = make_udp_dns_packet_with_payload(
+        [8, 8, 8, 8],
+        [10, 0, 0, 1],
+        53,
+        53_000,
+        &response_payload,
+    );
+    let (first, tail) = fragment_ipv4_udp_packet(&response_packet, 40);
+    (query_packet, first, tail)
+}
+
+fn run_fragment_reuse_capture(
+    name: &str,
+    capture: &[u8],
+    threads: usize,
+    extra_args: &[&str],
+    env_gap: Option<&str>,
+) -> (String, serde_json::Value) {
+    let input_path = temp_test_path(name, "pcap");
+    let output_path = temp_test_path(name, "csv");
+    fs::write(&input_path, capture).expect("fragment reuse capture written");
+    let mut command = Command::new(dpp_binary());
+    command
+        .args(["-s", "-f", "csv", "--full-fragments", "--threads"])
+        .arg(threads.to_string())
+        .args(["--report-format", "json"])
+        .args(extra_args)
+        .env_remove("DPP_IPV4_FRAGMENT_REUSE_GAP_MS")
+        .env_remove("DPP_MONOTONIC_CAPTURE")
+        .env_remove("DPP_MATCH_TIMEOUT_MS");
+    if let Some(gap) = env_gap {
+        command.env("DPP_IPV4_FRAGMENT_REUSE_GAP_MS", gap);
+    }
+    let output = command
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("DPP executes the fragment reuse capture");
+    assert!(
+        output.status.success(),
+        "DPP failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let csv = fs::read_to_string(&output_path).expect("fragment reuse CSV readable");
+    assert_eq!(
+        csv.lines().next(),
+        Some(
+            "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code"
+        )
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON report parses");
+    let available_cpus = report["execution"]["available_cpus"]
+        .as_u64()
+        .expect("execution budget is reported");
+    assert_eq!(
+        report["execution"]["model"],
+        if available_cpus >= 5 {
+            "staged"
+        } else {
+            "phase_parallel"
+        }
+    );
+    if threads == 1 {
+        assert_eq!(available_cpus, 1);
+    }
+    fs::remove_file(input_path).expect("remove fragment reuse capture");
+    fs::remove_file(output_path).expect("remove fragment reuse CSV");
+    (csv, report)
 }
 
 #[cfg(unix)]
@@ -566,6 +656,204 @@ fn full_ipv4_fragment_mode_falls_back_to_first_fragment_at_eof() {
 
     fs::remove_file(input_path).expect("remove input pcap");
     fs::remove_file(output_path).expect("remove output csv");
+}
+
+#[test]
+fn ipv4_fragment_reuse_gap_recovers_late_id_from_cli_and_environment() {
+    let (query_a, first_a, _) = fragment_reuse_transaction(0x2345, b"example");
+    let (query_b, first_b, tail_b) = fragment_reuse_transaction(0x3456, b"another");
+    let capture = classic_pcap_bytes(&[
+        (1, 0, &query_a),
+        (1, 100_000, &first_a),
+        (122, 0, &query_b),
+        (122, 100_000, &first_b),
+        (122, 100_001, &tail_b),
+    ]);
+
+    for threads in [1, 5] {
+        let (csv, report) =
+            run_fragment_reuse_capture("ipv4-reuse-default", &capture, threads, &[], None);
+        assert_eq!(
+            csv,
+            concat!(
+                "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+                "1000000,,10.0.0.1,53000,9029,example.com,A,\n",
+                "122000000,,10.0.0.1,53000,13398,another.com,A,\n"
+            )
+        );
+        assert_eq!(report["metrics"]["total_dns_responses_processed"], 0);
+        assert_eq!(report["metrics"]["timed_out_queries"], 2);
+
+        for env_gap in [None, Some("120000")] {
+            let extra_args: &[&str] = if env_gap.is_some() {
+                &[]
+            } else {
+                &["--ipv4-fragment-reuse-gap-ms", "120000"]
+            };
+            let (csv, report) = run_fragment_reuse_capture(
+                "ipv4-reuse-enabled",
+                &capture,
+                threads,
+                extra_args,
+                env_gap,
+            );
+            assert_eq!(
+                csv,
+                concat!(
+                    "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+                    "1000000,1100000,10.0.0.1,53000,9029,example.com,A,\n",
+                    "122000000,122100001,10.0.0.1,53000,13398,another.com,A,EDNS_BADVERS\n"
+                )
+            );
+            assert_eq!(report["metrics"]["fragmented_response_prefix_count"], 1);
+            assert_eq!(report["metrics"]["total_dns_responses_processed"], 2);
+            assert_eq!(report["metrics"]["total_matched_query_response_pairs"], 2);
+            assert_eq!(report["metrics"]["timed_out_queries"], 0);
+        }
+    }
+}
+
+#[test]
+fn ipv4_fragment_reuse_gap_is_strict_and_cli_overrides_environment() {
+    let (query_a, first_a, _) = fragment_reuse_transaction(0x2345, b"example");
+    let (query_b, first_b, tail_b) = fragment_reuse_transaction(0x3456, b"another");
+
+    for delta in [0, 1] {
+        let capture = classic_pcap_bytes(&[
+            (1, 0, &query_a),
+            (1, 100_000, &first_a),
+            (121, 0, &query_b),
+            (121, 100_000 + delta, &first_b),
+            (121, 100_001 + delta, &tail_b),
+        ]);
+        let (csv, report) = run_fragment_reuse_capture(
+            "ipv4-reuse-boundary",
+            &capture,
+            1,
+            &["--ipv4-fragment-reuse-gap-ms", "120000"],
+            Some("1"),
+        );
+        let expected_b = if delta == 0 {
+            "121000000,,10.0.0.1,53000,13398,another.com,A,".to_owned()
+        } else {
+            "121000000,121100002,10.0.0.1,53000,13398,another.com,A,EDNS_BADVERS".to_owned()
+        };
+        assert!(csv.lines().any(|line| line == expected_b));
+        assert_eq!(
+            report["metrics"]["total_matched_query_response_pairs"],
+            if delta == 0 { 0 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn ipv4_fragment_reuse_gap_recovers_tombstone_without_rejected_prefix() {
+    let (query_a, first_a, _) = fragment_reuse_transaction(0x2345, b"example");
+    let (query_b, first_b, tail_b) = fragment_reuse_transaction(0x3456, b"another");
+    let capture = classic_pcap_bytes(&[
+        (1, 0, &query_a),
+        (1, 100_000, &first_a),
+        // A close collision rejects the old candidate before the late reuse.
+        (1, 200_000, &first_b),
+        (122, 100_000, &query_b),
+        (122, 200_000, &first_b),
+        (122, 200_001, &tail_b),
+    ]);
+    for threads in [1, 5] {
+        let (csv, report) = run_fragment_reuse_capture(
+            "ipv4-reuse-tombstone",
+            &capture,
+            threads,
+            &["--ipv4-fragment-reuse-gap-ms", "120000"],
+            None,
+        );
+        assert_eq!(csv.lines().count(), 3);
+        assert!(csv.contains("1000000,,10.0.0.1,53000,9029,example.com,A,\n"));
+        assert!(
+            csv.contains("122100000,122200001,10.0.0.1,53000,13398,another.com,A,EDNS_BADVERS\n")
+        );
+        assert_eq!(report["metrics"]["fragmented_response_prefix_count"], 0);
+        assert_eq!(report["metrics"]["total_dns_responses_processed"], 1);
+        assert_eq!(report["metrics"]["total_matched_query_response_pairs"], 1);
+        assert_eq!(report["metrics"]["timed_out_queries"], 1);
+    }
+}
+
+#[test]
+fn ipv4_fragment_reuse_gap_filters_old_replay_across_history_and_batches() {
+    let (query_a, first_a, tail_a) = fragment_reuse_transaction(0x2345, b"example");
+    let (query_b, first_b, tail_b) = fragment_reuse_transaction(0x3456, b"another");
+    let mut non_dns_first = first_a.clone();
+    non_dns_first[34..36].copy_from_slice(&123_u16.to_be_bytes());
+    let mut padding = first_a.clone();
+    padding[14 + 9] = 1;
+
+    for padded in [false, true] {
+        let mut packets = vec![(1, 0, query_a.as_slice()), (1, 100_000, first_a.as_slice())];
+        if padded {
+            // Unsupported ICMP fragments fill an ingest batch without a ready backlog
+            // or another pending datagram that would change fallback timing.
+            packets.extend(std::iter::repeat_n(
+                (1, 200_000, padding.as_slice()),
+                65_536 - packets.len(),
+            ));
+        }
+        packets.extend([
+            (122, 0, query_b.as_slice()),
+            (122, 100_000, first_b.as_slice()),
+        ]);
+        if padded {
+            packets.extend(std::iter::repeat_n(
+                (122, 200_000, padding.as_slice()),
+                65_536 - packets.len() % 65_536,
+            ));
+        }
+        packets.extend([
+            // These old events are exactly on the retired generation's cutoff.
+            (121, 100_000, first_a.as_slice()),
+            (121, 100_000, tail_a.as_slice()),
+            (121, 100_000, non_dns_first.as_slice()),
+            (122, 100_001, tail_b.as_slice()),
+            // The cutoff must survive completion and a later non-DNS mark.
+            (1, 100_000, first_a.as_slice()),
+            (1, 100_001, tail_a.as_slice()),
+            (1, 100_002, non_dns_first.as_slice()),
+            (122, 150_000, non_dns_first.as_slice()),
+            (1, 100_000, first_a.as_slice()),
+            (1, 100_001, tail_a.as_slice()),
+            (1, 100_002, non_dns_first.as_slice()),
+            // A fully identical completed response remains a duplicate.
+            (122, 200_000, query_b.as_slice()),
+            (122, 300_000, first_b.as_slice()),
+            (122, 300_001, tail_b.as_slice()),
+            (1, 100_000, first_a.as_slice()),
+            (1, 100_001, tail_a.as_slice()),
+            (1, 100_002, non_dns_first.as_slice()),
+        ]);
+        let capture = classic_pcap_bytes(&packets);
+        for threads in [1, 5] {
+            let (csv, report) = run_fragment_reuse_capture(
+                "ipv4-reuse-replay",
+                &capture,
+                threads,
+                &["--ipv4-fragment-reuse-gap-ms", "120000"],
+                None,
+            );
+            assert_eq!(
+                csv,
+                concat!(
+                    "request_timestamp,response_timestamp,source_ip,source_port,id,name,query_type,response_code\n",
+                    "1000000,1100000,10.0.0.1,53000,9029,example.com,A,\n",
+                    "122000000,122100001,10.0.0.1,53000,13398,another.com,A,EDNS_BADVERS\n",
+                    "122200000,,10.0.0.1,53000,13398,another.com,A,\n"
+                )
+            );
+            assert_eq!(report["metrics"]["fragmented_response_prefix_count"], 1);
+            assert_eq!(report["metrics"]["total_dns_responses_processed"], 2);
+            assert_eq!(report["metrics"]["total_matched_query_response_pairs"], 2);
+            assert_eq!(report["metrics"]["timed_out_queries"], 1);
+        }
+    }
 }
 
 #[test]
