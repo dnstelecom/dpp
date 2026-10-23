@@ -17,7 +17,7 @@ explicitly.
 
 ## Build a variant
 
-Requires Rust 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
+Requires Rust 1.99.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 
 Default allocator:
 

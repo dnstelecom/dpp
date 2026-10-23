@@ -64,7 +64,7 @@ Start with the [usage examples](#usage). For implementation details and diagrams
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.98.1 or newer; this repository is pinned by `rust-toolchain.toml`.
+- [Rust](https://rustup.rs/) 1.99.1 or newer; this repository is pinned by `rust-toolchain.toml`.
 - Cargo
 - PCAP files for offline processing
 - `libpcap` development headers for fallback support on non-classic formats

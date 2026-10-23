@@ -2,9 +2,9 @@
 
 [package]
 name = "dpp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.99.1"
 build = "build.rs"  # Custom build script to include version information from git
 
 [workspace]
@@ -58,7 +58,7 @@ num-format = "0.4"                # Number formatting for logging and output
 sysinfo = "0.39"                  # System information retrieval (for memory monitoring)
 arrayvec = "0.7"                  # Fixed-size array wrapper for DNS field storage
 bytes = "1.12"                    # Shared byte storage for zero-copy Parquet values
-parquet = { version = "59.3.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
+parquet = { version = "60.0.0", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] } # Apache Parquet format support for exporting results
 serde = { version = "1.0", features = ["derive"] }  # Serialization and deserialization support
 clap = { version = "4.6", features = ["derive"] }   # Command-line argument parsing
 tikv-jemallocator = { version = "0.7.0", optional = true } # Jemalloc successor for Rust global allocation
@@ -70,7 +70,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tracing-log = "0.2.0"             # Bridges log-based dependencies into tracing
 aes = "0.9.3"
 pbkdf2 = "0.13.0"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 itoa = "1.0"
 memchr = "2.8"
 serde_json = "1.0"
