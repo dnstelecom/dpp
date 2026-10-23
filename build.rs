@@ -8,7 +8,7 @@
 use anyhow::Result;
 use std::env;
 use std::process::Command;
-use vergen_gitcl::{Build, Cargo, Emitter, Gitcl, Rustc, Sysinfo};
+use vergen_gitcl::{Build, Emitter, Gitcl};
 
 const MAIN_THREAD_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -40,16 +40,12 @@ pub fn main() -> Result<()> {
 
     Emitter::default()
         .add_instructions(&Build::all_build())?
-        .add_instructions(&Cargo::all_cargo())?
         .add_instructions(
             &Gitcl::builder()
-                .commit_date(true)
                 .commit_timestamp(true)
                 .sha(true)
                 .commit_author_email(true)
                 .build(),
         )?
-        .add_instructions(&Rustc::all_rustc())?
-        .add_instructions(&Sysinfo::all_sysinfo())?
         .emit()
 }
