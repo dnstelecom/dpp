@@ -144,7 +144,7 @@ dpp --report-format json input.pcap output.csv > dpp-summary.json
 | --- | --- |
 | `-s, --silent` | Suppress info-level log output |
 | `-f, --format <csv\|parquet\|pq>` | Select output format; stdout output is supported only for `csv` |
-| `--report-format <text\|json>` | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -` |
+| `--report-format <text\|json>` | Select the final process report format; defaults to `text`; `json` cannot be combined with `output_filename = -` or `--silent` |
 | `--match-timeout-ms <MS>` | Set the DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200` |
 | `--monotonic-capture` | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
 | `-t, --threads <N>` | Cap the CPU execution budget at a positive `N`, never above available CPUs |
@@ -171,7 +171,7 @@ provide supported per-core thread pinning through the affinity backend.
 | `DPP_FILENAME` | Input PCAP path. Use `-` to read a finite offline PCAP stream from `stdin` |
 | `DPP_OUTPUT_FILENAME` | Optional output file path; use `-` for CSV stdout output |
 | `DPP_FORMAT` | Output format: `csv`, `parquet`, or `pq` |
-| `DPP_REPORT_FORMAT` | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` |
+| `DPP_REPORT_FORMAT` | Final process report format: `text` or `json`; defaults to `text`; `json` cannot be combined with `DPP_OUTPUT_FILENAME=-` or `DPP_SILENT` |
 | `DPP_MATCH_TIMEOUT_MS` | DNS query-response match timeout in milliseconds; allowed range is `1..=5000`, default is `1200` |
 | `DPP_MONOTONIC_CAPTURE` | Assume globally monotonic packet timestamps, enable batched timeout eviction, and abort if a regression is detected |
 | `DPP_THREADS` | Maximum CPU execution budget when `--threads` is not set; must be a positive integer |
@@ -353,6 +353,8 @@ type/code values rather than collapsing them to an `Unknown` label.
 
 `--report-format json` or `DPP_REPORT_FORMAT=json` suppresses routine `info`/`warn` reporting and
 writes one final summary object to stdout. CSV or Parquet records remain in their own output file.
+JSON mode rejects `--silent` and `DPP_SILENT`: silent runs skip peak-RSS sampling, so
+`metrics.max_memory_usage_kib` would not be a measured value.
 
 The summary includes these processing and matching-quality metrics:
 
