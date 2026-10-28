@@ -1053,6 +1053,28 @@ fn input_file_is_preserved_when_output_path_is_the_same_file() {
 }
 
 #[test]
+fn cli_validation_error_is_reported_with_a_single_error_prefix() {
+    let input_path = temp_test_path("missing-input", "pcap");
+
+    let output = Command::new(dpp_binary())
+        .arg(&input_path)
+        .output()
+        .expect("dpp executed");
+
+    assert!(!output.status.success(), "missing input must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = format!(
+        "Error: The specified pcap file '{}' does not exist.",
+        input_path.display()
+    );
+    assert_eq!(
+        stderr.lines().next(),
+        Some(expected.as_str()),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn midstream_capture_error_flushes_complete_partial_output() {
     let input_path = temp_test_path("midstream-error-input", "pcap");
     let output_path = temp_test_path("midstream-error-output", "csv");

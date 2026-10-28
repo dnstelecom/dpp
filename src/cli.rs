@@ -487,13 +487,13 @@ fn validate_output_path(output_path: &Path) -> Result<()> {
             .context("Failed to retrieve file metadata for the output file")?;
         if metadata.file_type().is_symlink() {
             bail!(
-                "Error: The output file points to a symbolic link, aborting to prevent security issues."
+                "The output file points to a symbolic link, aborting to prevent security issues."
             );
         }
     }
 
     if output_path.is_dir() {
-        bail!("Error: The output file path is a directory, not a file.");
+        bail!("The output file path is a directory, not a file.");
     }
 
     Ok(())
@@ -513,7 +513,7 @@ fn validate_distinct_input_output(input_source: &InputSource, output_path: &Path
         .context("Failed to compare input and output file identities")?;
     if paths_refer_to_same_file {
         bail!(
-            "Error: Input PCAP '{}' and output path '{}' refer to the same file; refusing to overwrite the input capture.",
+            "Input PCAP '{}' and output path '{}' refer to the same file; refusing to overwrite the input capture.",
             input_path.display(),
             output_path.display()
         );
@@ -535,7 +535,7 @@ fn validate_distinct_key_output(key_path: Option<&Path>, output_path: &Path) -> 
         .context("Failed to compare anonymization key and output file identities")?
     {
         bail!(
-            "Error: Anonymization key '{}' and output path '{}' refer to the same file; refusing to overwrite the key.",
+            "Anonymization key '{}' and output path '{}' refer to the same file; refusing to overwrite the key.",
             key_path.display(),
             output_path.display()
         );
@@ -549,11 +549,11 @@ fn validate_output_mode(
     report_format: ReportFormat,
 ) -> Result<()> {
     if output_target == OutputTarget::Stdout && !matches!(format, OutputFormat::Csv) {
-        bail!("Error: stdout output is supported only for '--format csv'.");
+        bail!("stdout output is supported only for '--format csv'.");
     }
 
     if output_target == OutputTarget::Stdout && matches!(report_format, ReportFormat::Json) {
-        bail!("Error: '--report-format json' cannot be used when output_filename is '-'.");
+        bail!("'--report-format json' cannot be used when output_filename is '-'.");
     }
 
     Ok(())
@@ -569,7 +569,7 @@ fn validate_input_source(input_source: &InputSource) -> Result<()> {
 fn validate_input_path(input_path: &Path) -> Result<()> {
     if !input_path.exists() {
         bail!(
-            "Error: The specified pcap file '{}' does not exist.",
+            "The specified pcap file '{}' does not exist.",
             input_path.display()
         );
     }
@@ -583,7 +583,7 @@ fn validate_input_path(input_path: &Path) -> Result<()> {
 
     if !metadata.is_file() {
         bail!(
-            "Error: The input pcap path '{}' is not a regular file.",
+            "The input pcap path '{}' is not a regular file.",
             input_path.display()
         );
     }
@@ -594,13 +594,13 @@ fn validate_input_path(input_path: &Path) -> Result<()> {
 fn validate_stdin_input() -> Result<()> {
     #[cfg(windows)]
     {
-        bail!("Error: Reading the input capture from stdin is not supported on Windows.");
+        bail!("Reading the input capture from stdin is not supported on Windows.");
     }
 
     #[cfg(not(windows))]
     {
         if std::io::stdin().is_terminal() {
-            bail!("Error: Input filename '-' requires a PCAP stream on stdin.");
+            bail!("Input filename '-' requires a PCAP stream on stdin.");
         }
     }
 
@@ -614,7 +614,7 @@ fn validate_anonymize_path(anonymize_path: Option<&Path>) -> Result<()> {
 
     if !anonymize_path.exists() {
         bail!(
-            "Error: The anonymization key file '{}' does not exist.",
+            "The anonymization key file '{}' does not exist.",
             anonymize_path.display()
         );
     }
@@ -628,7 +628,7 @@ fn validate_anonymize_path(anonymize_path: Option<&Path>) -> Result<()> {
 
     if !metadata.is_file() {
         bail!(
-            "Error: The anonymization key path '{}' is not a regular file.",
+            "The anonymization key path '{}' is not a regular file.",
             anonymize_path.display()
         );
     }
