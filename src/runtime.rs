@@ -180,7 +180,7 @@ pub(crate) fn log_accessible_input_file(args: &AppConfig) -> Result<(), RuntimeE
         InputSource::File(path) => {
             File::open(path).map_err(|error| {
                 error!(
-                    "Error: Unable to open the specified pcap file '{}'. {}",
+                    "Unable to open the specified pcap file '{}'. {}",
                     path.display(),
                     error
                 );
