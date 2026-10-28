@@ -243,6 +243,8 @@ authoritative processing counters. Oversized-QNAME rejections appear as
 
 Final JSON reporting uses the CLI/config report-format contract. Runtime logging remains
 human-readable. Stdout export is CSV-only, rejects JSON reports, and suppresses text reports.
+Explicit silent mode (`--silent` or `DPP_SILENT`) also rejects JSON reports, because silent runs do
+not start the RSS monitor that measures `metrics.max_memory_usage_kib`.
 If stderr itself is a closed pipe, the logger suppresses broken-pipe noise.
 
 ### Completion and failure handling

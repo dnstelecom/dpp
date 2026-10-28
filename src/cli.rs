@@ -87,10 +87,12 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
     validate_distinct_input_output(&input_source, &output_filename)?;
     validate_distinct_key_output(anonymize.as_deref(), &output_filename)?;
     validate_output_mode(output_target, format, report_format)?;
+    let silent_requested = matches.get_flag("silent") || env_silent;
+    validate_silent_report_format(silent_requested, report_format)?;
 
     let zstd = matches.get_flag("zstd") || env_zstd;
     let v2 = matches.get_flag("v2") || env_v2;
-    let silent = resolve_silent_mode(&matches, env_silent, output_target);
+    let silent = resolve_silent_mode(silent_requested, output_target);
     let affinity = matches.get_flag("affinity") || env_affinity;
     let dns_wire_fast_path = matches.get_flag("dns_wire_fast_path") || env_dns_wire_fast_path;
     let (allow_fragments, full_fragments) =
@@ -150,7 +152,7 @@ fn build_cli(version: &'static str) -> Command {
   DPP_MONOTONIC_CAPTURE
                         Set to 'true' to assume globally monotonic packet timestamps, enable batched timeout eviction, and abort on timestamp regressions
   DPP_THREADS           Maximum CPU execution budget (positive integer, capped to available CPUs; used if --threads is not specified)
-  DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output)
+  DPP_REPORT_FORMAT     Final process report format: text or json (used if --report-format is not specified; json cannot be combined with stdout output or silent mode)
   DPP_MATCH_TIMEOUT_MS  DNS match timeout in milliseconds; allowed range is 1..=5000, default is 1200
   DPP_BONDED=N          Set IO channel capacity in records; internally rounded up to batched messages of up to 1024 records; 0 uses the safe default bounded capacity
   DPP_FORMAT            Output format: csv, parquet, or pq (used if --format option is not specified)
@@ -194,7 +196,7 @@ LICENSE INFORMATION:
         .arg(
             Arg::new("report_format")
                 .long("report-format")
-                .help("Final process report format: text or json; json cannot be combined with stdout output")
+                .help("Final process report format: text or json; json cannot be combined with stdout output or --silent")
                 .value_name("text|json")
                 .num_args(1)
                 .value_parser(["text", "json"]),
@@ -440,12 +442,8 @@ fn resolve_max_dns_compression_jumps(
     }
 }
 
-fn resolve_silent_mode(
-    matches: &ArgMatches,
-    env_silent: bool,
-    output_target: OutputTarget,
-) -> bool {
-    matches.get_flag("silent") || env_silent || matches!(output_target, OutputTarget::Stdout)
+fn resolve_silent_mode(silent_requested: bool, output_target: OutputTarget) -> bool {
+    silent_requested || matches!(output_target, OutputTarget::Stdout)
 }
 
 fn validate_parquet_only_flags(format: OutputFormat, zstd: bool, v2: bool) -> Result<()> {
@@ -554,6 +552,18 @@ fn validate_output_mode(
 
     if output_target == OutputTarget::Stdout && matches!(report_format, ReportFormat::Json) {
         bail!("'--report-format json' cannot be used when output_filename is '-'.");
+    }
+
+    Ok(())
+}
+
+/// Silent runs skip peak-RSS sampling, so a JSON report could not carry a measured value.
+fn validate_silent_report_format(
+    silent_requested: bool,
+    report_format: ReportFormat,
+) -> Result<()> {
+    if silent_requested && matches!(report_format, ReportFormat::Json) {
+        bail!("'--report-format json' cannot be combined with '--silent' (or DPP_SILENT).");
     }
 
     Ok(())
@@ -1279,5 +1289,32 @@ mod tests {
     fn text_report_format_is_allowed_for_stdout_output() {
         validate_output_mode(OutputTarget::Stdout, OutputFormat::Csv, ReportFormat::Text)
             .expect("text report format remains valid for stdout output");
+    }
+
+    #[test]
+    fn json_report_format_is_rejected_in_silent_mode() {
+        let error = validate_silent_report_format(true, ReportFormat::Json)
+            .expect_err("json report format must be rejected in silent mode");
+
+        assert!(
+            error.to_string().contains(
+                "'--report-format json' cannot be combined with '--silent' (or DPP_SILENT)"
+            )
+        );
+    }
+
+    #[test]
+    fn silent_mode_restricts_only_json_reports() {
+        validate_silent_report_format(true, ReportFormat::Text)
+            .expect("text report format remains valid in silent mode");
+        validate_silent_report_format(false, ReportFormat::Json)
+            .expect("json report format remains valid without silent mode");
+    }
+
+    #[test]
+    fn stdout_output_implies_silent_mode() {
+        assert!(resolve_silent_mode(false, OutputTarget::Stdout));
+        assert!(resolve_silent_mode(true, OutputTarget::File));
+        assert!(!resolve_silent_mode(false, OutputTarget::File));
     }
 }

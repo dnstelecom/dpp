@@ -136,7 +136,7 @@ fn run_fragment_reuse_capture(
     fs::write(&input_path, capture).expect("fragment reuse capture written");
     let mut command = Command::new(dpp_binary());
     command
-        .args(["-s", "-f", "csv", "--full-fragments", "--threads"])
+        .args(["-f", "csv", "--full-fragments", "--threads"])
         .arg(threads.to_string())
         .args(["--report-format", "json"])
         .args(extra_args)
@@ -577,7 +577,7 @@ fn full_ipv4_reassembly_ignores_first_fragment_duplicate_after_completion() {
     .expect("fragmented duplicate test pcap written");
 
     let result = Command::new(dpp_binary())
-        .args(["-s", "--full-fragments", "--report-format", "json"])
+        .args(["--full-fragments", "--report-format", "json"])
         .arg(&input_path)
         .arg(&output_path)
         .output()
@@ -980,6 +980,51 @@ fn thread_cap_changes_reported_execution_budget() {
 
     fs::remove_file(&input_path).expect("remove input pcap");
     fs::remove_file(&output_path).expect("remove output csv");
+}
+
+#[test]
+fn json_report_is_rejected_in_silent_mode() {
+    let input_path = temp_test_path("silent-json-report", "pcap");
+    let output_path = temp_test_path("silent-json-report", "csv");
+    fs::write(&input_path, classic_pcap_bytes(&[])).expect("empty pcap written");
+
+    for (args, env_silent) in [
+        (&["-s", "--report-format", "json"][..], None),
+        (&["--report-format", "json"][..], Some("true")),
+    ] {
+        let mut command = Command::new(dpp_binary());
+        command
+            .args(args)
+            .env_remove("DPP_SILENT")
+            .env_remove("DPP_REPORT_FORMAT");
+        if let Some(value) = env_silent {
+            command.env("DPP_SILENT", value);
+        }
+        let output = command
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .expect("dpp executed");
+
+        assert!(
+            !output.status.success(),
+            "silent JSON run must be rejected: {args:?}, DPP_SILENT={env_silent:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(
+                "'--report-format json' cannot be combined with '--silent' (or DPP_SILENT)"
+            ),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "no JSON report may be emitted");
+        assert!(
+            !output_path.exists(),
+            "output must not be created when CLI validation fails"
+        );
+    }
+
+    fs::remove_file(&input_path).expect("remove input pcap");
 }
 
 #[test]
